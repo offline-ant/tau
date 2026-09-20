@@ -1,53 +1,57 @@
 /**
- * Session Sidebar - Lists sessions grouped by project, handles switching
+ * Session Sidebar — lists projects, and the sessions of a project once it is
+ * expanded. Projects start collapsed and their sessions are fetched on demand,
+ * so opening the page costs one directory listing rather than a parse of every
+ * stored transcript.
  */
 
 import { isImeComposition } from './keyboard.js';
 
 export type SidebarSession = {
-  filePath?: string;
-  file?: string;
+  filePath: string;
+  file: string;
+  dir: string;
+  id?: string;
   name?: string | null;
   firstMessage?: string | null;
   timestamp?: string;
-  sessionName?: string;
-  sessionTimestamp?: string;
+  mtime?: number;
   live?: boolean;
-  tmux?: boolean;
-  [key: string]: unknown;
+  owner?: unknown;
 };
 
 export type SidebarProject = {
-  path?: string;
-  dirName?: string;
-  sessions?: SidebarSession[];
-  [key: string]: unknown;
-};
-
-type SearchResult = SidebarSession & {
-  project?: string;
-  matches: { snippet?: string }[];
+  path: string;
+  dirName: string;
+  count: number;
+  lastActive: number;
 };
 
 export class SessionSidebar {
   container: HTMLElement;
-  onSessionSelect: (session: SidebarSession | null, project: SidebarProject | null) => void;
+  onSessionSelect: (session: SidebarSession | null) => void;
+  onNewSession: (cwd: string) => void;
   activeSessionFile: string | null;
   projects: SidebarProject[];
-  collapsedProjects: Set<string | undefined>;
-  searchQuery: string;
+  sessionsByDir: Map<string, SidebarSession[]>;
+  expanded: Set<string>;
+  loading: Set<string>;
   favourites: string[];
   contextMenu: HTMLElement | null;
-  _searchTimer: ReturnType<typeof setTimeout> | null = null;
-  _searchResults: SearchResult[] | null = null;
 
-  constructor(container: HTMLElement, onSessionSelect: (session: SidebarSession | null, project: SidebarProject | null) => void) {
+  constructor(
+    container: HTMLElement,
+    onSessionSelect: (session: SidebarSession | null) => void,
+    onNewSession: (cwd: string) => void,
+  ) {
     this.container = container;
     this.onSessionSelect = onSessionSelect;
+    this.onNewSession = onNewSession;
     this.activeSessionFile = null;
     this.projects = [];
-    this.collapsedProjects = new Set();
-    this.searchQuery = '';
+    this.sessionsByDir = new Map();
+    this.expanded = new Set();
+    this.loading = new Set();
     this.favourites = JSON.parse(localStorage.getItem('tau-favourites') || '[]');
     this.contextMenu = null;
 
@@ -58,6 +62,62 @@ export class SessionSidebar {
       if (!(e.target as Element | null)?.closest('.session-item')) this.closeContextMenu();
     });
   }
+
+  // ═══════════════════════════════════════
+  // Loading
+  // ═══════════════════════════════════════
+
+  async loadProjects() {
+    try {
+      this.container.innerHTML = Array.from({ length: 6 }, () =>
+        '<div class="session-skeleton"><div class="session-skeleton-title"></div><div class="session-skeleton-meta"></div></div>'
+      ).join('');
+      const res = await fetch('/api/sessions');
+      const data = await res.json();
+      this.projects = data.projects || [];
+      this.sessionsByDir.clear();
+      this.render();
+      await this.loadFavouriteProjects();
+    } catch (error) {
+      console.error('[Sidebar] Failed to load projects:', error);
+      this.container.innerHTML = '<div class="session-loading">Failed to load sessions</div>';
+    }
+  }
+
+  async loadSessions(dirName: string) {
+    if (this.sessionsByDir.has(dirName) || this.loading.has(dirName)) return;
+    this.loading.add(dirName);
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(dirName)}`);
+      const data = await res.json();
+      this.sessionsByDir.set(dirName, data.sessions || []);
+    } catch (error) {
+      console.error(`[Sidebar] Failed to load sessions for ${dirName}:`, error);
+    } finally {
+      this.loading.delete(dirName);
+      this.render();
+    }
+  }
+
+  /** Favourites are shown up front, so their projects are the one thing loaded eagerly. */
+  async loadFavouriteProjects() {
+    const dirs = new Set(this.favourites.map(filePath => filePath.split('/').slice(-2)[0]));
+    await Promise.all(Array.from(dirs).map(dir => this.loadSessions(dir)));
+  }
+
+  favouriteSessions() {
+    const found: Array<{ session: SidebarSession; project: SidebarProject }> = [];
+    for (const project of this.projects) {
+      for (const session of this.sessionsByDir.get(project.dirName) || []) {
+        if (this.isFavourite(session.filePath)) found.push({ session, project });
+      }
+    }
+    return found;
+  }
+
+  // ═══════════════════════════════════════
+  // Favourites
+  // ═══════════════════════════════════════
 
   saveFavourites() {
     localStorage.setItem('tau-favourites', JSON.stringify(this.favourites));
@@ -78,163 +138,6 @@ export class SessionSidebar {
     }
     this.saveFavourites();
     this.render();
-  }
-
-  async loadSessions() {
-    try {
-      this.container.innerHTML = Array.from({length: 6}, () =>
-        '<div class="session-skeleton"><div class="session-skeleton-title"></div><div class="session-skeleton-meta"></div></div>'
-      ).join('');
-      const res = await fetch('/api/sessions');
-      const data = await res.json();
-      this.projects = data.projects || [];
-      this.render();
-    } catch (error) {
-      console.error('[Sidebar] Failed to load sessions:', error);
-      this.container.innerHTML = '<div class="session-loading">Failed to load sessions</div>';
-    }
-  }
-
-  setSearchQuery(query: string) {
-    this.searchQuery = query.toLowerCase().trim();
-
-    // Clear pending full-text search
-    if (this._searchTimer) clearTimeout(this._searchTimer);
-
-    if (!this.searchQuery) {
-      this._searchResults = null;
-      this.applySearch();
-      return;
-    }
-
-    // Instant: filter titles
-    this.applySearch();
-
-    // Debounced: full-text search (300ms)
-    if (this.searchQuery.length >= 2) {
-      this._searchTimer = setTimeout(() => this.fullTextSearch(this.searchQuery), 300);
-    }
-  }
-
-  async fullTextSearch(query: string) {
-    // Don't search if query changed since debounce
-    if (query !== this.searchQuery) return;
-
-    try {
-      const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
-      const data = await res.json();
-      if (query !== this.searchQuery) return; // stale
-
-      this._searchResults = data.results || [];
-      this.renderSearchResults();
-    } catch (err) {
-      console.error('[Sidebar] Search failed:', err);
-    }
-  }
-
-  renderSearchResults() {
-    if (!this._searchResults || this._searchResults.length === 0) return;
-
-    // Remove previous search results section
-    const existing = this.container.querySelector('.search-results-group');
-    if (existing) existing.remove();
-
-    const group = document.createElement('div');
-    group.className = 'search-results-group';
-
-    const header = document.createElement('div');
-    header.className = 'project-header search-results-header';
-    header.innerHTML = `<span>🔍</span> <span>Message matches</span> <span class="project-count">${this._searchResults.length}</span>`;
-    group.appendChild(header);
-
-    const sessionsDiv = document.createElement('div');
-    sessionsDiv.className = 'project-sessions';
-
-    for (const result of this._searchResults) {
-      const item = document.createElement('div');
-      item.className = 'session-item search-result-item';
-      item.dataset.filePath = result.filePath;
-
-      if (result.filePath === this.activeSessionFile) {
-        item.classList.add('active');
-      }
-
-      const title = result.sessionName || result.firstMessage || 'Untitled';
-      const snippet = result.matches[0]?.snippet || '';
-      const matchCount = result.matches.length;
-      const time = this.formatTime(result.sessionTimestamp);
-
-      item.innerHTML = `
-        <div class="session-title-row">
-          <div class="session-title" title="${this.escapeHtml(title)}">${this.escapeHtml(title)}</div>
-        </div>
-        <div class="search-snippet">${this.highlightMatch(snippet, this.searchQuery)}</div>
-        <div class="session-meta">${time}${matchCount > 1 ? ` · ${matchCount} matches` : ''}</div>
-      `;
-
-      // Find the matching project/session to pass to onSessionSelect
-      item.addEventListener('click', () => {
-        for (const project of this.projects) {
-          const session = project.sessions?.find(s => s.filePath === result.filePath);
-          if (session) {
-            this.onSessionSelect(session, project);
-            return;
-          }
-        }
-        // Session not in loaded list (unlikely) — try switching by path
-        this.onSessionSelect({ filePath: result.filePath, name: result.sessionName }, { path: result.project });
-      });
-
-      sessionsDiv.appendChild(item);
-    }
-
-    group.appendChild(sessionsDiv);
-    // Insert at top of container
-    this.container.insertBefore(group, this.container.firstChild);
-  }
-
-  highlightMatch(text: string, query: string) {
-    if (!query) return this.escapeHtml(text);
-    const escaped = this.escapeHtml(text);
-    const re = new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
-    return escaped.replace(re, '<mark>$1</mark>');
-  }
-
-  applySearch() {
-    if (!this.searchQuery) {
-      this.container.querySelectorAll('.session-item').forEach(el => el.classList.remove('hidden'));
-      this.container.querySelectorAll('.project-group').forEach(el => el.style.display = '');
-      const favSection = this.container.querySelector('.favourites-group');
-      if (favSection) favSection.style.display = '';
-      // Remove full-text results
-      const searchGroup = this.container.querySelector('.search-results-group');
-      if (searchGroup) searchGroup.remove();
-      return;
-    }
-
-    // Search favourites section
-    const favSection = this.container.querySelector('.favourites-group');
-    if (favSection) {
-      let hasVisible = false;
-      favSection.querySelectorAll('.session-item').forEach(item => {
-        const title = (item.querySelector('.session-title')?.textContent || '').toLowerCase();
-        const matches = title.includes(this.searchQuery);
-        item.classList.toggle('hidden', !matches);
-        if (matches) hasVisible = true;
-      });
-      favSection.style.display = hasVisible ? '' : 'none';
-    }
-
-    this.container.querySelectorAll('.project-group').forEach(group => {
-      let hasVisible = false;
-      group.querySelectorAll('.session-item').forEach(item => {
-        const title = (item.querySelector('.session-title')?.textContent || '').toLowerCase();
-        const matches = title.includes(this.searchQuery);
-        item.classList.toggle('hidden', !matches);
-        if (matches) hasVisible = true;
-      });
-      group.style.display = hasVisible ? '' : 'none';
-    });
   }
 
   setActive(filePath?: string | null) {
@@ -265,7 +168,7 @@ export class SessionSidebar {
       { icon: isFav ? '★' : '☆', label: isFav ? 'Unfavourite' : 'Favourite', action: () => this.toggleFavourite(session.filePath) },
       { icon: '✎', label: 'Rename', action: () => this.startRename(itemEl, session) },
       { icon: '📋', label: 'Export HTML', action: () => this.exportSession(session) },
-      { icon: '🗑', label: 'Delete', action: () => this.deleteSession(session, itemEl) },
+      { icon: '🗑', label: 'Delete', action: () => this.deleteSession(session, project) },
     ];
 
     for (const item of items) {
@@ -321,6 +224,7 @@ export class SessionSidebar {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ type: 'set_session_name', name: newName, filePath: session.filePath }),
           });
+          session.name = newName;
         } catch { /* silent */ }
       }
       const newTitle = document.createElement('div');
@@ -338,7 +242,7 @@ export class SessionSidebar {
     });
   }
 
-  async deleteSession(session: SidebarSession, itemEl: HTMLElement) {
+  async deleteSession(session: SidebarSession, project: SidebarProject) {
     if (!confirm(`Delete "${session.name || session.firstMessage || 'this session'}"?`)) return;
     try {
       const res = await fetch('/api/sessions/delete', {
@@ -346,22 +250,20 @@ export class SessionSidebar {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ filePath: session.filePath }),
       });
-      if (res.ok) {
-        itemEl.remove();
-        // Remove from favourites if present
-        if (session.filePath) {
-          const favIdx = this.favourites.indexOf(session.filePath);
-          if (favIdx >= 0) {
-            this.favourites.splice(favIdx, 1);
-            this.saveFavourites();
-          }
-        }
-        // If this was the active session, clear it
-        if (session.filePath === this.activeSessionFile) {
-          this.clearActive();
-          if (this.onSessionSelect) this.onSessionSelect(null, null);
-        }
+      if (!res.ok) return;
+      const sessions = this.sessionsByDir.get(project.dirName);
+      if (sessions) this.sessionsByDir.set(project.dirName, sessions.filter(s => s.filePath !== session.filePath));
+      project.count = Math.max(0, project.count - 1);
+      const favIdx = this.favourites.indexOf(session.filePath);
+      if (favIdx >= 0) {
+        this.favourites.splice(favIdx, 1);
+        this.saveFavourites();
       }
+      if (session.filePath === this.activeSessionFile) {
+        this.clearActive();
+        this.onSessionSelect(null);
+      }
+      this.render();
     } catch (e) {
       console.error('[Sidebar] Delete failed:', e);
     }
@@ -399,22 +301,76 @@ export class SessionSidebar {
 
     const title = session.name || session.firstMessage || 'Empty session';
     const time = this.formatTime(session.timestamp);
-    const tmuxTag = session.live ? '<span class="session-tag tmux-tag">live</span>' : (session.tmux ? '<span class="session-tag tmux-tag">tmux</span>' : '');
+    const liveTag = session.live ? '<span class="session-tag tmux-tag">live</span>' : '';
     const favIcon = this.isFavourite(session.filePath) ? '<span class="session-fav-icon">★</span>' : '';
 
     item.innerHTML = `
       <div class="session-title-row">
         ${favIcon}
         <div class="session-title" title="${this.escapeHtml(title)}">${this.escapeHtml(title)}</div>
-        ${tmuxTag}
+        ${liveTag}
       </div>
       <div class="session-meta">${time}</div>
     `;
 
-    item.addEventListener('click', () => this.onSessionSelect(session, project));
+    item.addEventListener('click', () => this.onSessionSelect(session));
     item.addEventListener('contextmenu', (e) => this.showContextMenu(e, session, project, item));
 
     return item;
+  }
+
+  buildProjectGroup(project: SidebarProject) {
+    const group = document.createElement('div');
+    group.className = 'project-group';
+    const isExpanded = this.expanded.has(project.dirName);
+
+    const header = document.createElement('div');
+    header.className = `project-header${isExpanded ? '' : ' collapsed'}`;
+
+    const shortPath = project.path.split('/').filter(Boolean).pop() || project.path || project.dirName;
+    header.innerHTML = `
+      <span class="chevron">▼</span>
+      <span title="${this.escapeHtml(project.path)}">${this.escapeHtml(shortPath)}</span>
+      <span class="project-count">${project.count}</span>
+    `;
+    header.addEventListener('click', () => this.toggleProject(project));
+
+    const addBtn = document.createElement('button');
+    addBtn.className = 'project-add-btn';
+    addBtn.type = 'button';
+    addBtn.textContent = '+';
+    addBtn.title = `New session in ${project.path || shortPath}`;
+    addBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.onNewSession(project.path);
+    });
+    header.appendChild(addBtn);
+    group.appendChild(header);
+
+    if (isExpanded) {
+      const sessionsDiv = document.createElement('div');
+      sessionsDiv.className = 'project-sessions';
+      const sessions = this.sessionsByDir.get(project.dirName);
+      if (!sessions) {
+        sessionsDiv.innerHTML = '<div class="session-loading">Loading sessions…</div>';
+      } else {
+        for (const session of sessions) sessionsDiv.appendChild(this.buildSessionItem(session, project));
+      }
+      group.appendChild(sessionsDiv);
+    }
+
+    return group;
+  }
+
+  toggleProject(project: SidebarProject) {
+    if (this.expanded.has(project.dirName)) {
+      this.expanded.delete(project.dirName);
+      this.render();
+      return;
+    }
+    this.expanded.add(project.dirName);
+    this.render();
+    this.loadSessions(project.dirName);
   }
 
   render() {
@@ -425,16 +381,7 @@ export class SessionSidebar {
 
     this.container.innerHTML = '';
 
-    // Favourites section — collect from all projects
-    const favSessions = [];
-    for (const project of this.projects) {
-      for (const session of project.sessions || []) {
-        if (this.isFavourite(session.filePath)) {
-          favSessions.push({ session, project });
-        }
-      }
-    }
-
+    const favSessions = this.favouriteSessions();
     if (favSessions.length > 0) {
       const favGroup = document.createElement('div');
       favGroup.className = 'favourites-group';
@@ -453,48 +400,9 @@ export class SessionSidebar {
       this.container.appendChild(favGroup);
     }
 
-    // Regular project groups
     for (const project of this.projects) {
-      const group = document.createElement('div');
-      group.className = 'project-group';
-      const isCollapsed = this.collapsedProjects.has(project.dirName);
-
-      const header = document.createElement('div');
-      header.className = `project-header${isCollapsed ? ' collapsed' : ''}`;
-
-      const pathParts = (project.path || '').split('/').filter(Boolean);
-      const shortPath = pathParts.length > 0 ? pathParts[pathParts.length - 1] : (project.path || '');
-
-      header.innerHTML = `
-        <span class="chevron">▼</span>
-        <span title="${this.escapeHtml(project.path)}">${this.escapeHtml(shortPath)}</span>
-        <span class="project-count">${(project.sessions || []).length}</span>
-      `;
-
-      header.addEventListener('click', () => {
-        if (this.collapsedProjects.has(project.dirName)) {
-          this.collapsedProjects.delete(project.dirName);
-        } else {
-          this.collapsedProjects.add(project.dirName);
-        }
-        header.classList.toggle('collapsed');
-        sessionsDiv.classList.toggle('collapsed');
-      });
-
-      group.appendChild(header);
-
-      const sessionsDiv = document.createElement('div');
-      sessionsDiv.className = `project-sessions${isCollapsed ? ' collapsed' : ''}`;
-
-      for (const session of project.sessions || []) {
-        sessionsDiv.appendChild(this.buildSessionItem(session, project));
-      }
-
-      group.appendChild(sessionsDiv);
-      this.container.appendChild(group);
+      this.container.appendChild(this.buildProjectGroup(project));
     }
-
-    if (this.searchQuery) this.applySearch();
   }
 
   formatTime(isoTimestamp?: string) {

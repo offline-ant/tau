@@ -2,6 +2,13 @@
 
 **Browser workspace for [Pi](https://github.com/earendil-works/pi) — a standalone web server that manages multiple live Pi RPC sessions in parallel.**
 
+> **This checkout is a fork** of [milanglacier/pi-tau-web-server](https://github.com/milanglacier/pi-tau-web-server)
+> (remote `upstream`, branch `pi-orchestration`). It adds orchestration support for
+> pi-ant: tau acts as a *web host* for Pi workers, and never becomes a second writer
+> on a session file a terminal worker owns. See [Orchestration host](#orchestration-host).
+> It also ships default HTTP Basic credentials, so the default `0.0.0.0` bind is
+> authenticated out of the box.
+
 Pi Tau Web Server is a fork of [deflating/tau](https://github.com/deflating/tau), forked at
 [`5e2bce39`](https://github.com/deflating/tau/tree/5e2bce39) and rewritten from
 a Pi extension that ran inside the Pi TUI into a standalone Node.js web server.
@@ -44,7 +51,7 @@ work with multiple Pi sessions side by side in your browser.
 - **Multiple live sessions** — in-page Tau tabs (not browser tabs) each represent a live Pi RPC session. Create, switch, and close them from one browser page. Tau runs all of them in parallel.
 - **Session persistence while the server runs** — closing or reloading the browser does not kill Pi child sessions; only closing an in-page Tau tab or shutting down the Tau server does
 - **Works on any device** — open the same Tau server from your phone, tablet, or another monitor
-- **Session history browser** — view saved Pi JSONL session files, search across all sessions by message content
+- **Session history browser** — browse saved Pi JSONL session files by project, loading a project's sessions when it is opened
 - **WebSocket-based client-server architecture** — the browser connects to Tau over HTTP and WebSocket; Tau communicates with Pi processes over JSON line-delimited RPC over stdin/stdout
 
 ## Install
@@ -160,8 +167,8 @@ machine. Pass `--bind 127.0.0.1` to restrict an instance to local access.
 
 ### Session Browser
 
-- Sidebar with all saved Pi JSONL session files, grouped by project
-- Full-text search across all historical sessions with highlighted snippets
+- Sidebar listing every project that has saved Pi JSONL sessions, collapsed by default
+- Expanding a project loads its sessions; `+` on a project header starts a new session there
 - Rename sessions, export to HTML
 
 ### Mobile Support
@@ -195,15 +202,15 @@ Six built-in themes: Dusk (clean neutral dark, default), Dawn (warm blue dark), 
 | `TAU_HOST`         |   `0.0.0.0` |                                             Bind address |
 | `TAU_PROJECTS_DIR` |    _(none)_ | Directory scanned for project chips in the new-tab modal |
 | `TAU_STATIC_DIR`   | _(bundled)_ |                               Override static files path |
-| `TAU_USER`         |    _(none)_ |                                 HTTP Basic Auth username |
-| `TAU_PASS`         |    _(none)_ |                                 HTTP Basic Auth password |
+| `TAU_USER`         |        `rs` |                                 HTTP Basic Auth username |
+| `TAU_PASS`         |         `l` |                                 HTTP Basic Auth password |
 | `TAU_COOKIE_SECRET`| _(generated)_ |            Secret that signs session cookies (optional) |
 
 Tau also reads matching values from `~/.pi/agent/settings.json` under the `tau` key (`host`, `port`, `projectsDir`, `user`, `pass`, `authEnabled`, `cookieSecret`).
 
 ### Authentication
 
-Tau Web Server supports optional HTTP Basic Auth. Set credentials in `~/.pi/agent/settings.json` or via environment variables, then toggle "Require login" in Tau Settings.
+Tau Web Server supports HTTP Basic Auth. This fork ships **default credentials `rs` / `l`**, so auth is enabled out of the box and the default `0.0.0.0` bind is never an unauthenticated session-spawning API. Replace them in `~/.pi/agent/settings.json` or via environment variables, then toggle "Require login" in Tau Settings. Setting `TAU_USER`/`TAU_PASS` (or the settings keys) to an empty string leaves auth unconfigured and disabled.
 
 ```json
 {
@@ -217,6 +224,39 @@ Tau Web Server supports optional HTTP Basic Auth. Set credentials in `~/.pi/agen
 Both HTTP and WebSocket connections are gated when enabled. `/api/health` remains open for monitoring.
 
 After the first successful Basic login, the server sets a signed `HttpOnly` session cookie and accepts it in place of the Authorization header. This keeps mobile browsers (notably iOS Safari and the installed PWA, which evict cached Basic credentials whenever you switch apps) from re-prompting for the password every time you return to the app. The cookie is scoped to the browser session — killing the browser ends it and the Basic prompt appears again — and the token inside it expires after 12 hours of inactivity, renewing itself while the app is in use. Changing the password invalidates every outstanding cookie on all devices, and deleting the auto-generated `cookieSecret` from `~/.pi/agent/settings.json` force-logs-out all devices at once.
+
+## Orchestration host
+
+pi-ant's orchestration package starts Pi workers on a *host*: tmux, Herdr, Emacs,
+or — with this fork — tau. A web-hosted worker is an ordinary live tab: you watch
+it stream in the browser, and its prompts are RPC commands rather than keystrokes,
+so there is no terminal draft to disturb.
+
+Three pieces make that work:
+
+- **Programmatic spawn.** `POST /api/live-sessions` accepts `sessionFile`, `args`,
+  and `env` next to `cwd` and `model`, so a caller runs the child with its own
+  session file, model flags, and environment. `args` is appended after tau's own
+  arguments; `sessionFile` must live under Pi's session directory.
+- **Discovery.** While running, the server writes `~/.pi/agent/tau/server.json`
+  (mode `0600`) containing its endpoint URL, with HTTP Basic credentials in the
+  URL userinfo when auth is configured. A Pi session started anywhere on the
+  machine can then select this server with `/orchestration-host web`. A second
+  concurrent server does not overwrite the first one's record; target it with
+  `PI_ORCHESTRATION_ENDPOINT`. Children tau spawns inherit
+  `PI_ORCHESTRATION_HOST=web` and that endpoint directly.
+- **Ownership.** Workers on a *terminal* host register themselves in
+  `$TMPDIR/pi-orchestration-targets`. Tau reads that registry, marks those
+  sessions `owner` in `GET /api/sessions`, and answers `POST
+  /api/live-sessions/resume` with `409` instead of attaching a second `pi`
+  process to a file another one is appending to. The UI opens such a session
+  read-only and re-reads it while it grows; `GET
+  /api/sessions/:project/:file?since=<byte offset>` serves those incremental
+  reads. The registry is advisory — a crashed orchestrator leaves its record
+  behind — so `{"force": true}` still resumes.
+
+Tau has no terminal, so it hosts Pi sessions only: `panel-start` and other shell
+work stay on a terminal host.
 
 ## How it works
 

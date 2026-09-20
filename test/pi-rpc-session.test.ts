@@ -212,6 +212,21 @@ test('terminate does not escalate to SIGKILL if the child already exited after S
   assert.deepEqual(killedSignals, ['SIGTERM']);
 });
 
+test('a pending command rejected by an exit reports the child stderr that explains it', async () => {
+  const manager = makeManager();
+  const session = new PiRpcSession(manager, { cwd: '/tmp' });
+  session.child = { stdin: { writable: true, write: ((_d: string, cb?: (err?: Error | null) => void) => cb && cb()) as FakeWrite } };
+  // A child that dies during startup says why on stderr; the exit code alone
+  // made an unknown provider look like a transport failure.
+  for (let i = 0; i < 25; i++) session.stderrTail.push(`noise ${i}`);
+  if (session.stderrTail.length > 20) session.stderrTail.splice(0, session.stderrTail.length - 20);
+  session.stderrTail.push('Error: Unknown provider "claude-agent".');
+  const pending = session.send({ type: 'get_session_stats' }, { timeoutMs: 100000 });
+  const check = assert.rejects(pending, /Pi process exited \(1\):[\s\S]*Unknown provider "claude-agent"/);
+  session.handleExit(1, null);
+  await check;
+});
+
 test('handleExit rejects pending and notifies the manager once', async () => {
   const manager = makeManager();
   const session = new PiRpcSession(manager, { cwd: '/tmp' });

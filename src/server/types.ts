@@ -48,6 +48,15 @@ export type RpcCommand = {
   enabled?: boolean;
   [key: string]: unknown;
 };
+/**
+ * Extra `pi` CLI arguments and environment for a spawned session. Callers that
+ * drive tau programmatically (pi-ant orchestration) need the child to run with
+ * their own extensions, model flags, and orchestration variables.
+ */
+export type SessionSpawnOverrides = {
+  args?: string[];
+  env?: Record<string, string>;
+};
 export type RpcResponse = JsonRecord;
 export type PendingCommand = {
   resolve: (value: RpcResponse) => void;

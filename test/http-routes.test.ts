@@ -8,11 +8,18 @@ import { PassThrough } from 'node:stream';
 
 // Loopback host so computeUrls() sets a localhost lanUrl; isolate settings.
 process.env.TAU_HOST = '127.0.0.1';
+// Isolate the orchestration registry under os.tmpdir(): these cases write
+// session-owner records and must never touch a real one on this machine.
+process.env.TMPDIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-http-tmp-'));
 process.env.PI_CODING_AGENT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-http-'));
 process.env.PI_CODING_AGENT_SESSION_DIR = path.join(process.env.PI_CODING_AGENT_DIR, 'sessions');
 // Configure a projects dir so /api/projects has something to list.
 const PROJECTS_DIR = path.join(process.env.PI_CODING_AGENT_DIR, 'projects');
 process.env.TAU_PROJECTS_DIR = PROJECTS_DIR;
+// These routes are exercised unauthenticated; this fork configures default
+// credentials, so opt out explicitly with empty values.
+process.env.TAU_USER = '';
+process.env.TAU_PASS = '';
 
 // Load the server after the env is in place: the module reads it at load
 // time, and ESM hoists static imports ahead of this body.
@@ -317,25 +324,148 @@ test('GET /api/sessions/:project/:file returns 404 for a missing file', async ()
   assert.equal(res.status, 404);
 });
 
-test('GET /api/search returns matching session entries', async () => {
-  writeSessionFile([
-    { type: 'session', id: 's', timestamp: '2026-01-01T00:00:00.000Z' },
-    { type: 'message', message: { role: 'user', content: 'please find the unique keyword here' } },
-  ]);
-  const res = await fetch(`${base}/api/search?q=keyword`);
-  assert.equal(res.status, 200);
-  const body = await jsonBody(res);
-  assert.equal(body.results.length, 1);
-  assert.equal(body.results[0].sessionId, 's');
-  assert.match(body.results[0].matches[0].snippet, /keyword/);
+test('GET /api/sessions/:project/:file reads only what was appended since a byte offset', async () => {
+  writeSessionFile([{ type: 'session', id: 'tail' }, { type: 'message', message: { role: 'user', content: 'first' } }]);
+  const initial = await jsonBody(await fetch(`${base}/api/sessions/--tmp--httpproj/s.jsonl`));
+  assert.equal(initial.entries.length, 2);
+  assert.equal(initial.offset, fs.statSync(SESSION_FILE).size);
+  assert.equal(initial.reset, false);
+
+  const empty = await jsonBody(await fetch(`${base}/api/sessions/--tmp--httpproj/s.jsonl?since=${initial.offset}`));
+  assert.deepEqual(empty.entries, []);
+  assert.equal(empty.offset, initial.offset);
+
+  fs.appendFileSync(SESSION_FILE, `${JSON.stringify({ type: 'message', message: { role: 'assistant', content: 'second' } })}\n`);
+  const appended = await jsonBody(await fetch(`${base}/api/sessions/--tmp--httpproj/s.jsonl?since=${initial.offset}`));
+  assert.equal(appended.entries.length, 1);
+  assert.equal(appended.entries[0].message.content, 'second');
+  assert.equal(appended.offset, fs.statSync(SESSION_FILE).size);
+
+  // A partial final line is left for the next read, so entries never split.
+  fs.appendFileSync(SESSION_FILE, '{"type":"message"');
+  const partial = await jsonBody(await fetch(`${base}/api/sessions/--tmp--httpproj/s.jsonl?since=${appended.offset}`));
+  assert.deepEqual(partial.entries, []);
+  assert.equal(partial.offset, appended.offset);
+
+  // A rewritten (shorter) file answers from the start rather than mid-record.
+  writeSessionFile([{ type: 'session', id: 'tail' }]);
+  const rewritten = await jsonBody(await fetch(`${base}/api/sessions/--tmp--httpproj/s.jsonl?since=${appended.offset}`));
+  assert.equal(rewritten.reset, true);
+  assert.equal(rewritten.entries.length, 1);
+
+  const invalid = await fetch(`${base}/api/sessions/--tmp--httpproj/s.jsonl?since=-1`);
+  assert.equal(invalid.status, 400);
 });
 
-test('GET /api/search returns an empty result list for a too-short query', async () => {
-  writeSessionFile([{ type: 'session', id: 's' }]);
-  const res = await fetch(`${base}/api/search?q=a`);
-  assert.equal(res.status, 200);
-  const body = await jsonBody(res);
-  assert.deepEqual(body.results, []);
+test('a session owned by an orchestration worker is listed as owned and is not resumed by default', async (t: TestContext) => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-owned-'));
+  writeSessionFileAt(PROJ_DIR, 'owned.jsonl', [
+    { type: 'session', id: 'owned-sess', timestamp: '2026-01-01T00:00:00.000Z', cwd },
+    { type: 'message', message: { role: 'user', content: 'worker task' } },
+    { type: 'message', message: { role: 'assistant', content: 'working' } },
+    // Two user messages: the listing skips sessions that never got going.
+    { type: 'message', message: { role: 'user', content: 'continue' } },
+  ]);
+  const sessionFile = path.join(PROJ_DIR, 'owned.jsonl');
+  const registry = path.join(os.tmpdir(), 'pi-orchestration-targets');
+  fs.mkdirSync(registry, { recursive: true });
+  fs.writeFileSync(path.join(registry, 'delegate-7.json'),
+    JSON.stringify({ target: { host: 'tmux', name: 'delegate-7', id: '%3', kind: 'pi', sessionFile } }));
+  // A session this server hosts is a live tab here, not somebody else's.
+  fs.writeFileSync(path.join(registry, 'web-worker.json'),
+    JSON.stringify({ target: { host: 'web', name: 'web-worker', id: 'tau_9', kind: 'pi', sessionFile: path.join(PROJ_DIR, 'resume.jsonl') } }));
+  t.after(() => fs.rmSync(registry, { recursive: true, force: true }));
+
+  const listing = await jsonBody(await fetch(`${base}/api/sessions/--tmp--httpproj`));
+  const sessions = listing.sessions;
+  const owned = sessions.find((entry: { file?: string }) => entry.file === 'owned.jsonl');
+  assert.deepEqual(owned.owner, { name: 'delegate-7', host: 'tmux' });
+  for (const entry of sessions.filter((item: { file?: string }) => item.file !== 'owned.jsonl')) assert.equal(entry.owner, null);
+
+  const refused = await fetch(`${base}/api/live-sessions/resume`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: base, Host: new URL(base).host },
+    body: JSON.stringify({ filePath: sessionFile }),
+  });
+  assert.equal(refused.status, 409);
+  const refusedBody = await jsonBody(refused);
+  assert.deepEqual(refusedBody.owner, { name: 'delegate-7', host: 'tmux' });
+  assert.match(refusedBody.error, /running as delegate-7 on tmux/);
+  assert.equal(liveManager.findBySessionFile(sessionFile), undefined);
+
+  const child = makeFakeChild();
+  _setSpawnPiForTest(() => child);
+  t.after(() => _setSpawnPiForTest(null));
+  const forced = await fetch(`${base}/api/live-sessions/resume`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: base, Host: new URL(base).host },
+    body: JSON.stringify({ filePath: sessionFile, force: true }),
+  });
+  assert.equal(forced.status, 200);
+  const forcedBody = await jsonBody(forced);
+  assert.equal(forcedBody.session.sessionFile, sessionFile);
+  await liveManager.delete(forcedBody.session.id);
+  child.stdin.end();
+});
+
+test('GET /api/sessions lists projects without parsing their transcripts', async () => {
+  const projectDir = path.join(SESSIONS_DIR, '--tmp--listproj');
+  writeSessionFileAt(projectDir, 'older.jsonl', [
+    { type: 'session', id: 'older', timestamp: '2026-01-01T00:00:00.000Z', cwd: '/tmp/listproj' },
+    { type: 'message', message: { role: 'user', content: 'older session' } },
+  ]);
+  writeSessionFileAt(projectDir, 'newer.jsonl', [
+    { type: 'session', id: 'newer', timestamp: '2026-01-02T00:00:00.000Z', cwd: '/tmp/listproj' },
+    { type: 'message', message: { role: 'user', content: 'newer session' } },
+  ]);
+
+  const body = await jsonBody(await fetch(`${base}/api/sessions`));
+  const project = body.projects.find((p: { dirName: string }) => p.dirName === '--tmp--listproj');
+  assert.equal(project.path, path.resolve('/tmp/listproj'));
+  assert.equal(project.count, 2);
+  assert.ok(project.lastActive > 0);
+  assert.equal(project.sessions, undefined);
+});
+
+test('GET /api/sessions/:project summarises the sessions of that project, newest first', async () => {
+  const projectDir = path.join(SESSIONS_DIR, '--tmp--summaryproj');
+  writeSessionFileAt(projectDir, 'older.jsonl', [
+    { type: 'session', id: 'older', timestamp: '2026-01-01T00:00:00.000Z', cwd: '/tmp/summaryproj' },
+    { type: 'message', message: { role: 'user', content: 'older session' } },
+  ]);
+  writeSessionFileAt(projectDir, 'newer.jsonl', [
+    { type: 'session', id: 'newer', timestamp: '2026-01-02T00:00:00.000Z', cwd: '/tmp/summaryproj' },
+    { type: 'message', message: { role: 'user', content: 'newer session' } },
+  ]);
+
+  const body = await jsonBody(await fetch(`${base}/api/sessions/--tmp--summaryproj`));
+  assert.deepEqual(body.sessions.map((s: { id: string }) => s.id), ['newer', 'older']);
+  assert.equal(body.sessions[0].firstMessage, 'Newer session');
+  assert.equal(body.sessions[0].file, 'newer.jsonl');
+  assert.equal(body.sessions[0].dir, '--tmp--summaryproj');
+  assert.equal(body.sessions[0].live, false);
+  assert.equal(body.sessions[0].owner, null);
+});
+
+test('GET /api/sessions/:project summarises a transcript larger than the read window from both ends', async () => {
+  const filler = { type: 'message', message: { role: 'assistant', content: 'x'.repeat(4096) } };
+  writeSessionFileAt(PROJ_DIR, 'big.jsonl', [
+    { type: 'session', id: 'big', timestamp: '2026-01-03T00:00:00.000Z', cwd: '/tmp/httpproj' },
+    { type: 'message', message: { role: 'user', content: 'opening question' } },
+    ...Array.from({ length: 40 }, () => filler),
+    { type: 'session_info', name: 'Renamed after a long chat' },
+  ]);
+
+  const body = await jsonBody(await fetch(`${base}/api/sessions/--tmp--httpproj`));
+  const big = body.sessions.find((s: { file: string }) => s.file === 'big.jsonl');
+  assert.equal(big.id, 'big');
+  assert.equal(big.firstMessage, 'Opening question');
+  assert.equal(big.name, 'Renamed after a long chat');
+});
+
+test('GET /api/sessions/:project returns 404 for an unknown project', async () => {
+  const res = await fetch(`${base}/api/sessions/--tmp--nosuchproject`);
+  assert.equal(res.status, 404);
 });
 
 test('GET /api/sessions preserves hyphenated project cwd from the session header', async () => {
@@ -355,21 +485,6 @@ test('GET /api/sessions preserves hyphenated project cwd from the session header
   assert.ok(project);
   assert.equal(path.basename(project.path), 'agent-scratch');
   assert.ok(!project.path.includes(`${path.sep}agent${path.sep}scratch`));
-});
-
-test('GET /api/search returns the hyphenated project cwd from the session header', async () => {
-  const projectPath = path.join(PROJECTS_DIR, 'agent-scratch');
-  const encodedDir = path.join(SESSIONS_DIR, '--tmp--agent-scratch-search');
-  writeSessionFileAt(encodedDir, 'hyphen-search.jsonl', [
-    { type: 'session', id: 'hyphen-search', timestamp: '2026-01-01T00:00:00.000Z', cwd: projectPath },
-    { type: 'message', message: { role: 'user', content: 'please find hyphenneedle here' } },
-  ]);
-
-  const res = await fetch(`${base}/api/search?q=hyphenneedle`);
-  assert.equal(res.status, 200);
-  const body = await jsonBody(res);
-  assert.equal(body.results.length, 1);
-  assert.equal(body.results[0].project, path.resolve(projectPath));
 });
 
 test('GET /api/projects lists project directories under the configured projects dir', async () => {

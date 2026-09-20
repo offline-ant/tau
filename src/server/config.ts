@@ -28,6 +28,13 @@ export function expandHome(p: string) {
   return p.startsWith('~') ? path.join(USER_HOME, p.slice(1)) : p;
 }
 
+// Fork default: this workspace always runs tau with credentials configured, so
+// the default 0.0.0.0 bind is never an open session-spawning API. An
+// explicitly empty TAU_USER/TAU_PASS (or an empty value in settings.json) opts
+// out and leaves auth unconfigured.
+export const DEFAULT_USER = 'rs';
+export const DEFAULT_PASS = 'l';
+
 export function loadTauSettings(): TauSettings {
   let settings: TauSettingsFile['tau'] = {};
   try {
@@ -37,8 +44,8 @@ export function loadTauSettings(): TauSettings {
   return {
     port: parseInt(String(ARGS.port || process.env.TAU_PORT || settings.port || '3001'), 10),
     host: ARGS.host || process.env.TAU_HOST || settings.host || '0.0.0.0',
-    user: process.env.TAU_USER || settings.user || '',
-    pass: process.env.TAU_PASS || settings.pass || '',
+    user: process.env.TAU_USER ?? settings.user ?? DEFAULT_USER,
+    pass: process.env.TAU_PASS ?? settings.pass ?? DEFAULT_PASS,
     authEnabled: settings.authEnabled,
     cookieSecret: process.env.TAU_COOKIE_SECRET || settings.cookieSecret || '',
     projectsDir: expandHome(ARGS['projects-dir'] || process.env.TAU_PROJECTS_DIR || settings.projectsDir || ''),

@@ -444,33 +444,10 @@ body {
   box-shadow: var(--shadow-inset);
 }
 
-/* Sidebar search */
-.sidebar-search-input {
-  flex: 1;
-  min-width: 0;
-  padding: 6px 10px;
-  background: var(--bg-glass);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  color: var(--text-primary);
-  font-size: 12px;
-  font-family: inherit;
-  outline: none;
-  transition: all var(--duration) var(--ease);
-  -webkit-app-region: no-drag;
-}
-
-.sidebar-search-input:focus {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-glow);
-  background: var(--bg-glass-hover);
-}
-
-.sidebar-search-input::placeholder { color: var(--text-dim); }
-
 .sidebar-actions {
   display: flex;
   gap: 2px;
+  margin-left: auto;
   -webkit-app-region: no-drag;
 }
 
@@ -597,13 +574,27 @@ body {
   color: var(--text-dim);
 }
 
+.project-add-btn {
+  background: none;
+  border: none;
+  padding: 0 2px;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--text-dim);
+  cursor: pointer;
+  opacity: 0;
+  transition: all var(--duration) var(--ease);
+}
+
+.project-header:hover .project-add-btn { opacity: 1; }
+
+.project-add-btn:hover { color: var(--accent); }
+
 .project-sessions {
   display: flex;
   flex-direction: column;
   gap: 1px;
 }
-
-.project-sessions.collapsed { display: none; }
 
 /* Session items */
 .session-item {
@@ -702,29 +693,6 @@ body {
   background: color-mix(in srgb, var(--accent) 15%, transparent);
   color: var(--accent);
   border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent);
-}
-
-/* Search results */
-.search-results-header {
-  color: var(--accent-text);
-}
-
-.search-snippet {
-  font-size: 12px;
-  color: var(--text-dim);
-  line-height: 1.4;
-  margin-top: 2px;
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-}
-
-.search-snippet mark {
-  background: var(--accent-glow);
-  color: var(--accent-text);
-  border-radius: 2px;
-  padding: 0 1px;
 }
 
 .session-title {
@@ -2482,6 +2450,7 @@ body.hide-thinking .thinking-block { display: none !important; }
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: 16px;
   z-index: 1000;
   animation: fadeIn 0.15s;
   backdrop-filter: blur(16px);
@@ -2493,7 +2462,12 @@ body.hide-thinking .thinking-block { display: none !important; }
   to { opacity: 1; }
 }
 
+/* A column so the title and actions stay in view while the message and option
+   list scroll: a select with many options must never push its buttons off
+   screen. */
 .dialog {
+  display: flex;
+  flex-direction: column;
   background: var(--bg-frosted);
   backdrop-filter: blur(var(--blur-heavy)) saturate(1.5);
   -webkit-backdrop-filter: blur(var(--blur-heavy)) saturate(1.5);
@@ -2502,11 +2476,13 @@ body.hide-thinking .thinking-block { display: none !important; }
   padding: 28px;
   max-width: 420px;
   width: 90%;
+  max-height: min(80dvh, 720px);
   box-shadow: var(--shadow-lg), var(--shadow-inset);
   animation: sheetIn 0.3s var(--ease);
 }
 
 .dialog-title {
+  flex-shrink: 0;
   font-size: 16px;
   font-weight: 600;
   margin-bottom: 12px;
@@ -2517,6 +2493,8 @@ body.hide-thinking .thinking-block { display: none !important; }
   color: var(--text-secondary);
   font-size: 13px;
   line-height: 1.55;
+  overflow-y: auto;
+  min-height: 0;
 }
 
 .dialog-input,
@@ -2552,9 +2530,16 @@ body.hide-thinking .thinking-block { display: none !important; }
   flex-direction: column;
   gap: 4px;
   margin-bottom: 16px;
+  overflow-y: auto;
+  min-height: 0;
+  /* Room for the hover lift, which would otherwise be clipped by the scroller. */
+  padding: 1px;
+  margin-left: -1px;
+  margin-right: -1px;
 }
 
 .dialog-option {
+  flex-shrink: 0;
   padding: 10px 12px;
   background: var(--bg-glass);
   border: 1px solid var(--border);
@@ -2576,6 +2561,7 @@ body.hide-thinking .thinking-block { display: none !important; }
 
 .dialog-actions {
   display: flex;
+  flex-shrink: 0;
   gap: 8px;
   justify-content: flex-end;
 }
@@ -3481,19 +3467,14 @@ body.hide-thinking .thinking-block { display: none !important; }
     font-weight: 400;
   }
 
-  .search-snippet {
-    font-size: 14px;
-    font-weight: 400;
-  }
-
   .sidebar-header {
     padding: 16px 16px;
   }
 
-  .sidebar-search-input {
-    font-size: 16px;
-    padding: 10px 12px;
-    border-radius: var(--radius-md);
+  .project-add-btn {
+    opacity: 1;
+    font-size: 18px;
+    padding: 0 6px;
   }
 
   .icon-btn,

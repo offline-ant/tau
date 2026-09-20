@@ -7,7 +7,7 @@ import { StateManager } from './state.js';
 import { MessageRenderer } from './message-renderer.js';
 import { ToolCardRenderer, type ToolExecution, type ToolResult } from './tool-card.js';
 import { DialogHandler, type DialogRequest } from './dialogs.js';
-import { SessionSidebar, type SidebarProject, type SidebarSession } from './session-sidebar.js';
+import { SessionSidebar, type SidebarSession } from './session-sidebar.js';
 import { themes, applyTheme, getCurrentTheme } from './themes.js';
 import { FileBrowser, getFileIcon } from './file-browser.js';
 import { setupLauncherPanel } from './launcher-panel.js';
@@ -48,7 +48,8 @@ const dialogHandler = new DialogHandler(document.getElementById('dialog-containe
 // Session sidebar
 const sidebar = new SessionSidebar(
   document.getElementById('session-list')!,
-  handleSessionSelect
+  handleSessionSelect,
+  (cwd) => openNewLiveSessionModal(cwd),
 );
 
 // UI elements
@@ -133,7 +134,6 @@ const sidebarToggle = document.getElementById('sidebar-toggle')!;
 const sidebarOverlay = document.getElementById('sidebar-overlay')!;
 
 const refreshSessionsBtn = document.getElementById('refresh-sessions-btn')!;
-const sessionSearchInput = document.getElementById('session-search-input')!;
 const typingIndicator = document.getElementById('typing-indicator')!;
 
 const contextPillEl = document.getElementById('context-pill')!;
@@ -560,6 +560,7 @@ async function selectLiveSession(id: string) {
   const session = liveSessions.find(s => s.id === id);
   if (!session) return;
   suspendCurrentDialogForTabSwitch(id);
+  stopFollowing();
   launcherPanel.hide();
   activeLiveSessionId = id;
   localStorage.setItem('tau-active-live-session-id', id);
@@ -636,11 +637,12 @@ async function loadProjectChips() {
   } catch {}
 }
 
-function openNewLiveSessionModal() {
+function openNewLiveSessionModal(cwd?: string) {
   newLiveSessionOverlay?.classList.remove('hidden');
   newLiveSessionModal?.classList.remove('hidden');
   newLiveSessionSubmit.disabled = false;
-  if (!newLiveSessionCwd.value) newLiveSessionCwd.value = liveSessions.find(s => s.id === activeLiveSessionId)?.cwd || '';
+  if (cwd) newLiveSessionCwd.value = cwd;
+  else if (!newLiveSessionCwd.value) newLiveSessionCwd.value = liveSessions.find(s => s.id === activeLiveSessionId)?.cwd || '';
   loadProjectChips();
   requestAnimationFrame(() => newLiveSessionCwd?.focus());
 }
@@ -650,7 +652,7 @@ function closeNewLiveSessionModal() {
   newLiveSessionModal?.classList.add('hidden');
 }
 
-liveTabAddBtn?.addEventListener('click', openNewLiveSessionModal);
+liveTabAddBtn?.addEventListener('click', () => openNewLiveSessionModal());
 document.getElementById('new-live-session-close')?.addEventListener('click', closeNewLiveSessionModal);
 document.getElementById('new-live-session-cancel')?.addEventListener('click', closeNewLiveSessionModal);
 newLiveSessionOverlay?.addEventListener('click', closeNewLiveSessionModal);
@@ -1458,7 +1460,7 @@ sidebarOverlay.addEventListener('click', () => {
 
 
 const newSessionBtn = document.getElementById('new-session-btn')!;
-newSessionBtn.addEventListener('click', openNewLiveSessionModal);
+newSessionBtn.addEventListener('click', () => openNewLiveSessionModal());
 
 refreshSessionsBtn.addEventListener('click', () => {
   if (isMobile()) {
@@ -1466,7 +1468,7 @@ refreshSessionsBtn.addEventListener('click', () => {
     return;
   }
   refreshSessionsBtn.classList.add('spinning');
-  sidebar.loadSessions().then(() => {
+  sidebar.loadProjects().then(() => {
     setTimeout(() => refreshSessionsBtn.classList.remove('spinning'), 600);
     updateLiveSessionIndicators();
   });
@@ -1511,11 +1513,6 @@ refreshSessionsBtn.addEventListener('click', () => {
   }, { passive: true });
 })();
 
-// Session search
-sessionSearchInput.addEventListener('input', () => {
-  sidebar.setSearchQuery(sessionSearchInput.value);
-});
-
 async function newSession() {
   sessionTotalCost = 0;
   lastInputTokens = 0;
@@ -1530,13 +1527,13 @@ async function newSession() {
   if (!isMobile()) messageInput.focus();
 }
 
-async function handleSessionSelect(session: SidebarSession | null, project: SidebarProject | null) {
+async function handleSessionSelect(session: SidebarSession | null) {
   if (session) sidebar.setActive(session.filePath);
   sessionTotalCost = 0;
   lastInputTokens = 0;
   lastUsage = null;
   updateContextPill();
-  if (session) await switchSession(session.filePath, session, project);
+  if (session) await switchSession(session.filePath, session);
 
   // Close sidebar on mobile after selecting
   if (isMobile()) {
@@ -1545,14 +1542,98 @@ async function handleSessionSelect(session: SidebarSession | null, project: Side
   }
 }
 
-async function switchSession(sessionFile: string | null | undefined, session: SidebarSession | null = null, project: SidebarProject | null = null) {
+// ═══════════════════════════════════════
+// Read-only follow of a session another Pi process owns
+// ═══════════════════════════════════════
+
+/*
+ * A session file that an orchestration worker (tmux, Herdr, Emacs) is
+ * appending to must not be resumed here: two `pi` processes writing one JSONL
+ * file interleave entries and fork the conversation tree. Such a session is
+ * shown read-only instead, re-read from disk while it grows.
+ */
+
+const FOLLOW_POLL_MS = 3000;
+
+type SessionOwner = { name: string; host: string };
+type FollowedSession = {
+  dirName: string;
+  file: string;
+  offset: number;
+  entries: SessionHistoryEntry[];
+  owner: SessionOwner;
+  timer: ReturnType<typeof setInterval>;
+};
+
+let followed: FollowedSession | null = null;
+
+function sessionOwnerOf(value: unknown): SessionOwner | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const { name, host } = value as { name?: unknown; host?: unknown };
+  return typeof name === 'string' && typeof host === 'string' ? { name, host } : null;
+}
+
+function stopFollowing() {
+  if (!followed) return;
+  clearInterval(followed.timer);
+  followed = null;
+}
+
+async function readFollowedSession(dirName: string, file: string, since: number) {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(dirName)}/${encodeURIComponent(file)}?since=${since}`);
+  const data = await res.json();
+  if (!res.ok || data.error) throw new Error(data.error || 'Failed to read session file');
+  return data as { entries: SessionHistoryEntry[]; offset: number; reset: boolean };
+}
+
+function renderFollowedSession(current: FollowedSession) {
+  clearConversation();
+  messageRenderer.renderSystemMessage(
+    `Read-only: ${current.owner.name} is running this session on ${current.owner.host}. Open it again once that worker finishes to continue it here.`
+  );
+  renderSessionHistory(current.entries);
+  updateLiveSessionInputState();
+  updateUI();
+}
+
+async function pollFollowedSession() {
+  const current = followed;
+  if (!current) return;
+  try {
+    const chunk = await readFollowedSession(current.dirName, current.file, current.offset);
+    if (followed !== current) return;
+    current.offset = chunk.offset;
+    if (chunk.reset) current.entries = chunk.entries;
+    else if (chunk.entries.length) current.entries = current.entries.concat(chunk.entries);
+    else return;
+    renderFollowedSession(current);
+  } catch (e) {
+    stopFollowing();
+    messageRenderer.renderError(e instanceof Error ? e.message : 'Stopped following this session');
+  }
+}
+
+async function followSession(session: SidebarSession, owner: SessionOwner) {
+  stopFollowing();
+  const { dir: dirName, file } = session;
+  try {
+    const chunk = await readFollowedSession(dirName, file, 0);
+    followed = { dirName, file, offset: chunk.offset, entries: chunk.entries, owner, timer: setInterval(pollFollowedSession, FOLLOW_POLL_MS) };
+    renderFollowedSession(followed);
+  } catch (e) {
+    messageRenderer.renderError(e instanceof Error ? e.message : 'Failed to read session file');
+  }
+}
+
+async function switchSession(sessionFile: string | null | undefined, session: SidebarSession | null = null) {
   try {
     // Clear any streaming state from previous session to prevent bleed
     currentStreamingElement = null;
     currentStreamingThinking = '';
     currentStreamingText = '';
     viewingActiveSession = false;
-    
+    stopFollowing();
+
     state.reset();
     showTypingIndicator(false);
     updateUI();
@@ -1567,23 +1648,36 @@ async function switchSession(sessionFile: string | null | undefined, session: Si
         await selectLiveSession(live.id);
         return;
       }
+      const owner = session ? sessionOwnerOf(session.owner) : null;
+      if (owner) {
+        updateLiveSessionInputState();
+        await followSession(session!, owner);
+        return;
+      }
       // No live tab yet — ask the server to resume this session.
       messageRenderer.renderSystemMessage('Resuming session…');
       try {
-        const resumeBody: Record<string, unknown> = { filePath: sessionFile };
-        if (project?.path) resumeBody.cwd = project.path;
+        // The server reads the project directory from the session's own
+        // header, so the resume request only has to name the file.
         const res = await fetch('/api/live-sessions/resume', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(resumeBody),
+          body: JSON.stringify({ filePath: sessionFile }),
         });
         const data = await res.json();
         if (!res.ok || data.error) {
           clearConversation();
-          messageRenderer.renderError(data.error || 'Failed to resume session');
           viewingActiveSession = false;
           updateLiveSessionInputState();
           updateUI();
+          // The listing was stale: another process took the session over
+          // between the click and the request.
+          const refused = sessionOwnerOf(data.owner);
+          if (refused && session) {
+            await followSession(session, refused);
+            return;
+          }
+          messageRenderer.renderError(data.error || 'Failed to resume session');
           return;
         }
         // If the server found an existing live tab (reused), just focus it.
@@ -2099,6 +2193,23 @@ toggleShowThinking.addEventListener('click', () => {
   localStorage.setItem('tau-show-thinking', String(!isOn));
 });
 
+// Fullscreen toggle (follows the document's actual fullscreen state)
+const toggleFullscreen = document.getElementById('toggle-fullscreen')!;
+if (document.fullscreenEnabled) {
+  const syncFullscreenToggle = () => {
+    toggleFullscreen.className = `settings-toggle${document.fullscreenElement ? ' on' : ''}`;
+  };
+  document.addEventListener('fullscreenchange', syncFullscreenToggle);
+  toggleFullscreen.addEventListener('click', () => {
+    const change = document.fullscreenElement
+      ? document.exitFullscreen()
+      : document.documentElement.requestFullscreen();
+    change.catch((error: unknown) => console.warn('Fullscreen change failed', error));
+  });
+} else {
+  document.getElementById('setting-fullscreen')!.style.display = 'none';
+}
+
 // Auth toggle
 const toggleAuth = document.getElementById('toggle-auth')!;
 const authSection = document.getElementById('settings-auth-section')!;
@@ -2188,7 +2299,7 @@ if (isMobile()) {
 wsClient.connect();
 messageRenderer.renderWelcome();
 updateLiveSessionInputState();
-sidebar.loadSessions().then(() => {
+sidebar.loadProjects().then(() => {
   updateLiveSessionIndicators();
 });
 launcherPanel.init();

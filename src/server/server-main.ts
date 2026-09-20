@@ -12,7 +12,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { spawn, execFile, type ExecException } from 'node:child_process';
-import readline from 'node:readline';
 import { WebSocketServer, WebSocket } from 'ws';
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -24,6 +23,8 @@ import { ARGS, AUTH_CONFIGURED, HOST, MIME_TYPES, PI_AGENT_DIR, PORT, SESSIONS_D
 import { SESSION_COOKIE_NAME, SESSION_REFRESH_THRESHOLD_SECONDS, buildSessionCookie, issueSessionToken, parseCookies, verifySessionToken } from './auth.js';
 import { getAvailableModels, modelLabel, normalizeModel, parseModelSpecToModel, parsePiListModels, _clearModelListCacheForTest, _setExecFileForTest } from './model-utils.js';
 import { LiveSessionManager, PiRpcSession, isGenericSessionName, liveManager, makeId, _setSpawnPiForTest } from './sessions.js';
+import { buildEndpoint, orchestrationEndpoint, publishEndpoint, unpublishEndpoint } from './orchestration.js';
+import { sessionOwner, sessionOwners } from './session-owners.js';
 import { NAVIGATE_COMMAND, NAVIGATION_MARKER_TYPE, flattenTree, isTreeNavigationInProgress, leafDescendsFrom, navigateTree, pathFromRoot, selectNavigationTarget } from './tree.js';
 
 type TauWs = WsType & { isAlive?: boolean };
@@ -133,6 +134,39 @@ function resolveSessionFile(filePath: string) {
   }
   if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) throw new Error('Session not found');
   return resolved;
+}
+
+/**
+ * Validates the programmatic spawn fields of POST /api/live-sessions.
+ *
+ * These let an orchestration client (pi-ant) run the child with its own
+ * extensions, model flags, and environment. They do not widen the server's
+ * blast radius: the API already starts `pi` in a caller-chosen directory and
+ * prompts it, so it is an authenticated code-execution surface either way.
+ * The checks exist to turn malformed input into a 400 instead of a confusing
+ * spawn failure.
+ */
+function parseSpawnOverrides(body: RpcCommand): { args?: string[]; env?: Record<string, string>; sessionFile?: string } {
+  const overrides: { args?: string[]; env?: Record<string, string>; sessionFile?: string } = {};
+  if (body.args !== undefined) {
+    if (!Array.isArray(body.args) || body.args.some((arg) => typeof arg !== 'string')) throw new Error('args must be an array of strings');
+    overrides.args = body.args as string[];
+  }
+  if (body.env !== undefined) {
+    if (typeof body.env !== 'object' || body.env === null || Array.isArray(body.env)) throw new Error('env must be an object of string values');
+    const env: Record<string, string> = {};
+    for (const [key, value] of Object.entries(body.env as Record<string, unknown>)) {
+      if (typeof value !== 'string') throw new Error(`env.${key} must be a string`);
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) throw new Error(`Invalid environment variable name: ${key}`);
+      env[key] = value;
+    }
+    overrides.env = env;
+  }
+  // Reuse the session-directory containment check: a created session may adopt
+  // an existing file (an orchestration worker writes its header before start),
+  // but never a path outside Pi's session storage.
+  if (body.sessionFile !== undefined) overrides.sessionFile = resolveSessionFile(String(body.sessionFile));
+  return overrides;
 }
 
 function appendSessionName(filePath: string, name: string) {
@@ -403,8 +437,12 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
   if (cleanPath === '/api/live-sessions' && req.method === 'POST') {
     readBody(req).then(async (body) => {
       if (!body.cwd) return json(res, 400, { error: 'cwd required' });
+      let overrides: { args?: string[]; env?: Record<string, string>; sessionFile?: string };
       try {
-        const session = await liveManager.create({ cwd: body.cwd, model: body.model || '' });
+        overrides = parseSpawnOverrides(body);
+      } catch (e) { return json(res, 400, { error: errorMessage(e) }); }
+      try {
+        const session = await liveManager.create({ cwd: body.cwd, model: body.model || '', ...overrides });
         json(res, 200, { session: session.metadata() });
       } catch (e) { json(res, 400, { error: errorMessage(e) }); }
     }).catch((e) => json(res, 400, { error: errorMessage(e) }));
@@ -417,6 +455,15 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
       try { resolvedFile = resolveSessionFile(body.filePath); } catch (e) { return json(res, 400, { error: errorMessage(e) }); }
       const existing = liveManager.findBySessionFile(resolvedFile);
       if (existing) return json(res, 200, { session: existing.metadata(), reused: true });
+      // Another Pi process is appending to this file. Resuming would make this
+      // server a second writer on the same conversation.
+      const owner = sessionOwner(resolvedFile);
+      if (owner && body.force !== true) {
+        return json(res, 409, {
+          error: `Session is running as ${owner.name} on ${owner.host}. Follow it read-only, or resume with force to take it over.`,
+          owner,
+        });
+      }
       let cwd: string | null = normalizeSessionCwd(body.cwd);
       if (!cwd) cwd = readSessionHeaderCwd(resolvedFile);
       if (!cwd || !fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
@@ -448,8 +495,7 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
   }
 
   if (cleanPath === '/api/projects' && req.method === 'GET') return serveProjectsList(res);
-  if (cleanPath === '/api/sessions' && req.method === 'GET') return serveSessionsList(res);
-  if (cleanPath.startsWith('/api/search') && req.method === 'GET') return serveSearch(res, parsed.searchParams.get('q') || '');
+  if (cleanPath === '/api/sessions' && req.method === 'GET') return serveProjectSummaries(res);
   if ((cleanPath === '/api/files') && req.method === 'GET') {
     const explicitPath = parsed.searchParams.get('path');
     const sessionId = parsed.searchParams.get('sessionId');
@@ -497,8 +543,10 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
     }).catch((e) => json(res, 400, { error: errorMessage(e) }));
     return;
   }
+  const projectMatch = cleanPath.match(/^\/api\/sessions\/([^/]+)$/);
+  if (projectMatch && req.method === 'GET') return serveProjectSessions(res, projectMatch[1]);
   const sessionMatch = cleanPath.match(/^\/api\/sessions\/([^/]+)\/([^/]+)$/);
-  if (sessionMatch && req.method === 'GET') return serveSessionFile(res, sessionMatch[1], sessionMatch[2]);
+  if (sessionMatch && req.method === 'GET') return serveSessionFile(res, sessionMatch[1], sessionMatch[2], parsed.searchParams.get('since'));
 
   json(res, 404, { error: 'Not found' });
 }
@@ -585,24 +633,9 @@ function serveProjectsList(res: ServerResponse) {
   try {
     const projectsRoot = path.resolve(projectsDir);
     const sessionInfo = new Map<string, { count: number; lastActive: number }>();
-    if (fs.existsSync(SESSIONS_DIR)) {
-      for (const dir of fs.readdirSync(SESSIONS_DIR, { withFileTypes: true })) {
-        if (!dir.isDirectory()) continue;
-        const files = fs.readdirSync(path.join(SESSIONS_DIR, dir.name)).filter((f: string) => f.endsWith('.jsonl'));
-        let sessionCwd: string | null = null;
-        let lastActive = 0;
-        for (const f of files) {
-          const filePath = path.join(SESSIONS_DIR, dir.name, f);
-          try {
-            lastActive = Math.max(lastActive, fs.statSync(filePath).mtimeMs);
-            if (!sessionCwd) sessionCwd = readSessionHeaderCwd(filePath);
-          } catch {}
-        }
-        const projectPath = sessionCwd;
-        if (!projectPath) continue;
-        if (!isWithinPath(projectsRoot, projectPath)) continue;
-        sessionInfo.set(projectPath, { count: files.length, lastActive });
-      }
+    for (const project of projectSummaries()) {
+      if (!project.path || !isWithinPath(projectsRoot, project.path)) continue;
+      sessionInfo.set(project.path, { count: project.count, lastActive: project.lastActive });
     }
     const liveCwds = new Set(liveManager.list().map((s) => s.cwd));
     const projects = fs.readdirSync(projectsRoot, { withFileTypes: true })
@@ -616,74 +649,133 @@ function serveProjectsList(res: ServerResponse) {
   } catch (e) { json(res, 500, { error: errorMessage(e) }); }
 }
 
-async function serveSessionsList(res: ServerResponse) {
-  try {
-    if (!fs.existsSync(SESSIONS_DIR)) return json(res, 200, { projects: [] });
-    const projectsByPath = new Map<string, { path: string; dirName: string; sessions: Array<Record<string, unknown>> }>();
-    const liveFiles = liveFilesSet();
-    for (const dir of fs.readdirSync(SESSIONS_DIR, { withFileTypes: true })) {
-      if (!dir.isDirectory()) continue;
-      const projectDir = path.join(SESSIONS_DIR, dir.name);
-      for (const file of fs.readdirSync(projectDir).filter((f: string) => f.endsWith('.jsonl'))) {
-        try {
-          const filePath = path.join(projectDir, file);
-          const parsed = await parseSessionFile(filePath);
-          if (parsed) {
-            const projectPath = parsed.cwd || ''; // Intentionally leave missing header cwd empty; backward compatibility for legacy/incomplete sessions without cwd is not required.
-            let project = projectsByPath.get(projectPath);
-            if (!project) {
-              project = { path: projectPath, dirName: dir.name, sessions: [] };
-              projectsByPath.set(projectPath, project);
-            }
-            project.sessions.push({ ...parsed, file, filePath, mtime: fs.statSync(filePath).mtimeMs, live: liveFiles.has(filePath) });
-          }
-        } catch {}
-      }
+/**
+ * One project per session directory: pi derives that directory name from the
+ * session cwd, so a directory is a project and its newest file carries the
+ * current cwd. Listing costs a readdir and a stat per file, no transcript
+ * parsing — the sidebar loads a project's sessions only when it is expanded.
+ */
+function projectSummaries() {
+  if (!fs.existsSync(SESSIONS_DIR)) return [];
+  const projects: Array<{ path: string; dirName: string; count: number; lastActive: number }> = [];
+  for (const dir of fs.readdirSync(SESSIONS_DIR, { withFileTypes: true })) {
+    if (!dir.isDirectory()) continue;
+    const projectDir = path.join(SESSIONS_DIR, dir.name);
+    let count = 0, lastActive = 0, newest = '';
+    for (const file of fs.readdirSync(projectDir)) {
+      if (!file.endsWith('.jsonl')) continue;
+      count++;
+      const mtime = fs.statSync(path.join(projectDir, file)).mtimeMs;
+      if (mtime >= lastActive) { lastActive = mtime; newest = file; }
     }
-    const projects = Array.from(projectsByPath.values());
-    for (const project of projects) project.sessions.sort((a, b) => Number(b.mtime || 0) - Number(a.mtime || 0));
-    projects.sort((a, b) => Number(b.sessions[0]?.mtime || 0) - Number(a.sessions[0]?.mtime || 0));
-    json(res, 200, { projects });
+    if (!count) continue;
+    projects.push({ path: readSessionHeaderCwd(path.join(projectDir, newest)) || '', dirName: dir.name, count, lastActive });
+  }
+  projects.sort((a, b) => b.lastActive - a.lastActive);
+  return projects;
+}
+
+function serveProjectSummaries(res: ServerResponse) {
+  try {
+    json(res, 200, { projects: projectSummaries() });
   } catch (e) { json(res, 500, { error: errorMessage(e) }); }
 }
 
-async function parseSessionFile(filePath: string) {
-  const stream = fs.createReadStream(filePath, { encoding: 'utf8' });
-  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-  let header = null, firstMessage = null, sessionName = null, userMessageCount = 0, lineCount = 0;
-  for await (const line of rl) {
-    if (!line.trim()) continue;
-    lineCount++;
-    try {
-      const entry = JSON.parse(line);
-      if (entry.type === 'session') header = entry;
-      else if (entry.type === 'session_info' && entry.name) sessionName = entry.name;
-      else if (entry.type === 'message' && entry.message?.role === 'user') {
-        userMessageCount++;
-        if (!firstMessage) {
-          const c = entry.message.content;
-          firstMessage = typeof c === 'string' ? c.slice(0, 120) : (Array.isArray(c) ? (c.find((b) => b.type === 'text')?.text || '').slice(0, 120) : null);
-        }
-      }
-    } catch {}
-  }
-  rl.close(); stream.destroy();
-  if (!header?.id || (userMessageCount <= 1 && lineCount <= 8)) return null;
-  return { id: header.id, timestamp: header.timestamp || '', name: sessionName, firstMessage, cwd: normalizeSessionCwd(header.cwd) };
+function serveProjectSessions(res: ServerResponse, dirName: string) {
+  try {
+    const projectDir = path.join(SESSIONS_DIR, dirName);
+    if (!fs.existsSync(projectDir) || !fs.statSync(projectDir).isDirectory()) return json(res, 404, { error: 'Project not found' });
+    const liveFiles = liveFilesSet();
+    const owners = sessionOwners();
+    const sessions = fs.readdirSync(projectDir)
+      .filter((file: string) => file.endsWith('.jsonl'))
+      .map((file: string) => {
+        const filePath = path.join(projectDir, file);
+        return {
+          ...readSessionSummary(filePath), file, dir: dirName, filePath,
+          live: liveFiles.has(filePath), owner: owners.get(filePath) ?? null,
+        };
+      })
+      .sort((a, b) => b.mtime - a.mtime);
+    json(res, 200, { sessions });
+  } catch (e) { json(res, 500, { error: errorMessage(e) }); }
 }
 
-function serveSessionFile(res: ServerResponse, dirName: string, file: string) {
+/** Bytes read from each end of a transcript to summarise it for the sidebar. */
+const SUMMARY_WINDOW = 64 * 1024;
+
+/**
+ * Summarises one stored session without reading it whole: the header and the
+ * first user message are at the start of the file, and a rename is appended at
+ * the end, so sampling both ends is enough for everything the sidebar shows.
+ * Transcripts here reach tens of megabytes, and a project holds thousands.
+ */
+function readSessionSummary(filePath: string) {
+  const { size, mtimeMs } = fs.statSync(filePath);
+  const fd = fs.openSync(filePath, 'r');
+  let head: string, tail = '';
+  try {
+    head = readWindow(fd, 0, Math.min(size, SUMMARY_WINDOW));
+    if (size > SUMMARY_WINDOW) tail = readWindow(fd, size - SUMMARY_WINDOW, SUMMARY_WINDOW);
+  } finally {
+    fs.closeSync(fd);
+  }
+  // A window cuts mid-line at the end of the head and the start of the tail;
+  // those partial records are dropped rather than parsed.
+  const headLines = head.split(/\r?\n/);
+  if (size > SUMMARY_WINDOW) headLines.pop();
+  const tailLines = tail.split(/\r?\n/).slice(1);
+
+  let id = '', timestamp = '', name: string | null = null, firstMessage: string | null = null;
+  for (const line of headLines.concat(tailLines)) {
+    if (!line.trim()) continue;
+    let entry;
+    try { entry = JSON.parse(line); } catch { continue; }
+    if (entry.type === 'session') { id = entry.id || ''; timestamp = entry.timestamp || ''; }
+    else if (entry.type === 'session_info' && entry.name) name = entry.name;
+    else if (!firstMessage && entry.type === 'message' && entry.message?.role === 'user') {
+      firstMessage = titleFromMessageContent(entry.message.content);
+    }
+  }
+  return { id, timestamp, name, firstMessage, mtime: mtimeMs };
+}
+
+function readWindow(fd: number, position: number, length: number) {
+  const buffer = Buffer.alloc(length);
+  const bytesRead = fs.readSync(fd, buffer, 0, length, position);
+  return buffer.toString('utf8', 0, bytesRead);
+}
+
+/**
+ * Reads a stored session. `since` is a byte offset from a previous read, so a
+ * follower polls only the entries appended since then; a file that shrank or
+ * was rewritten answers from the start with `reset`, because its earlier bytes
+ * no longer describe the same conversation.
+ */
+function serveSessionFile(res: ServerResponse, dirName: string, file: string, since: string | null) {
   const filePath = path.join(SESSIONS_DIR, dirName, file);
   if (!fs.existsSync(filePath)) return json(res, 404, { error: 'Session not found' });
+  const size = fs.statSync(filePath).size;
+  const requested = since === null ? 0 : Number(since);
+  if (!Number.isInteger(requested) || requested < 0) return json(res, 400, { error: 'since must be a byte offset' });
+  const reset = requested > size;
+  const start = reset ? 0 : requested;
   const entries: unknown[] = [];
-  const stream = fs.createReadStream(filePath, { encoding: 'utf8' });
+  if (start >= size) return json(res, 200, { entries, offset: size, reset });
+  const stream = fs.createReadStream(filePath, { encoding: 'utf8', start });
   let buffer = '';
+  // Whole lines only: the last partial line stays unread until its newline
+  // arrives, so the next poll starts at a record boundary.
+  let consumed = start;
   stream.on('data', (chunk: string) => {
     buffer += chunk;
     const lines = buffer.split('\n'); buffer = lines.pop() || '';
-    for (const line of lines) if (line.trim()) { try { entries.push(JSON.parse(line)); } catch {} }
+    for (const line of lines) {
+      consumed += Buffer.byteLength(line) + 1;
+      if (line.trim()) { try { entries.push(JSON.parse(line)); } catch {} }
+    }
   });
-  stream.on('end', () => { if (buffer.trim()) { try { entries.push(JSON.parse(buffer)); } catch {} } json(res, 200, { entries }); });
+  stream.on('end', () => json(res, 200, { entries, offset: consumed, reset }));
   stream.on('error', (e: Error) => json(res, 500, { error: e.message }));
 }
 
@@ -789,48 +881,6 @@ async function openNative(fp: string) {
   }
 }
 
-async function serveSearch(res: ServerResponse, query: string) {
-  try {
-    if (!query || query.length < 2 || !fs.existsSync(SESSIONS_DIR)) return json(res, 200, { results: [] });
-    const q = query.toLowerCase();
-    const results = [];
-    for (const dir of fs.readdirSync(SESSIONS_DIR, { withFileTypes: true })) {
-      if (!dir.isDirectory() || results.length >= 30) continue;
-      const projectDir = path.join(SESSIONS_DIR, dir.name);
-      for (const file of fs.readdirSync(projectDir).filter((f: string) => f.endsWith('.jsonl'))) {
-        if (results.length >= 30) break;
-        const filePath = path.join(projectDir, file);
-        const stream = fs.createReadStream(filePath, { encoding: 'utf8' });
-        const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-        let sessionId = '', sessionName = '', sessionTimestamp = '', firstMessage = '';
-        let sessionCwd: string | null = null;
-        const matches = [];
-        for await (const line of rl) {
-          if (!line.trim()) continue;
-          try {
-            const entry = JSON.parse(line);
-            if (entry.type === 'session') { sessionId = entry.id; sessionTimestamp = entry.timestamp || ''; sessionCwd = normalizeSessionCwd(entry.cwd); }
-            if (entry.type === 'session_info' && entry.name) sessionName = entry.name;
-            if (entry.type === 'message') {
-              const c = entry.message?.content;
-              const text = typeof c === 'string' ? c : (Array.isArray(c) ? c.filter((b) => b.type === 'text').map((b) => b.text).join(' ') : '');
-              if (!firstMessage && entry.message?.role === 'user' && text) firstMessage = text.slice(0, 120);
-              const idx = text.toLowerCase().indexOf(q);
-              if (idx >= 0) {
-                matches.push({ role: entry.message?.role || 'unknown', snippet: `${idx > 0 ? '…' : ''}${text.slice(Math.max(0, idx - 60), Math.min(text.length, idx + q.length + 60)).replace(/\n/g, ' ')}${idx + q.length + 60 < text.length ? '…' : ''}` });
-                if (matches.length >= 3) break;
-              }
-            }
-          } catch {}
-        }
-        rl.close(); stream.destroy();
-        if (matches.length) results.push({ filePath, project: sessionCwd || '', sessionId, sessionName, sessionTimestamp, firstMessage, matches });
-      }
-    }
-    json(res, 200, { results });
-  } catch (e) { json(res, 500, { error: errorMessage(e) }); }
-}
-
 function computeUrls(port: number) {
   const isLoopback = HOST === '127.0.0.1' || HOST === '::1' || HOST === 'localhost';
   let localIp = 'localhost';
@@ -911,6 +961,7 @@ function listen(port: number, attemptsLeft = 10) {
   });
   server.listen(port, HOST, () => {
     computeUrls(port);
+    publishEndpoint(port);
     console.log(`[Tau] Server running on ${lanUrl}${tailscaleUrl ? `  •  Tailscale: ${tailscaleUrl}` : ''}`);
     console.log(`[Tau] Static assets: ${STATIC_DIR}`);
     if (ARGS.open) openUrl(lanUrl).catch(() => {});
@@ -923,6 +974,7 @@ async function shutdown(signal: string) {
   shuttingDown = true;
   console.log(`\n[Tau] Shutting down (${signal}); terminating ${liveManager.sessions.size} Pi session(s)...`);
   try { wss.close(); } catch {}
+  unpublishEndpoint();
   await liveManager.shutdown();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 2500).unref();
@@ -931,6 +983,7 @@ function startCli() {
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('exit', () => {
+    unpublishEndpoint();
     for (const session of liveManager.sessions.values()) {
       try { session.child?.kill('SIGTERM'); } catch {}
     }
@@ -982,6 +1035,11 @@ export {
   navigateTree,
   pathFromRoot,
   selectNavigationTarget,
+  buildEndpoint,
+  orchestrationEndpoint,
+  parseSpawnOverrides,
+  sessionOwner,
+  sessionOwners,
   isAllowedApiOrigin,
   setCorsForAllowedOrigin,
   handleApiRoute,

@@ -13,6 +13,10 @@ process.env.TAU_HOST = '127.0.0.1';
 process.env.PI_CODING_AGENT_DIR = TMP;
 process.env.PI_CODING_AGENT_SESSION_DIR = path.join(TMP, 'sessions');
 fs.mkdirSync(process.env.PI_CODING_AGENT_SESSION_DIR, { recursive: true });
+// These cases connect unauthenticated; this fork configures default
+// credentials, so opt out explicitly with empty values.
+process.env.TAU_USER = '';
+process.env.TAU_PASS = '';
 
 // Load the server after the env + settings are in place: the module reads
 // them at load time, and ESM hoists static imports ahead of this body.
