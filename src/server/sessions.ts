@@ -4,8 +4,9 @@ import { spawn } from 'node:child_process';
 import { WebSocket } from 'ws';
 
 import type { ChildProcess } from 'node:child_process';
-import type { AbortState, JsonRecord, LiveClient, ModelIdentity, PendingCommand, PendingDialog, RpcCommand, RpcResponse } from './types.js';
+import type { AbortState, JsonRecord, LiveClient, ModelIdentity, PendingCommand, PendingDialog, RpcCommand, RpcResponse, SessionSpawnOverrides } from './types.js';
 import { PI_COMMAND, expandHome } from './config.js';
+import { orchestrationEndpoint } from './orchestration.js';
 import { modelLabel, normalizeModel, parseModelSpecToModel } from './model-utils.js';
 import { NAVIGATE_COMMAND } from './tree.js';
 
@@ -46,6 +47,9 @@ export function makeId() {
 // pi loads extension .ts files directly.
 const TAU_TREE_EXTENSION = path.resolve(import.meta.dirname, '..', 'src', 'pi-extension', 'tau-tree.ts');
 
+/** Bound on retained child stderr; startup diagnostics are short. */
+const STDERR_TAIL_LINES = 20;
+
 export function isGenericSessionName(name: unknown) {
   const normalized = String(name || '').trim().toLowerCase();
   return normalized === 'chat' || normalized === 'new chat' || normalized === 'untitled' || normalized === 'untitled chat' || normalized === 'session';
@@ -67,8 +71,14 @@ export class PiRpcSession {
   sessionFile: string | null;
   sessionName: string | null;
   contextUsage: JsonRecord | null;
+  /** Extra `pi` arguments supplied by a programmatic caller, appended after tau's own. */
+  extraArgs: string[];
+  /** Extra child environment supplied by a programmatic caller; overrides tau's defaults. */
+  extraEnv: Record<string, string>;
   pending: Map<string, PendingCommand>;
   stdoutBuffer: string;
+  /** Recent child stderr, so an exit can say why instead of only reporting its code. */
+  stderrTail: string[];
   terminating: boolean;
   exitCode: number | null;
   titleSet: boolean;
@@ -85,7 +95,7 @@ export class PiRpcSession {
   private operationRevision = 0;
   private abortOperationRevision = 0;
 
-  constructor(manager: LiveSessionManager, opts: { id?: string; cwd: string; modelSpec?: string; sessionFile?: string | null; entries?: JsonRecord[]; sessionName?: string | null }) {
+  constructor(manager: LiveSessionManager, opts: { id?: string; cwd: string; modelSpec?: string; sessionFile?: string | null; entries?: JsonRecord[]; sessionName?: string | null } & SessionSpawnOverrides) {
     this.manager = manager;
     this.id = opts.id || makeId();
     this.cwd = opts.cwd;
@@ -101,10 +111,13 @@ export class PiRpcSession {
     this.thinkingLevel = parsed.level || 'off';
     this.sessionFile = opts.sessionFile || null;
     this.sessionName = opts.sessionName || null;
+    this.extraArgs = opts.args ? [...opts.args] : [];
+    this.extraEnv = opts.env ? { ...opts.env } : {};
     if (opts.entries && opts.entries.length) this.entries = opts.entries;
     this.contextUsage = null;
     this.pending = new Map();
     this.stdoutBuffer = '';
+    this.stderrTail = [];
     this.terminating = false;
     this.exitCode = null;
     this.titleSet = false;
@@ -209,11 +222,15 @@ export class PiRpcSession {
     const args = ['--mode', 'rpc', '--extension', TAU_TREE_EXTENSION];
     if (this.sessionFile) args.push('--session', this.sessionFile);
     if (this.modelSpec) args.push('--model', this.modelSpec);
+    args.push(...this.extraArgs);
     this.navigateCommandChecked = false;
     const spawnFn: SpawnFn = _spawnPiForTest || spawn;
+    // Children can orchestrate through this server unless explicitly pinned.
+    const endpoint = orchestrationEndpoint();
+    const orchestration = endpoint ? { PI_ORCHESTRATION_HOST: 'web', PI_ORCHESTRATION_ENDPOINT: endpoint } : {};
     const child = spawnFn(PI_COMMAND, args, {
       cwd: this.cwd,
-      env: { ...process.env, TAU_DISABLED: '1' },
+      env: { ...process.env, TAU_DISABLED: '1', ...orchestration, ...this.extraEnv },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.child = child;
@@ -223,7 +240,11 @@ export class PiRpcSession {
     child.stdout!.on('data', (chunk: string) => this.handleStdout(chunk));
     child.stderr!.setEncoding('utf8');
     child.stderr!.on('data', (chunk: string) => {
-      for (const line of chunk.split(/\r?\n/).filter(Boolean)) console.error(`[Pi ${this.id}] ${line}`);
+      for (const line of chunk.split(/\r?\n/).filter(Boolean)) {
+        console.error(`[Pi ${this.id}] ${line}`);
+        this.stderrTail.push(line);
+        if (this.stderrTail.length > STDERR_TAIL_LINES) this.stderrTail.shift();
+      }
     });
     child.on('error', (err: Error) => this.handleExit(null, null, err));
     child.on('exit', (code: number | null, signal: NodeJS.Signals | null) => this.handleExit(code, signal));
@@ -246,7 +267,7 @@ export class PiRpcSession {
         if (settled) return;
         settled = true;
         cleanup();
-        reject(new Error(`Pi RPC process exited during startup (${signal || code})`));
+        reject(new Error(`Pi RPC process exited during startup — ${this.exitError(code, signal).message}`));
       };
       child.once('error', onError);
       child.once('exit', onExit);
@@ -555,13 +576,24 @@ export class PiRpcSession {
     }
   }
 
+  /**
+   * A child that dies during startup — an unknown provider, a failed extension —
+   * explains itself on stderr and nowhere else. Without that text the caller only
+   * sees an exit code, which is what made a disabled provider look like a
+   * transport failure.
+   */
+  exitError(code: number | null, signal: string | null) {
+    const reason = this.stderrTail.join('\n').trim();
+    return new Error(`Pi process exited (${signal || code})${reason ? `:\n${reason}` : ''}`);
+  }
+
   handleExit(code: number | null, signal: string | null, err?: { message?: string }) {
     if (this.exitCode !== null) return;
     this.exitCode = code;
     this.clearDialogs('process_exit');
     for (const [, pending] of this.pending) {
       clearTimeout(pending.timer);
-      pending.reject(err || new Error(`Pi process exited (${signal || code})`));
+      pending.reject(err || this.exitError(code, signal));
     }
     this.pending.clear();
     this.manager.removeExited(this.id, err?.message || `process_exit:${signal || code}`);
@@ -600,9 +632,12 @@ export class LiveSessionManager {
   }
   hasPendingResume(sessionFile: string) { return this.pendingResumes.has(path.resolve(sessionFile)); }
   hasTerminatingResume(sessionFile: string) { return this.terminatingResumes.has(path.resolve(sessionFile)); }
-  async create({ cwd, model }: { cwd?: string; model?: string }) {
+  async create({ cwd, model, sessionFile, args, env }: { cwd?: string; model?: string; sessionFile?: string } & SessionSpawnOverrides) {
     const resolved = path.resolve(expandHome(cwd || process.cwd()));
-    const session = new PiRpcSession(this, { cwd: resolved, modelSpec: (model || '').trim() });
+    const session = new PiRpcSession(this, {
+      cwd: resolved, modelSpec: (model || '').trim(),
+      ...(sessionFile ? { sessionFile: path.resolve(expandHome(sessionFile)) } : {}), args, env,
+    });
     await session.start();
     this.sessions.set(session.id, session);
     this.broadcast({ type: 'live_session_created', session: session.metadata() });
