@@ -701,41 +701,53 @@ function serveProjectSessions(res: ServerResponse, dirName: string) {
   } catch (e) { json(res, 500, { error: errorMessage(e) }); }
 }
 
-/** Bytes read from each end of a transcript to summarise it for the sidebar. */
+/** Bytes read per step from the start of a transcript, and once from its end. */
 const SUMMARY_WINDOW = 64 * 1024;
 
 /**
- * Summarises one stored session without reading it whole: the header and the
- * first user message are at the start of the file, and a rename is appended at
- * the end, so sampling both ends is enough for everything the sidebar shows.
+ * Summarises one stored session without reading it whole: the start is read
+ * forward only as far as the first user message (system records of any size
+ * may precede it), and a rename is appended at the end, so one window there
+ * completes everything the sidebar shows.
  * Transcripts here reach tens of megabytes, and a project holds thousands.
  */
 function readSessionSummary(filePath: string) {
   const { size, mtimeMs } = fs.statSync(filePath);
-  const fd = fs.openSync(filePath, 'r');
-  let head: string, tail = '';
-  try {
-    head = readWindow(fd, 0, Math.min(size, SUMMARY_WINDOW));
-    if (size > SUMMARY_WINDOW) tail = readWindow(fd, size - SUMMARY_WINDOW, SUMMARY_WINDOW);
-  } finally {
-    fs.closeSync(fd);
-  }
-  // A window cuts mid-line at the end of the head and the start of the tail;
-  // those partial records are dropped rather than parsed.
-  const headLines = head.split(/\r?\n/);
-  if (size > SUMMARY_WINDOW) headLines.pop();
-  const tailLines = tail.split(/\r?\n/).slice(1);
-
   let id = '', timestamp = '', name: string | null = null, firstMessage: string | null = null;
-  for (const line of headLines.concat(tailLines)) {
-    if (!line.trim()) continue;
+  const readLine = (line: string) => {
+    if (!line.trim()) return;
     let entry;
-    try { entry = JSON.parse(line); } catch { continue; }
+    try { entry = JSON.parse(line); } catch { return; }
     if (entry.type === 'session') { id = entry.id || ''; timestamp = entry.timestamp || ''; }
     else if (entry.type === 'session_info' && entry.name) name = entry.name;
-    else if (!firstMessage && entry.type === 'message' && entry.message?.role === 'user') {
+    else if (firstMessage === null && entry.type === 'message' && entry.message?.role === 'user') {
       firstMessage = titleFromMessageContent(entry.message.content);
     }
+  };
+
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const window = Buffer.alloc(SUMMARY_WINDOW);
+    let position = 0;
+    let partial: Buffer = Buffer.alloc(0);
+    while (firstMessage === null && position < size) {
+      const bytesRead = fs.readSync(fd, window, 0, SUMMARY_WINDOW, position);
+      if (!bytesRead) break;
+      position += bytesRead;
+      partial = Buffer.concat([partial, window.subarray(0, bytesRead)]);
+      let newline;
+      while ((newline = partial.indexOf(10)) !== -1) {
+        readLine(partial.toString('utf8', 0, newline));
+        partial = partial.subarray(newline + 1);
+      }
+    }
+    // The rest is sampled from the end. A window that starts past the first
+    // unread line starts mid-record, so its leading partial line is dropped.
+    const unread = position - partial.length;
+    const tailStart = Math.max(unread, size - SUMMARY_WINDOW);
+    readWindow(fd, tailStart, SUMMARY_WINDOW).split('\n').slice(tailStart > unread ? 1 : 0).forEach(readLine);
+  } finally {
+    fs.closeSync(fd);
   }
   return { id, timestamp, name, firstMessage, mtime: mtimeMs };
 }

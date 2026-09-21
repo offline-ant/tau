@@ -138,6 +138,16 @@ test('totalCost sums usage.cost.total across assistant messages', () => {
   assert.equal(totalCost, 0.75);
 });
 
+test('usage entries add to totalCost without being displayed or counted as context', () => {
+  const { items, totalCost, lastInputTokens } = buildHistoryItems([
+    msg({ role: 'assistant', content: [{ type: 'text', text: 'a' }], usage: { input: 100, cost: { total: 0.5 } } }),
+    { type: 'usage', kind: 'cache_warm', usage: { input: 0, cacheRead: 50000, cost: { total: 0.015 } } },
+  ]);
+  assert.equal(items.length, 1);
+  assert.equal(totalCost, 0.515);
+  assert.equal(lastInputTokens, 100);
+});
+
 test('lastInputTokens/lastUsage come from the last assistant message with usage', () => {
   const first = { input: 100, cacheRead: 10, cost: { total: 0.1 } };
   const last = { input: 200, cacheRead: 50, cost: { total: 0.2 } };
@@ -179,4 +189,13 @@ test('items preserve conversation order', () => {
     items.map((i: { kind: string }) => i.kind),
     ['user', 'assistant', 'toolCall', 'user', 'assistant']
   );
+});
+
+test('context_edit entries change model context only: the target stays displayed', () => {
+  const { items } = buildHistoryItems([
+    { type: 'message', id: 'u1', message: { role: 'user', content: 'kept in UI' } },
+    { type: 'context_edit', targetId: 'u1', replacement: null },
+    { type: 'context_edit', targetId: 'u1', replacement: 'replaced for the model' },
+  ]);
+  assert.deepEqual(items, [{ kind: 'user', content: 'kept in UI', images: undefined }]);
 });

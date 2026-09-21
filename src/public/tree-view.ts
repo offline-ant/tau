@@ -32,6 +32,8 @@ type TreeEntry = {
   thinkingLevel?: string;
   name?: string;
   label?: string;
+  targetId?: string;
+  replacement?: unknown;
   [key: string]: unknown;
 };
 
@@ -89,7 +91,7 @@ function messageText(msg: TreeEntryMessage | undefined) {
 }
 
 // Classify an entry for glyph + filtering, and produce the one-line snippet.
-function describeEntry(entry: TreeEntry): { kind: string; text: string } {
+export function describeEntry(entry: TreeEntry): { kind: string; text: string } {
   if (entry.type === 'message') {
     const role = entry.message?.role || '';
     if (role === 'user') return { kind: 'user', text: firstLine(messageText(entry.message)) || '(empty message)' };
@@ -121,6 +123,8 @@ function describeEntry(entry: TreeEntry): { kind: string; text: string } {
   if (entry.type === 'thinking_level_change') return { kind: 'meta', text: `thinking → ${entry.thinkingLevel || ''}` };
   if (entry.type === 'session_info') return { kind: 'meta', text: `name → ${entry.name || ''}` };
   if (entry.type === 'label') return { kind: 'meta', text: `label → ${entry.label || ''}` };
+  // Edits only future model context; the target itself stays in the tree.
+  if (entry.type === 'context_edit') return { kind: 'meta', text: `context ${entry.replacement === null ? 'omit' : 'replace'} → ${entry.targetId || ''}` };
   return { kind: 'meta', text: entry.type || 'entry' };
 }
 
@@ -170,14 +174,15 @@ export function setupTreeView(options: TreeViewOptions) {
   // entry would have had), so the branch structure stays readable in
   // messages-only mode. "Messages only" mirrors pi's no-tools filter: tool
   // results and housekeeping entries (model/thinking/name changes, custom
-  // meta entries) are hidden, messages and compactions stay. tau's internal
-  // navigation markers are plumbing and are hidden in every mode.
+  // meta entries, context edits) are hidden, messages and compactions stay.
+  // tau's internal navigation markers and pi's usage records (e.g. cache
+  // warming) are plumbing and are hidden in every mode, as in pi's /tree.
   function flatten(nodes: TreeNode[], depth: number, out: FlatRow[]) {
     for (const node of nodes) {
       const entry = node.entry;
-      const isInternalMarker = entry.type === 'custom' && entry.customType === NAVIGATION_MARKER_TYPE;
+      const isPlumbing = entry.type === 'usage' || (entry.type === 'custom' && entry.customType === NAVIGATION_MARKER_TYPE);
       const kind = describeEntry(entry).kind;
-      const hidden = isInternalMarker || (!showAll && (kind === 'tool' || kind === 'meta'));
+      const hidden = isPlumbing || (!showAll && (kind === 'tool' || kind === 'meta'));
       if (!hidden) out.push({ node, depth });
       const childDepth = depth + ((node.children || []).length > 1 ? 1 : 0);
       flatten(node.children, childDepth, out);
