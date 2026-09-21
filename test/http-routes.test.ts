@@ -463,6 +463,24 @@ test('GET /api/sessions/:project summarises a transcript larger than the read wi
   assert.equal(big.name, 'Renamed after a long chat');
 });
 
+test('GET /api/sessions/:project finds the first user message behind system records larger than the read window', async () => {
+  // Multi-byte text exercises window boundaries that split a character.
+  const system = { type: 'message', message: { role: 'system', content: 'é'.repeat(50 * 1024) } };
+  writeSessionFileAt(PROJ_DIR, 'system.jsonl', [
+    { type: 'session', id: 'system', timestamp: '2026-01-04T00:00:00.000Z', cwd: '/tmp/httpproj' },
+    system, system,
+    { type: 'message', message: { role: 'user', content: 'question after the prompt' } },
+    { type: 'message', message: { role: 'assistant', content: 'short answer' } },
+    { type: 'session_info', name: 'Named at the end' },
+  ]);
+
+  const body = await jsonBody(await fetch(`${base}/api/sessions/--tmp--httpproj`));
+  const session = body.sessions.find((s: { file: string }) => s.file === 'system.jsonl');
+  assert.equal(session.id, 'system');
+  assert.equal(session.firstMessage, 'Question after the prompt');
+  assert.equal(session.name, 'Named at the end');
+});
+
 test('GET /api/sessions/:project returns 404 for an unknown project', async () => {
   const res = await fetch(`${base}/api/sessions/--tmp--nosuchproject`);
   assert.equal(res.status, 404);

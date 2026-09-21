@@ -12,7 +12,7 @@
 import type { AppMessage, MessageContentBlock, UsageRecord } from './app-types.js';
 import type { ToolResult } from './tool-card.js';
 
-export type SessionHistoryEntry = { type?: string; message?: AppMessage };
+export type SessionHistoryEntry = { type?: string; message?: AppMessage; usage?: UsageRecord };
 
 export type HistoryImage = { data: string; mimeType: string };
 
@@ -76,6 +76,9 @@ export function buildHistoryItems(entries: SessionHistoryEntry[]): HistoryBuildR
 
   for (let index = 0; index < entries.length; index++) {
     const entry = entries[index];
+    // Usage outside the conversation (e.g. cache warming) costs money but is
+    // neither displayed nor a measure of the context size.
+    if (entry.type === 'usage') totalCost += entry.usage?.cost?.total || 0;
     if (entry.type !== 'message') continue;
 
     const msg = entry.message;
