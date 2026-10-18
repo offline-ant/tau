@@ -101,6 +101,7 @@
       <div class="input-area">
         <div class="queued-messages hidden" id="queued-messages"></div>
         <div class="image-previews hidden" id="image-previews"></div>
+        <div class="voice-status hidden" id="voice-status" role="status" aria-live="polite"></div>
         <form id="chat-form">
           <div class="input-left-actions">
             <button type="button" class="input-icon-btn" id="command-btn" title="Commands" aria-label="Open commands" tabindex="-1">
@@ -183,7 +184,7 @@
           <button class="settings-toggle on" id="toggle-show-thinking"></button>
         </div>
         <div class="settings-row" id="setting-fullscreen">
-          <span class="settings-label">Fullscreen</span>
+          <span class="settings-label" id="fullscreen-label">Fullscreen</span>
           <button class="settings-toggle" id="toggle-fullscreen"></button>
         </div>
       </div>

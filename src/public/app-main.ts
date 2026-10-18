@@ -4,6 +4,7 @@
 
 import { WebSocketClient } from './websocket-client.js';
 import { StateManager } from './state.js';
+import { clearSessionLinkHash, SessionLink } from './session-link.js';
 import { MessageRenderer } from './message-renderer.js';
 import { ToolCardRenderer, type ToolExecution, type ToolResult } from './tool-card.js';
 import { attachCompletionList } from './completion-list.js';
@@ -15,7 +16,7 @@ import { FileBrowser, getFileIcon } from './file-browser.js';
 import { setupLauncherPanel } from './launcher-panel.js';
 import { setupModelPicker } from './model-picker.js';
 import { setupTreeView } from './tree-view.js';
-import { setupVoiceInput } from './voice-input.js';
+import { setupVoiceInput, type VoiceInput } from './voice-input.js';
 import { setupCommandPalette } from './command-palette.js';
 import { setupSessionStatsCard, type SessionStats } from './session-stats-card.js';
 import { isImeComposition } from './keyboard.js';
@@ -196,7 +197,11 @@ let hasReceivedInitialServerState = false;
 let liveInstances: LiveInstance[] = []; // Sidebar live indicators derived from backend live sessions
 let liveSessions: LiveSession[] = [];
 let activeLiveSessionId = localStorage.getItem('tau-active-live-session-id') || null;
+let voiceInput: VoiceInput | null = null;
 let hasRestoredInitialLiveSession = false;
+const sessionLink = new SessionLink(location.hash);
+// A URL selects a view, not permission to submit that tab's queued input.
+let resumeQueuedInput = true;
 let pendingExtensionUIRequests: ExtensionUIRequest[] = []; // background notifications only
 const interactionStates = new Map<string, InteractionState>();
 const operationRevisions = new Map<string, number>();
@@ -412,11 +417,16 @@ wsClient.addEventListener('stateUpdate', (e: Event) => {
   const launcherVisible = launcherPanel.isVisible();
   hasReceivedInitialServerState = true;
   setLiveSessions(detail.liveSessions || []);
+  if (applyPendingSessionLink()) {
+    hasRestoredInitialLiveSession = true;
+    return;
+  }
   if (!hasRestoredInitialLiveSession || (wasViewingLive && !launcherVisible)) {
     hasRestoredInitialLiveSession = true;
     restoreActiveLiveSession();
   } else {
     if (activeLiveSessionId && !liveSessions.some(s => s.id === activeLiveSessionId)) {
+      voiceInput?.cancel();
       activeLiveSessionId = null;
       activeLiveSessionFile = null;
       sidebar.clearActive();
@@ -469,6 +479,36 @@ wsClient.addEventListener('liveSessionSnapshot', (e: Event) => {
   applyLiveSessionSnapshot((e as CustomEvent<LiveSessionSnapshotData>).detail);
 });
 
+// A link is one navigation request, not a preference reapplied on reconnect.
+// Missing targets are rejected after the current server state, never kept as
+// promises to select an unrelated future tab with that id.
+function applyPendingSessionLink(): boolean {
+  const intent = sessionLink.take(liveSessions.map(session => session.id));
+  if (!intent) return false;
+  clearSessionLinkHash(location, history);
+  if (intent.kind === 'select') {
+    void selectLiveSession(intent.id, false);
+  } else {
+    if (!hasRestoredInitialLiveSession) {
+      activeLiveSessionId = null;
+      viewingActiveSession = false;
+      renderLiveTabs();
+      updateLiveSessionInputState();
+    }
+    flashStatusError(intent.kind === 'missing'
+      ? 'Linked Tau tab is no longer live. Select a tab to continue.'
+      : 'Invalid Tau session link. Select a tab to continue.', 8000);
+  }
+  return true;
+}
+
+window.addEventListener('hashchange', () => {
+  sessionLink.set(location.hash);
+  if (hasReceivedInitialServerState && wsClient.ws?.readyState === WebSocket.OPEN) {
+    applyPendingSessionLink();
+  }
+});
+
 // ═══════════════════════════════════════
 // Live-session tabs
 // ═══════════════════════════════════════
@@ -508,6 +548,7 @@ function handleLiveSessionClosed(closedId: string) {
   renderQueuedMessages();
   if (activeLiveSessionId === closedId) {
     const wasViewingActive = viewingActiveSession;
+    voiceInput?.cancel();
     activeLiveSessionId = null;
     localStorage.removeItem('tau-active-live-session-id');
     activeLiveSessionFile = null;
@@ -629,7 +670,7 @@ function restoreActiveLiveSession() {
   const saved = activeLiveSessionId && liveSessions.find(s => s.id === activeLiveSessionId);
   const next = saved || getMostRecentLiveSession();
   if (next) {
-    selectLiveSession(next.id);
+    selectLiveSession(next.id, resumeQueuedInput);
   } else {
     activeLiveSessionId = null;
     viewingActiveSession = false;
@@ -643,9 +684,12 @@ function restoreActiveLiveSession() {
   }
 }
 
-async function selectLiveSession(id: string) {
+async function selectLiveSession(id: string, resumeQueue = true) {
+  sessionLink.cancel();
+  voiceInput?.cancel();
   const session = liveSessions.find(s => s.id === id);
   if (!session) return;
+  resumeQueuedInput = resumeQueue;
   suspendCurrentDialogForTabSwitch(id);
   stopFollowing();
   launcherPanel.hide();
@@ -667,12 +711,14 @@ async function selectLiveSession(id: string) {
   try {
     const res = await fetch(`/api/live-sessions/${encodeURIComponent(id)}/snapshot`);
     const data = await res.json();
+    if (id !== activeLiveSessionId || !viewingActiveSession) return;
     if (!res.ok || data.error) {
       handleLiveSessionClosed(id);
       throw new Error(data.error || 'Live session not found');
     }
     applyLiveSessionSnapshot({ ...data, sessionId: id }, requestedAtRevision);
   } catch (e) {
+    if (id !== activeLiveSessionId || !viewingActiveSession) return;
     messageRenderer.renderError((e instanceof Error ? e.message : '') || 'Failed to load live session snapshot');
     return;
   }
@@ -1485,6 +1531,7 @@ function sendMessage() {
   }
 
   cmd.sessionId = activeLiveSessionId;
+  resumeQueuedInput = true;
 
   if (state.isStreaming || sessionHasPendingWork(activeLiveSessionId)) {
     // Queue it for the current Tau tab only; do not let tab switches retarget it.
@@ -1548,7 +1595,7 @@ function escapeHtml(text: string) {
 }
 
 function flushQueue() {
-  if (!activeLiveSessionId || state.isStreaming || sessionHasPendingWork(activeLiveSessionId)) return;
+  if (!activeLiveSessionId || state.isStreaming || !resumeQueuedInput || sessionHasPendingWork(activeLiveSessionId)) return;
   const idx = messageQueue.findIndex(cmd => cmd.sessionId === activeLiveSessionId);
   if (idx >= 0) {
     if (messageQueue[idx].error) return; // A failed instruction needs an explicit retry or cancellation.
@@ -1919,6 +1966,7 @@ async function newSession() {
 }
 
 async function handleSessionSelect(session: SidebarSession | null) {
+  sessionLink.cancel();
   if (session) sidebar.setActive(session.filePath);
   sessionTotalCost = 0;
   lastInputTokens = 0;
@@ -2630,19 +2678,37 @@ toggleShowThinking.addEventListener('click', () => {
   localStorage.setItem('tau-show-thinking', String(!isOn));
 });
 
-// Fullscreen toggle (follows the document's actual fullscreen state)
+// Fullscreen preference: on by default for touch devices, off for desktop;
+// an explicit choice is remembered. Browsers only enter fullscreen from a user
+// gesture, so while the preference is on, any tap outside fullscreen enters it
+// (also after the browser left fullscreen, e.g. on an app switch).
 const toggleFullscreen = document.getElementById('toggle-fullscreen')!;
-if (document.fullscreenEnabled) {
-  const syncFullscreenToggle = () => {
-    toggleFullscreen.className = `settings-toggle${document.fullscreenElement ? ' on' : ''}`;
-  };
-  document.addEventListener('fullscreenchange', syncFullscreenToggle);
-  toggleFullscreen.addEventListener('click', () => {
-    const change = document.fullscreenElement
-      ? document.exitFullscreen()
-      : document.documentElement.requestFullscreen();
+const installedFullscreen = matchMedia('(display-mode: fullscreen), (display-mode: standalone)').matches;
+if (document.fullscreenEnabled && !installedFullscreen) {
+  const savedFullscreen = localStorage.getItem('tau-fullscreen');
+  let preferFullscreen = savedFullscreen ? savedFullscreen === 'on' : matchMedia('(pointer: coarse)').matches;
+  const changeFullscreen = (enter: boolean) => {
+    if (enter === Boolean(document.fullscreenElement)) return;
+    const change = enter ? document.documentElement.requestFullscreen() : document.exitFullscreen();
     change.catch((error: unknown) => console.warn('Fullscreen change failed', error));
+  };
+  const syncFullscreenToggle = () => {
+    toggleFullscreen.className = `settings-toggle${preferFullscreen ? ' on' : ''}`;
+  };
+  syncFullscreenToggle();
+  document.addEventListener('click', (event) => {
+    if (preferFullscreen && !(event.target instanceof Element && event.target.closest('#toggle-fullscreen'))) changeFullscreen(true);
+  }, true);
+  toggleFullscreen.addEventListener('click', () => {
+    preferFullscreen = !preferFullscreen;
+    localStorage.setItem('tau-fullscreen', preferFullscreen ? 'on' : 'off');
+    syncFullscreenToggle();
+    changeFullscreen(preferFullscreen);
   });
+} else if (!installedFullscreen) {
+  // iPhone Safari has no element fullscreen; a Home Screen web app is.
+  document.getElementById('fullscreen-label')!.textContent = 'Fullscreen: add Tau to your Home Screen';
+  toggleFullscreen.style.display = 'none';
 } else {
   document.getElementById('setting-fullscreen')!.style.display = 'none';
 }
@@ -2720,8 +2786,8 @@ const sessionStatsCard = setupSessionStatsCard({
   }),
 });
 
-// Voice Input
-setupVoiceInput(document.getElementById('mic-btn')!, messageInput);
+// Voice input (assigned once the DOM hooks below exist; session changes cancel it)
+voiceInput = setupVoiceInput(document.getElementById('mic-btn')!, messageInput as HTMLTextAreaElement, document.getElementById('voice-status')!);
 
 // ═══════════════════════════════════════
 // Initialize

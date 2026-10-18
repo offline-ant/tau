@@ -18,27 +18,44 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
+import { isIP } from 'node:net';
 
 import { HOST, PI_AGENT_DIR, TAU_SETTINGS } from './config.js';
 
 export const RUNTIME_DIR = path.join(PI_AGENT_DIR, 'tau');
 export const RUNTIME_FILE = path.join(RUNTIME_DIR, 'server.json');
 
-type RuntimeFile = { endpoint: string; pid: number; startedAt: string };
+type RuntimeFile = { endpoint: string; pid: number; startedAt: string; browserUrls?: string[] };
 
 let endpoint = '';
 
-/** Loopback unless tau is bound to one specific non-loopback address. */
-function endpointHost(): string {
-  if (!HOST || HOST === '0.0.0.0' || HOST === '::' || HOST === 'localhost') return '127.0.0.1';
-  return HOST.includes(':') ? `[${HOST}]` : HOST;
+/** Wildcard listeners use loopback for local orchestration, never a LAN address. */
+function endpointHost(address: string): string {
+  if (!address || address === '0.0.0.0' || address === 'localhost') return '127.0.0.1';
+  if (address === '::') return '[::1]';
+  return address.includes(':') ? `[${address}]` : address;
 }
 
-export function buildEndpoint(port: number): string {
+/** Only numeric addresses on the listener's family; scoped IPv6 is not a browser URL. */
+export function buildBrowserUrls(port: number, address = HOST, interfaces = os.networkInterfaces()): string[] {
+  const wildcard = address === '0.0.0.0' || address === '::';
+  const family = address === '::' ? 6 : 4;
+  const addresses = wildcard
+    ? [...Object.values(interfaces).flatMap((entries) => entries ?? []).filter((entry) => !entry.internal).map((entry) => entry.address), family === 6 ? '::1' : '127.0.0.1']
+    : [address];
+  return [...new Set(addresses)].filter((host) => {
+    const version = isIP(host);
+    return version !== 0 && (!wildcard || version === family) && host !== '0.0.0.0' && host !== '::'
+      && !host.includes('%') && !/^fe[89ab]/i.test(host);
+  }).map((host) => `http://${host.includes(':') ? `[${host}]` : host}:${port}`);
+}
+
+export function buildEndpoint(port: number, address = HOST): string {
   const credentials = TAU_SETTINGS.user && TAU_SETTINGS.pass
     ? `${encodeURIComponent(TAU_SETTINGS.user)}:${encodeURIComponent(TAU_SETTINGS.pass)}@`
     : '';
-  return `http://${credentials}${endpointHost()}:${port}`;
+  return `http://${credentials}${endpointHost(address)}:${port}`;
 }
 
 /** Empty until the server is listening. */
@@ -62,14 +79,14 @@ function isAlive(pid: number): boolean {
  * first one's file alone: two servers cannot both be "the" discoverable one,
  * and silently stealing the name would send workers to the wrong instance.
  */
-export function publishEndpoint(port: number): void {
-  endpoint = buildEndpoint(port);
+export function publishEndpoint(port: number, address = HOST): void {
+  endpoint = buildEndpoint(port, address);
   const existing = readRuntimeFile();
   if (existing && existing.pid !== process.pid && isAlive(existing.pid)) {
     console.log(`[Tau] Another tau server (pid ${existing.pid}) owns ${RUNTIME_FILE}; orchestration discovery keeps pointing at it. Use PI_ORCHESTRATION_ENDPOINT to target this instance.`);
     return;
   }
-  const record: RuntimeFile = { endpoint, pid: process.pid, startedAt: new Date().toISOString() };
+  const record: RuntimeFile = { endpoint, pid: process.pid, startedAt: new Date().toISOString(), browserUrls: buildBrowserUrls(port, address) };
   try {
     fs.mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 });
     const temp = `${RUNTIME_FILE}.${process.pid}.tmp`;

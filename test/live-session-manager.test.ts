@@ -1,10 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { EventEmitter } from 'node:events';
-import { PassThrough } from 'node:stream';
+import { FakePi, flushIo } from './fake-pi.ts';
+import type { JsonRecord } from '../src/server/types.ts';
 import { WebSocket } from 'ws';
 
 // The built server module is a plain JS artifact without declarations; the
@@ -146,154 +145,197 @@ test('shutdown terminates all managed sessions and clears the map', async () => 
   assert.equal(s1.calls.terminatedArgs[0], 'server_shutdown');
 });
 
-// A realistic fake `pi` child: real streams so start()'s setEncoding/on('data')
-// wiring works, and an EventEmitter so on('error')/on('exit') resolve startup.
-function makeFakeChild() {
-  const child: any = new EventEmitter();
-  child.stdin = new PassThrough();
-  child.stdout = new PassThrough();
-  child.stderr = new PassThrough();
-  child.pid = 12345;
-  child.kill = (sig: string) => { child.killedSignal = sig; };
-  return child;
-}
+test('shutdown waits for every cleanup and reports failures without dropping uncertain children', async () => {
+  const mgr = new LiveSessionManager();
+  const failed = fakeSession('failed');
+  failed.terminate = async () => { throw new Error('exit not confirmed'); };
+  const delayed = fakeSession('delayed');
+  let finish: () => void = () => { throw new Error('cleanup not started'); };
+  delayed.terminate = () => new Promise<void>((resolve) => { finish = resolve; });
+  mgr.sessions.set(failed.id, failed);
+  mgr.sessions.set(delayed.id, delayed);
+  let settled = false;
+  const shuttingDown = assert.rejects(mgr.shutdown(), /1 Pi child exit\(s\) unconfirmed/).then(() => { settled = true; });
+  await flushIo();
+  assert.equal(settled, false);
+  finish();
+  await shuttingDown;
+  assert.equal(mgr.get(failed.id), failed);
+  assert.equal(mgr.get(delayed.id), undefined);
+});
 
-test('create() resolves cwd, stores the session, and broadcasts live_session_created', async (t: TestContext) => {
-  // Mock the startup setTimeouts in start() so the test does not wait on
-  // wall-clock time for the 100ms startup grace.
+test('create() waits for readiness before storing and broadcasting the real model', async (t: TestContext) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
-  const child = makeFakeChild();
-  _setSpawnPiForTest(() => child);
+  const child = new FakePi({ autoRespond: false, state: { model: { provider: 'openai', id: 'gpt-5.5' }, thinkingLevel: 'high' } });
+  _setSpawnPiForTest(() => child.asChild());
   t.after(() => _setSpawnPiForTest(null));
-
   const mgr = new LiveSessionManager();
   const client = openClient();
   mgr.addClient(client);
-
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-create-'));
-  const createP = mgr.create({ cwd, model: 'openai/gpt-5.5' });
-  // advance past start()'s 100ms startup wait so it resolves
-  t.mock.timers.tick(100);
-  const session = await createP;
-
-  assert.equal(mgr.get(session.id), session);
-  assert.equal(session.cwd, path.resolve(cwd));
-  assert.equal(session.modelSpec, 'openai/gpt-5.5');
-  assert.equal(session.pid, 12345);
-  // the live_session_created broadcast is delivered to the connected client
-  assert.equal(client.sent.length, 1);
-  const msg = JSON.parse(client.sent[0]);
-  assert.equal(msg.type, 'live_session_created');
-  assert.equal(msg.session.id, session.id);
-  // The server canonicalizes the spec into a full {provider,id} object.
-  assert.deepEqual(msg.session.model, { provider: 'openai', id: 'gpt-5.5' });
-  assert.equal(msg.session.modelLabel, 'openai/gpt-5.5');
-});
-
-test('resume() passes --session, seeds entries/name, stores, and broadcasts', async (t: TestContext) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  const child = makeFakeChild();
-  _setSpawnPiForTest(() => child);
-  t.after(() => _setSpawnPiForTest(null));
-
-  const mgr = new LiveSessionManager();
-  const client = openClient();
-  mgr.addClient(client);
-
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-resume-'));
-  const sessionFile = path.join(cwd, 'test.jsonl');
-  const entries = [{ type: 'message', message: { role: 'user', content: 'hi' } }];
-
-  const resumeP = mgr.resume({ sessionFile, cwd, model: 'openai/gpt-4o', entries, sessionName: 'My Session' });
-  t.mock.timers.tick(100);
-  const session = await resumeP;
-
-  assert.equal(mgr.get(session.id), session);
-  assert.equal(session.sessionFile, path.resolve(sessionFile));
-  assert.equal(session.sessionName, 'My Session');
-  assert.equal(session.entries.length, 1);
-  assert.deepEqual(session.entries[0], entries[0]);
-  assert.equal(session.cwd, path.resolve(cwd));
-
-  // Broadcast includes sessionFile and sessionName in metadata.
-  const msg = JSON.parse(client.sent[0]);
-  assert.equal(msg.type, 'live_session_created');
-  assert.equal(msg.session.sessionFile, path.resolve(sessionFile));
-  assert.equal(msg.session.sessionName, 'My Session');
-});
-
-test('resume() coalesces concurrent and repeated resumes for the same file', async (t: TestContext) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  const child = makeFakeChild();
-  let call = 0;
-  _setSpawnPiForTest(() => { call++; return child; });
-  t.after(() => _setSpawnPiForTest(null));
-
-  const mgr = new LiveSessionManager();
-  const client = openClient();
-  mgr.addClient(client);
-
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-resume2-'));
-  const sessionFile = path.join(cwd, 'dup.jsonl');
-
-  const p1 = mgr.resume({ sessionFile, cwd });
-  const p2 = mgr.resume({ sessionFile, cwd });
-  assert.equal(mgr.hasPendingResume(sessionFile), true);
-  t.mock.timers.tick(100);
-  const [s1, s2] = await Promise.all([p1, p2]);
-  assert.equal(s1.id, s2.id);
-  assert.equal(call, 1);
-  assert.equal(mgr.sessions.size, 1);
-  assert.equal(client.sent.length, 1);
-
-  const s3 = await mgr.resume({ sessionFile, cwd });
-  assert.equal(s3.id, s1.id);
-  assert.equal(call, 1);
-  assert.equal(mgr.sessions.size, 1);
-});
-
-test('resume() waits for a terminating session with the same file before spawning again', async (t: TestContext) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  let call = 0;
-  _setSpawnPiForTest(() => { call++; return makeFakeChild(); });
-  t.after(() => _setSpawnPiForTest(null));
-
-  const mgr = new LiveSessionManager();
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-resume-terminate-'));
-  const sessionFile = path.join(cwd, 'resume.jsonl');
-
-  const firstP = mgr.resume({ sessionFile, cwd });
-  t.mock.timers.tick(100);
-  const first = await firstP;
-  assert.equal(call, 1);
-
-  const deleteP = mgr.delete(first.id);
-  assert.equal(mgr.hasTerminatingResume(sessionFile), true);
+  const cwd = os.tmpdir();
+  const creating = mgr.create({ cwd });
+  t.mock.timers.tick(1000);
+  await flushIo();
   assert.equal(mgr.sessions.size, 0);
+  assert.equal(client.sent.length, 0);
+  assert.deepEqual(child.commands.map((command) => command.type), ['get_state']);
+  child.autoRespond = true;
+  child.respond(child.commands[0]);
+  const session = await creating;
+  assert.equal(mgr.get(session.id), session);
+  assert.equal(session.cwd, path.resolve(cwd));
+  assert.equal(session.pid, 12345);
+  const messages = client.sent.map((message) => JSON.parse(message));
+  const created = messages.filter((message) => message.type === 'live_session_created');
+  assert.equal(created.length, 1);
+  assert.equal(created[0].session.id, session.id);
+  assert.deepEqual(created[0].session.model, { provider: 'openai', id: 'gpt-5.5' });
+  assert.equal(created[0].session.thinkingLevel, 'high');
+  assert.ok(child.commands.some((command) => command.type === 'get_session_stats'));
+});
 
-  const secondP = mgr.resume({ sessionFile, cwd });
-  assert.equal(call, 1, 'resume must not spawn while the old child is terminating');
+test('resume() forwards args/env and uses the active branch while preserving header/name', async (t: TestContext) => {
+  const cwd = os.tmpdir();
+  const sessionFile = path.join(cwd, 'tau-resume-branch.jsonl');
+  const root = { id: 'root', parentId: null, type: 'message', message: { role: 'user', content: 'question' } };
+  const kept = { id: 'kept', parentId: 'root', type: 'message', message: { role: 'assistant', content: 'kept answer' } };
+  const discarded = { id: 'discarded', parentId: 'root', type: 'message', message: { role: 'assistant', content: 'other branch' } };
+  const header = { type: 'session', id: 'session-id', cwd };
+  const child = new FakePi({ sessionFile, tree: [{ entry: root, children: [{ entry: kept }, { entry: discarded }] }], leafId: 'kept' });
+  const calls: Array<{ args: string[]; options: JsonRecord }> = [];
+  _setSpawnPiForTest((_command: string, args: string[], options: JsonRecord) => {
+    calls.push({ args, options });
+    return child.asChild();
+  });
+  t.after(() => _setSpawnPiForTest(null));
+  const mgr = new LiveSessionManager();
+  const client = openClient();
+  mgr.addClient(client);
+  const args = ['--provider', 'openai', '--thinking', 'high'];
+  const env = { PI_CODING_AGENT_DIR: '/tmp/private-agent', HERDR_SOCKET_PATH: '/tmp/herdr.sock' };
+  const { session: session } = await mgr.resume({ sessionFile, cwd, model: 'gpt-4o', entries: [header, root, kept, discarded], sessionName: 'My Session', args, env });
+  assert.equal(mgr.get(session.id), session);
+  assert.deepEqual(session.entries, [header, root, kept]);
+  assert.equal(session.sessionName, 'My Session');
+  assert.equal(session.sessionFile, sessionFile);
+  assert.equal(calls[0].args[calls[0].args.indexOf('--session') + 1], sessionFile);
+  assert.equal(calls[0].args[calls[0].args.indexOf('--model') + 1], 'gpt-4o');
+  assert.deepEqual(calls[0].args.slice(-args.length), args);
+  const childEnv = calls[0].options.env as Record<string, string>;
+  for (const [key, value] of Object.entries(env)) assert.equal(childEnv[key], value);
+  const created = client.sent.map((message) => JSON.parse(message)).find((message) => message.type === 'live_session_created');
+  assert.equal(created.session.sessionFile, sessionFile);
+  assert.equal(created.session.sessionName, 'My Session');
+});
+
+test('resume() coalesces delayed concurrent and repeated resumes for the same file', async (t: TestContext) => {
+  const sessionFile = '/tmp/tau-concurrent-resume.jsonl';
+  const child = new FakePi({ sessionFile, autoRespond: false });
+  let spawned = 0;
+  _setSpawnPiForTest(() => { spawned++; return child.asChild(); });
+  t.after(() => _setSpawnPiForTest(null));
+  const mgr = new LiveSessionManager();
+  const first = mgr.resume({ sessionFile, cwd: os.tmpdir() });
+  const second = mgr.resume({ sessionFile, cwd: os.tmpdir() });
   assert.equal(mgr.hasPendingResume(sessionFile), true);
+  await flushIo();
+  assert.equal(spawned, 1);
+  assert.equal(mgr.sessions.size, 0);
+  child.autoRespond = true;
+  child.respond(child.commands[0]);
+  const [a, b] = await Promise.all([first, second]);
+  assert.equal(a.session, b.session);
+  assert.equal(a.started, true);
+  assert.equal(b.started, false);
+  const repeated = await mgr.resume({ sessionFile, cwd: os.tmpdir() });
+  assert.equal(repeated.session, a.session);
+  assert.equal(repeated.started, false);
+  assert.equal(spawned, 1);
+  assert.equal(mgr.hasPendingResume(sessionFile), false);
+});
 
-  t.mock.timers.tick(1500);
-  for (let i = 0; i < 20 && call < 2; i++) await Promise.resolve();
-  assert.equal(call, 2, 'resume should spawn after termination completes');
-  t.mock.timers.tick(100);
-  const [second] = await Promise.all([secondP, deleteP]);
-
-  assert.notEqual(second.id, first.id);
-  assert.equal(call, 2);
+test('resume() waits for actual child exit during concurrent deletes', async (t: TestContext) => {
+  const sessionFile = '/tmp/tau-wait-exit.jsonl';
+  const children: FakePi[] = [];
+  _setSpawnPiForTest(() => {
+    const child = new FakePi({ sessionFile, exitOnSignal: null });
+    children.push(child);
+    return child.asChild();
+  });
+  t.after(() => _setSpawnPiForTest(null));
+  const mgr = new LiveSessionManager();
+  const { session: first } = await mgr.resume({ sessionFile, cwd: os.tmpdir() });
+  const deletion = mgr.delete(first.id);
+  const duplicateDeletion = mgr.delete(first.id);
+  assert.equal(mgr.hasTerminatingResume(sessionFile), true);
+  assert.equal(mgr.get(first.id), first, 'retain ownership until exit');
+  const resuming = mgr.resume({ sessionFile, cwd: os.tmpdir() });
+  await flushIo();
+  assert.equal(children.length, 1);
+  assert.deepEqual(children[0].signals, ['SIGTERM']);
+  children[0].exit(null, 'SIGTERM');
+  const [second] = await Promise.all([resuming, deletion, duplicateDeletion]);
+  assert.notEqual(first.id, second.session.id);
+  assert.equal(second.started, true);
+  assert.equal(children.length, 2);
   assert.equal(mgr.sessions.size, 1);
   assert.equal(mgr.hasTerminatingResume(sessionFile), false);
 });
 
-test('create() rejects when the cwd does not exist', async (t: TestContext) => {
-  _setSpawnPiForTest(() => makeFakeChild());
+test('failed cleanup rejects delete and concurrent resume without dropping ownership', async (t: TestContext) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const sessionFile = '/tmp/tau-uncertain-exit.jsonl';
+  const child = new FakePi({ sessionFile, exitOnSignal: null });
+  let spawned = 0;
+  _setSpawnPiForTest(() => { spawned++; return child.asChild(); });
   t.after(() => _setSpawnPiForTest(null));
   const mgr = new LiveSessionManager();
-  await assert.rejects(
-    () => mgr.create({ cwd: '/definitely/not/a/real/path/tau' }),
-    /Directory not found/,
-  );
+  const { session: session } = await mgr.resume({ sessionFile, cwd: os.tmpdir() });
+  const deletion = assert.rejects(mgr.delete(session.id), { childStopped: false, sessionId: session.id });
+  const resuming = assert.rejects(mgr.resume({ sessionFile, cwd: os.tmpdir() }), { childStopped: false, sessionId: session.id });
+  await flushIo();
+  t.mock.timers.tick(1500);
+  await flushIo();
+  t.mock.timers.tick(5000);
+  await Promise.all([deletion, resuming]);
+  assert.equal(mgr.get(session.id), session);
+  assert.equal(spawned, 1);
+  await assert.rejects(mgr.resume({ sessionFile, cwd: os.tmpdir() }), { childStopped: false, sessionId: session.id });
+  assert.equal(spawned, 1);
+  child.exit(null, 'SIGKILL');
+  assert.equal(mgr.sessions.size, 0);
+});
+
+test('ambiguous startup retains the child and blocks later resumes until exit', async (t: TestContext) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const sessionFile = '/tmp/tau-failed-start.jsonl';
+  const child = new FakePi({ sessionFile, autoRespond: false, exitOnSignal: null });
+  let spawned = 0;
+  _setSpawnPiForTest(() => { spawned++; return child.asChild(); });
+  t.after(() => _setSpawnPiForTest(null));
+  const mgr = new LiveSessionManager();
+  const failing = assert.rejects(mgr.resume({ sessionFile, cwd: os.tmpdir() }), { childStopped: false });
+  await flushIo();
+  child.respond(child.commands[0], { success: false, error: 'configuration rejected' });
+  await flushIo();
+  t.mock.timers.tick(1500);
+  await flushIo();
+  t.mock.timers.tick(5000);
+  await failing;
+  assert.equal(mgr.sessions.size, 1);
+  assert.equal(mgr.hasPendingResume(sessionFile), false);
+  await assert.rejects(mgr.resume({ sessionFile, cwd: os.tmpdir() }), { childStopped: false });
+  assert.equal(spawned, 1);
+  child.exit(null, 'SIGKILL');
+  assert.equal(mgr.sessions.size, 0);
+});
+
+test('create() rejects a missing cwd without spawning a child', async (t: TestContext) => {
+  let spawned = false;
+  _setSpawnPiForTest(() => { spawned = true; return new FakePi().asChild(); });
+  t.after(() => _setSpawnPiForTest(null));
+  const mgr = new LiveSessionManager();
+  await assert.rejects(mgr.create({ cwd: '/definitely/not/a/real/path/tau' }), { childStopped: true });
+  assert.equal(spawned, false);
   assert.equal(mgr.sessions.size, 0);
 });

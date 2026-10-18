@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { EventEmitter } from 'node:events';
-import { PassThrough } from 'node:stream';
+import { FakePi } from '../fake-pi.ts';
+import type { TreeEntry } from '../../src/server/tree.ts';
 import { chromium } from 'playwright';
 import type { TestContext } from 'node:test';
 import type { Browser, Page } from 'playwright';
@@ -24,7 +24,11 @@ export type ToolResultMessage = Extract<Extract<JsonAgentSessionEvent, { type: '
 
 // Loopback host; isolate session/settings dirs before loading the server.
 process.env.TAU_HOST = '127.0.0.1';
+process.env.TMPDIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-history-tmp-'));
 process.env.PI_CODING_AGENT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-e2e-'));
+process.env.TAU_USER = '';
+process.env.TAU_PASS = '';
+fs.writeFileSync(path.join(process.env.PI_CODING_AGENT_DIR, 'settings.json'), JSON.stringify({ tau: { authEnabled: false } }));
 process.env.PI_CODING_AGENT_SESSION_DIR = path.join(process.env.PI_CODING_AGENT_DIR, 'sessions');
 process.env.TAU_PROJECTS_DIR = path.join(process.env.PI_CODING_AGENT_DIR, 'projects');
 
@@ -40,16 +44,14 @@ let browserUnavailable = '';
 
 const PROJ_DIR = path.join(SESSIONS_DIR, '--tmp--e2eproj');
 
-// Same realistic fake `pi` child as test/http-routes.test.ts: real streams so
-// the RPC wiring works, an EventEmitter so error/exit listeners resolve.
-function makeFakeChild() {
-  const child: any = new EventEmitter();
-  child.stdin = new PassThrough();
-  child.stdout = new PassThrough();
-  child.stderr = new PassThrough();
-  child.pid = 12345;
-  child.kill = () => {};
-  return child;
+// Readiness and refresh return the exact file and its selected history path.
+function makeFakeChild(args: string[]) {
+  const sessionIndex = args.indexOf('--session');
+  assert.notEqual(sessionIndex, -1);
+  const sessionFile = args[sessionIndex + 1];
+  const entries = fs.readFileSync(sessionFile, 'utf8').trim().split('\n')
+    .map((line) => JSON.parse(line) as TreeEntry).filter((entry) => entry.type !== 'session');
+  return new FakePi({ sessionFile, tree: entries.map((entry) => ({ entry })), leafId: entries.at(-1)?.id ?? null }).asChild();
 }
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
@@ -112,7 +114,9 @@ function buildSmallSession(cwd: string) {
 function writeSession(fileName: string, lines: Array<Record<string, unknown>>) {
   fs.mkdirSync(PROJ_DIR, { recursive: true });
   const filePath = path.join(PROJ_DIR, fileName);
-  fs.writeFileSync(filePath, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+  const entries = lines.map((entry, index) => index === 0 ? entry
+    : { ...entry, id: `entry-${index}`, parentId: index === 1 ? null : `entry-${index - 1}` });
+  fs.writeFileSync(filePath, entries.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
   return filePath;
 }
 
@@ -127,7 +131,7 @@ export function setupHistoryE2E() {
     largeFile = writeSession('large.jsonl', buildLargeSession(cwd));
     smallFile = writeSession('small.jsonl', buildSmallSession(cwd));
 
-    _setSpawnPiForTest(() => makeFakeChild());
+    _setSpawnPiForTest((_command: string, args: string[]) => makeFakeChild(args));
     _setExecFileForTest((_file: string, _args: string[], _opts: object, cb: (err: Error | null, stdout: string, stderr: string) => void) =>
       cb(null, '', '')
     );
@@ -212,6 +216,8 @@ export async function openPage(t: TestContext, options: OpenPageOptions = {}) {
     // manual branch. Disable it so this page behaves like stable Safari.
     await page.addStyleTag({ content: '.messages { overflow-anchor: none !important; }' });
   }
+  // Projects are loaded first; their transcript lists are fetched on expansion.
+  await page.locator('.project-group .project-header').first().click();
   await page.waitForSelector('.session-item', { timeout: 15000 });
   return { page, errors };
 }
