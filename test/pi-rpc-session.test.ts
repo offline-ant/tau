@@ -3,8 +3,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
-import { EventEmitter } from 'node:events';
-import { PassThrough } from 'node:stream';
+import { FakePi, flushIo } from './fake-pi.ts';
 
 process.env.PI_CODING_AGENT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-pirs-'));
 process.env.PI_CODING_AGENT_SESSION_DIR = path.join(process.env.PI_CODING_AGENT_DIR, 'sessions');
@@ -164,52 +163,48 @@ test('send rejects when terminating', async () => {
   await assert.rejects(() => session.send({ type: 'prompt', message: 'hi' }), /not running/);
 });
 
-test('terminate rejects pending commands and escalates to SIGKILL when SIGTERM is ignored', async (t: TestContext) => {
-  // Mock the SIGTERM grace wait so the escalation logic runs without a real
-  // 1.5s sleep. clearTimeout is mocked automatically alongside setTimeout.
+test('terminate rejects pending commands and waits for actual exit after SIGKILL', async (t: TestContext) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const { session } = makeSession();
-  const killedSignals: string[] = [];
-  // a stubborn child that never exits and records kill signals
-  session.child = {
-    exitCode: null,
-    signalCode: null,
-    stdin: { writable: true, write: ((_d: string, cb?: (err?: Error | null) => void) => cb && cb()) as FakeWrite },
-    kill(sig: string) { killedSignals.push(sig); },
-  };
-  // plant a pending command; attach the rejection handler BEFORE terminate
-  // runs so the pending rejection isn't reported as an unhandled rejection.
-  const p = session.send({ type: 'get_session_stats' }, { timeoutMs: 100000 });
-  const check = assert.rejects(p, /Session terminated/);
+  const child = new FakePi({ autoRespond: false, exitOnSignal: null });
+  session.child = child.asChild();
+  const check = assert.rejects(session.send({ type: 'get_session_stats' }, { timeoutMs: 100000 }), /Session terminated/);
   const term = session.terminate('closed_by_user');
-  // advance past the 1500ms grace wait so terminate can re-check and SIGKILL
+  assert.equal(session.terminate('duplicate'), term, 'concurrent termination joins the exit wait');
+  let completed = false;
+  term.then(() => { completed = true; });
   t.mock.timers.tick(1500);
+  await flushIo();
+  assert.deepEqual(child.signals, ['SIGTERM', 'SIGKILL']);
+  assert.equal(completed, false, 'sending SIGKILL is not proof of exit');
+  child.exit(null, 'SIGKILL');
   await Promise.all([term, check]);
   assert.equal(session.pending.size, 0);
   assert.equal(session.terminating, true);
-  // SIGTERM then SIGKILL because exitCode/signalCode stayed null
-  assert.deepEqual(killedSignals, ['SIGTERM', 'SIGKILL']);
 });
 
-test('terminate does not escalate to SIGKILL if the child already exited after SIGTERM', async (t: TestContext) => {
+test('terminate resolves immediately on SIGTERM exit without waiting out the grace period', async (t: TestContext) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const { session } = makeSession();
-  const killedSignals: string[] = [];
-  session.child = {
-    exitCode: null,
-    signalCode: null,
-    stdin: { writable: true, write: ((_d: string, cb?: (err?: Error | null) => void) => cb && cb()) as FakeWrite },
-    kill(sig: string) {
-      killedSignals.push(sig);
-      // simulate the process exiting due to SIGTERM
-      session.child.exitCode = 0;
-      session.child.signalCode = 'SIGTERM';
-    },
-  };
-  const term = session.terminate('closed_by_user');
+  const child = new FakePi();
+  session.child = child.asChild();
+  await session.terminate('closed_by_user');
+  assert.deepEqual(child.signals, ['SIGTERM']);
+  assert.equal(child.signalCode, 'SIGTERM');
+});
+
+test('terminate reports an uncertain outcome when neither signal produces an exit', async (t: TestContext) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { session } = makeSession();
+  const child = new FakePi({ exitOnSignal: null });
+  session.child = child.asChild();
+  const failure = assert.rejects(session.terminate(), { childStopped: false, sessionId: session.id });
   t.mock.timers.tick(1500);
-  await term;
-  assert.deepEqual(killedSignals, ['SIGTERM']);
+  await flushIo();
+  t.mock.timers.tick(5000);
+  await failure;
+  assert.deepEqual(child.signals, ['SIGTERM', 'SIGKILL']);
+  assert.equal(session.terminating, true);
 });
 
 test('a pending command rejected by an exit reports the child stderr that explains it', async () => {
@@ -239,6 +234,14 @@ test('handleExit rejects pending and notifies the manager once', async () => {
   assert.equal(manager.removed[0].id, session.id);
   // a second exit event is ignored
   session.handleExit(0, null);
+  assert.equal(manager.removed.length, 1);
+});
+
+test('a signal-only exit is final even though its exit code is null', () => {
+  const { session, manager } = makeSession();
+  session.handleExit(null, 'SIGTERM');
+  session.handleExit(null, 'SIGTERM');
+  assert.equal(session.exited, true);
   assert.equal(manager.removed.length, 1);
 });
 
@@ -408,122 +411,254 @@ test('constructor accepts sessionFile, entries, and sessionName and they appear 
   assert.equal(meta.sessionName, 'Resumed Chat');
 });
 
-test('start() passes --session <file> to spawned pi when sessionFile is set', async (t: TestContext) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
+test('start() passes --session <file> and waits for state and tree responses', async (t: TestContext) => {
+  const sessionFile = '/tmp/some-session.jsonl';
+  const child = new FakePi({ sessionFile, autoRespond: false });
   const spawnArgs: Array<{ cmd: string; args: string[] }> = [];
-  _setSpawnPiForTest((cmd: string, args: string[], _opts: Record<string, unknown>) => {
+  _setSpawnPiForTest((cmd: string, args: string[]) => {
     spawnArgs.push({ cmd, args });
-    const child: any = new EventEmitter();
-    child.stdin = new PassThrough();
-    child.stdout = new PassThrough();
-    child.stderr = new PassThrough();
-    child.pid = 55555;
-    child.kill = () => {};
-    return child;
+    return child.asChild();
   });
   t.after(() => _setSpawnPiForTest(null));
   const mgr = new LiveSessionManager();
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-spawnargs-'));
-  const createP = mgr.resume({ sessionFile: '/tmp/some-session.jsonl', cwd, model: 'openai/gpt-4o' });
-  t.mock.timers.tick(100);
-  await createP;
+  const starting = mgr.resume({ sessionFile, cwd: os.tmpdir(), model: 'openai/gpt-4o' });
+  let completed = false;
+  starting.then(() => { completed = true; });
+  await flushIo();
+  assert.equal(completed, false);
+  assert.deepEqual(child.commands.map((command) => command.type), ['get_state']);
+  child.respond(child.commands[0]);
+  await flushIo();
+  assert.equal(completed, false);
+  assert.deepEqual(child.commands.map((command) => command.type), ['get_state', 'get_tree']);
+  child.autoRespond = true;
+  child.respond(child.commands[1]);
+  await starting;
   assert.equal(spawnArgs.length, 1);
   const args = spawnArgs[0].args;
-  assert.ok(args.includes('--mode'));
-  assert.ok(args.includes('rpc'));
-  assert.ok(args.includes('--session'));
-  const sessionIdx = args.indexOf('--session');
-  assert.ok(sessionIdx >= 0);
-  assert.equal(args[sessionIdx + 1], '/tmp/some-session.jsonl');
-  assert.ok(args.includes('--model'));
+  assert.equal(args[args.indexOf('--mode') + 1], 'rpc');
+  assert.equal(args[args.indexOf('--session') + 1], sessionFile);
   assert.equal(args[args.indexOf('--model') + 1], 'openai/gpt-4o');
+  assert.deepEqual(child.commands.map((command) => command.type), ['get_state', 'get_tree', 'get_session_stats']);
 });
 
-test('startup get_state response populates model and broadcasts live_session_updated', async (t: TestContext) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  const writes: string[] = [];
-  const child: any = new EventEmitter();
-  child.stdin = { writable: true, write: ((data: string, cb?: (err?: Error | null) => void) => { writes.push(data); cb && cb(); }) as FakeWrite };
-  child.stdout = new PassThrough();
-  child.stderr = new PassThrough();
-  child.pid = 55556;
-  child.kill = () => {};
-  _setSpawnPiForTest(() => child);
+test('startup only succeeds after get_state reports the current model', async (t: TestContext) => {
+  const child = new FakePi({ autoRespond: false, state: { model: { provider: 'anthropic', id: 'claude-opus' }, thinkingLevel: 'medium' } });
+  _setSpawnPiForTest(() => child.asChild());
   t.after(() => _setSpawnPiForTest(null));
   const mgr = new LiveSessionManager();
   const broadcasts: BroadcastMsg[] = [];
   mgr.broadcast = (msg: BroadcastMsg) => { broadcasts.push(msg); };
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-startup-state-'));
-  // Create without a model spec — the common case where the tab would show a
-  // placeholder because pi's default model is unknown to the server.
-  const createP = mgr.create({ cwd });
-  t.mock.timers.tick(100);
-  const session = await createP;
-  assert.equal(session.model, null);
-  // The 250ms startup probe must ask for state (model) and stats.
-  t.mock.timers.tick(250);
-  const sent = writes.map((w) => JSON.parse(w));
-  const getState = sent.find((c) => c.type === 'get_state');
-  assert.ok(getState, 'expected a startup get_state probe');
-  assert.ok(sent.some((c) => c.type === 'get_session_stats'), 'expected the startup get_session_stats probe');
-  // Pi answers get_state with its current (default) model.
-  child.stdout.write(JSON.stringify({
-    type: 'response', id: getState.id, command: 'get_state', success: true,
-    data: { model: { provider: 'anthropic', id: 'claude-opus' }, thinkingLevel: 'medium' },
-  }) + '\n');
-  // Stream data events are nextTick-driven, not setTimeout-driven; flush them.
-  await new Promise((r) => setImmediate(r));
+  const starting = mgr.create({ cwd: os.tmpdir() });
+  await flushIo();
+  assert.equal(broadcasts.some((message) => message.type === 'live_session_created'), false);
+  child.autoRespond = true;
+  child.respond(child.commands[0]);
+  const session = await starting;
   assert.deepEqual(session.model, { provider: 'anthropic', id: 'claude-opus' });
   assert.equal(session.thinkingLevel, 'medium');
-  const updated = broadcasts.find((b) => b.type === 'live_session_updated' && b.session?.id === session.id);
-  assert.ok(updated, 'expected a live_session_updated broadcast after the get_state response');
-  assert.deepEqual(updated?.session?.model, { provider: 'anthropic', id: 'claude-opus' });
-  assert.ok(updated?.session?.modelLabel, 'expected a non-empty modelLabel in the broadcast metadata');
+  const created = broadcasts.find((message) => message.type === 'live_session_created');
+  assert.deepEqual(created?.session?.model, { provider: 'anthropic', id: 'claude-opus' });
 });
 
-test('extension-refresh: prompt ack triggers get_state refresh and broadcast', async () => {
-  const { session, manager } = makeSession('openai/gpt-4o:off');
-  // Register this session in the liveManager so refreshSessionModel's
-  // broadcastUpdated path is exercised against a real manager.
-  liveManager.sessions.set(session.id, session);
-  try {
-    session.child = { stdin: { writable: true, write: ((_d: string, cb?: (err?: Error | null) => void) => cb && cb()) as FakeWrite } };
-    // Track outbound command sequence: first prompt, then get_state.
-    let calls: string[] = [];
-    session.send = (command: RpcCommand, opts: RpcOpts) => {
-      calls.push(command.type);
-      const id = command.id || `cmd_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,6)}`;
-      if (command.type === 'prompt') {
-        return Promise.resolve({ type: 'response', id, success: true, data: {} });
-      }
-      if (command.type === 'get_state') {
-        // Simulate an extension having changed the model mid-prompt.
-        return Promise.resolve({
-          type: 'response', id, success: true,
-          data: { model: { provider: 'openai', id: 'gpt-4o-mini' }, thinkingLevel: 'high' },
-        });
-      }
-      return Promise.resolve({ type: 'response', id, success: true, data: {} });
-    };
-    // Collect broadcastUpdated calls from the real liveManager.
-    const updatedIds: string[] = [];
-    const origBroadcast = liveManager.broadcast.bind(liveManager);
-    liveManager.broadcast = (msg: BroadcastMsg | null) => {
-      if (msg && msg.type === 'live_session_updated' && msg.session) updatedIds.push(msg.session.id);
-      origBroadcast(msg);
-    };
-    const resp = await handleRpcCommand({
-      type: 'prompt', message: '/session-model openai/gpt-4o-mini:high', sessionId: session.id,
+test('unsuccessful startup state waits for cleanup and reports childStopped only after exit', async (t: TestContext) => {
+  const child = new FakePi({ autoRespond: false, exitOnSignal: null });
+  _setSpawnPiForTest(() => child.asChild());
+  t.after(() => _setSpawnPiForTest(null));
+  const mgr = new LiveSessionManager();
+  let rejected = false;
+  const failing = assert.rejects(mgr.create({ cwd: os.tmpdir() }), (error: { message: string; childStopped: boolean }) => {
+    rejected = true;
+    assert.match(error.message, /startup state failed: invalid configuration/);
+    assert.equal(error.childStopped, true);
+    return true;
+  });
+  child.respond(child.commands[0], { success: false, error: 'invalid configuration' });
+  await flushIo();
+  assert.deepEqual(child.signals, ['SIGTERM']);
+  assert.equal(rejected, false);
+  child.exit(null, 'SIGTERM');
+  await failing;
+  assert.equal(mgr.sessions.size, 0);
+});
+
+test('startup rejects a different session file and confirms cleanup', async (t: TestContext) => {
+  const child = new FakePi({ sessionFile: '/tmp/wrong.jsonl' });
+  _setSpawnPiForTest(() => child.asChild());
+  t.after(() => _setSpawnPiForTest(null));
+  const mgr = new LiveSessionManager();
+  await assert.rejects(mgr.resume({ sessionFile: '/tmp/requested.jsonl', cwd: os.tmpdir() }), (error: { message: string; childStopped: boolean }) => {
+    assert.match(error.message, /did not load the requested session/);
+    assert.equal(error.childStopped, true);
+    return true;
+  });
+  assert.deepEqual(child.signals, ['SIGTERM']);
+  assert.equal(child.commands.some((command) => command.type === 'get_tree'), false);
+  assert.equal(mgr.sessions.size, 0);
+});
+
+test('an early startup exit retains stderr and never publishes a live session', async (t: TestContext) => {
+  const child = new FakePi({ autoRespond: false });
+  _setSpawnPiForTest(() => child.asChild());
+  t.after(() => _setSpawnPiForTest(null));
+  const mgr = new LiveSessionManager();
+  const failing = assert.rejects(mgr.create({ cwd: os.tmpdir() }), (error: { message: string; childStopped: boolean }) => {
+    assert.match(error.message, /Unknown provider/);
+    assert.equal(error.childStopped, true);
+    return true;
+  });
+  child.stderr.write('Error: Unknown provider\n');
+  child.exit(1);
+  await failing;
+  assert.equal(mgr.sessions.size, 0);
+  assert.deepEqual(child.signals, []);
+});
+
+test('a child stdin error rejects startup without crashing the server or claiming exit early', async (t: TestContext) => {
+  const child = new FakePi({ autoRespond: false, exitOnSignal: null });
+  _setSpawnPiForTest(() => child.asChild());
+  t.after(() => _setSpawnPiForTest(null));
+  const mgr = new LiveSessionManager();
+  let settled = false;
+  const failing = assert.rejects(mgr.create({ cwd: os.tmpdir() }), { message: 'write EPIPE', childStopped: true }).then(() => { settled = true; });
+  child.stdin.emit('error', new Error('write EPIPE'));
+  await flushIo();
+  assert.equal(settled, false);
+  assert.deepEqual(child.signals, ['SIGTERM']);
+  child.exit(null, 'SIGTERM');
+  await failing;
+  assert.equal(mgr.sessions.size, 0);
+});
+
+test('spawn errors without a pid prove no child remains', async (t: TestContext) => {
+  const child = new FakePi({ autoRespond: false });
+  child.pid = undefined;
+  _setSpawnPiForTest(() => child.asChild());
+  t.after(() => _setSpawnPiForTest(null));
+  const mgr = new LiveSessionManager();
+  const failing = assert.rejects(mgr.create({ cwd: os.tmpdir() }), { message: 'spawn pi ENOENT', childStopped: true });
+  child.emit('error', new Error('spawn pi ENOENT'));
+  await failing;
+  assert.deepEqual(child.signals, []);
+  assert.equal(mgr.sessions.size, 0);
+});
+
+test('a failed startup tree check is not accepted as a ready resumed session', async (t: TestContext) => {
+  const sessionFile = '/tmp/tau-bad-tree.jsonl';
+  const child = new FakePi({ sessionFile, autoRespond: false });
+  _setSpawnPiForTest(() => child.asChild());
+  t.after(() => _setSpawnPiForTest(null));
+  const mgr = new LiveSessionManager();
+  const failing = assert.rejects(mgr.resume({ sessionFile, cwd: os.tmpdir() }), { childStopped: true });
+  await flushIo();
+  child.respond(child.commands[0]);
+  await flushIo();
+  assert.equal(child.commands[1].type, 'get_tree');
+  child.respond(child.commands[1], { success: false, error: 'tree unavailable' });
+  await failing;
+  assert.deepEqual(child.signals, ['SIGTERM']);
+  assert.equal(mgr.sessions.size, 0);
+});
+
+test('startup deadline failure reaps the child before rejecting', async (t: TestContext) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const child = new FakePi({ autoRespond: false });
+  _setSpawnPiForTest(() => child.asChild());
+  t.after(() => _setSpawnPiForTest(null));
+  const mgr = new LiveSessionManager();
+  const failing = assert.rejects(mgr.create({ cwd: os.tmpdir() }), { childStopped: true });
+  t.mock.timers.tick(30000);
+  await failing;
+  assert.deepEqual(child.signals, ['SIGTERM']);
+  assert.equal(mgr.sessions.size, 0);
+});
+
+for (const command of ['prompt', 'steer', 'follow_up']) {
+  test(`extension-refresh: ${command} acknowledgement refreshes state exactly once`, async (t) => {
+    const child = new FakePi();
+    _setSpawnPiForTest(() => child.asChild());
+    t.after(() => _setSpawnPiForTest(null));
+    const manager = new LiveSessionManager();
+    const session = await manager.create({ cwd: os.tmpdir(), model: 'openai/gpt-4o:off' });
+    liveManager.sessions.set(session.id, session);
+    t.after(() => liveManager.sessions.delete(session.id));
+    const broadcasts: BroadcastMsg[] = [];
+    manager.broadcast = (message: BroadcastMsg) => broadcasts.push(message);
+    child.commands.length = 0;
+    child.state = { ...child.state, model: { provider: 'openai', id: 'gpt-4o-mini' }, thinkingLevel: 'high' };
+    const response = await handleRpcCommand({
+      type: command, message: '/session-model openai/gpt-4o-mini:high', sessionId: session.id,
     });
-    assert.equal(resp.success, true);
-    // Allow the fire-and-forget refresh to run.
-    await new Promise((r) => setImmediate(r));
-    await new Promise((r) => setImmediate(r));
-    assert.deepEqual(calls, ['prompt', 'get_state']);
+    await flushIo();
+    assert.equal(response.success, true);
+    assert.deepEqual(child.commands.map((item) => item.type), [command, 'get_state']);
     assert.deepEqual(session.model, { provider: 'openai', id: 'gpt-4o-mini' });
     assert.equal(session.thinkingLevel, 'high');
-    assert.ok(updatedIds.includes(session.id), 'expected a broadcastUpdated for the refreshed session');
-  } finally {
-    liveManager.sessions.delete(session.id);
-  }
-});
+    assert.ok(broadcasts.some((message) => message.type === 'live_session_updated'
+      && message.session?.thinkingLevel === 'high'));
+  });
+}
+
+for (const restored of [true, false]) {
+  test(`late input acknowledgement refreshes the file after ${restored ? 'rollback' : 'session replacement'} without an ownership gap`, async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const original = '/tmp/tau-switch-original.jsonl';
+    const temporary = '/tmp/tau-switch-temporary.jsonl';
+    const child = new FakePi({ sessionFile: original });
+    _setSpawnPiForTest(() => child.asChild());
+    t.after(() => _setSpawnPiForTest(null));
+    const manager = new LiveSessionManager();
+    const session = await manager.create({ cwd: os.tmpdir() });
+    liveManager.sessions.set(session.id, session);
+    t.after(() => liveManager.sessions.delete(session.id));
+    child.autoRespond = false;
+    child.commands.length = 0;
+    const pending = handleRpcCommand({ type: 'prompt', message: '/switch herdr', sessionId: session.id });
+    const prompt = child.commands[0];
+    t.mock.timers.tick(10000);
+    assert.equal((await pending).success, true, 'HTTP timeout is not command completion');
+    assert.equal(session.pending.has(prompt.id), false);
+    // An unrelated get_state observes the temporary replacement while the
+    // extension command is still running. The original remains associated.
+    session.handleResponse({ type: 'response', command: 'get_state', success: true, data: { sessionFile: temporary } });
+    assert.equal(session.sessionFile, temporary);
+    assert.equal(manager.findBySessionFile(original), session);
+    assert.equal((await manager.resume({ sessionFile: original, cwd: os.tmpdir() })).started, false);
+    child.state.sessionFile = restored ? original : temporary;
+    child.respond(prompt);
+    await flushIo();
+    assert.deepEqual(child.commands.map((item) => item.type), ['prompt', 'get_state']);
+    assert.equal(manager.findBySessionFile(original), session, 'keep ownership until the post-command refresh responds');
+    child.respond(child.commands[1]);
+    await flushIo();
+    assert.equal(session.sessionFile, child.state.sessionFile);
+    assert.equal(manager.findBySessionFile(original), restored ? session : undefined);
+    assert.equal(manager.findBySessionFile(child.state.sessionFile), session);
+    if (restored) assert.equal((await manager.resume({ sessionFile: original, cwd: os.tmpdir() })).started, false);
+  });
+}
+
+for (const failure of ['timeout', 'unsuccessful']) {
+  test(`an unconfirmed post-input state (${failure}) retains the original file until exit`, async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const original = '/tmp/tau-unconfirmed-original.jsonl';
+    const child = new FakePi({ sessionFile: original });
+    _setSpawnPiForTest(() => child.asChild());
+    t.after(() => _setSpawnPiForTest(null));
+    const manager = new LiveSessionManager();
+    const session = await manager.create({ cwd: os.tmpdir() });
+    child.autoRespond = false;
+    child.commands.length = 0;
+    const sent = session.send({ type: 'prompt', message: '/switch herdr' });
+    session.handleResponse({ type: 'response', command: 'get_state', success: true, data: { sessionFile: '/tmp/temporary.jsonl' } });
+    child.respond(child.commands[0]);
+    await sent;
+    if (failure === 'timeout') t.mock.timers.tick(5000);
+    else child.respond(child.commands[1], { success: false, data: undefined, error: 'state unavailable' });
+    await flushIo();
+    assert.equal(manager.findBySessionFile(original), session);
+    assert.equal((await manager.resume({ sessionFile: original, cwd: os.tmpdir() })).started, false);
+    child.exit();
+    assert.equal(manager.findBySessionFile(original), undefined);
+  });
+}

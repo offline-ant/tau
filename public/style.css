@@ -71,9 +71,9 @@ select:focus-visible {
   --accent-subtle: rgba(255, 255, 255, 0.04);
   --accent-text: #c0c0c0;
 
-  --user-bubble: rgba(255, 255, 255, 0.06);
+  --user-bubble: rgba(255, 255, 255, 0.12);
+  --assistant-bubble: rgba(255, 255, 255, 0.05);
   --user-bubble-text: var(--text-primary);
-  --user-bubble-border: linear-gradient(135deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.02));
 
   --tool-accent: #777;
   --tool-accent-text: #999;
@@ -117,9 +117,9 @@ select:focus-visible {
   --accent-subtle: rgba(106, 122, 136, 0.06);
   --accent-text: #8a9aa8;
 
-  --user-bubble: rgba(255, 255, 255, 0.08);
+  --user-bubble: rgba(255, 255, 255, 0.14);
+  --assistant-bubble: rgba(255, 255, 255, 0.06);
   --user-bubble-text: var(--text-primary);
-  --user-bubble-border: linear-gradient(135deg, rgba(255, 255, 255, 0.10), rgba(255, 255, 255, 0.02));
 
   --tool-accent: #4a5565;
   --tool-accent-text: #8a95a5;
@@ -163,9 +163,9 @@ select:focus-visible {
   --accent-subtle: rgba(122, 138, 176, 0.1);
   --accent-text: #a0b4d8;
 
-  --user-bubble: rgba(122, 138, 176, 0.1);
+  --user-bubble: rgba(122, 138, 176, 0.24);
+  --assistant-bubble: rgba(255, 255, 255, 0.06);
   --user-bubble-text: var(--text-primary);
-  --user-bubble-border: linear-gradient(135deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.02));
 
   --tool-accent: #6a5a80;
   --tool-accent-text: #a090b8;
@@ -213,6 +213,7 @@ select:focus-visible {
   --header-pill-text: rgba(0, 0, 0, 0.55);
 
   --user-bubble: #2a96d6;
+  --assistant-bubble: #eff1f4;
   --user-bubble-text: white;
 
   --tool-accent: #007aff;
@@ -261,6 +262,7 @@ select:focus-visible {
   --header-pill-text: rgba(0, 0, 0, 0.65);
 
   --user-bubble: #b06a48;
+  --assistant-bubble: #ffffff;
   --user-bubble-text: white;
 
   --tool-accent: #5c2860;
@@ -309,6 +311,7 @@ select:focus-visible {
   --header-pill-text: rgba(0, 0, 0, 0.65);
 
   --user-bubble: #6a7d5a;
+  --assistant-bubble: #ffffff;
   --user-bubble-text: white;
 
   --tool-accent: #4a3860;
@@ -1537,8 +1540,10 @@ body {
   to { opacity: 1; transform: translateY(0) scale(1); }
 }
 
-.message.user { align-self: flex-end; }
-.message.assistant { align-self: flex-start; }
+/* Room for the bubble tails inside the row: history rows use
+   content-visibility, whose paint containment clips outside the row box. */
+.message.user { align-self: flex-end; padding-right: 9px; }
+.message.assistant { align-self: flex-start; padding-left: 9px; }
 .message-header { display: none; }
 
 .message-usage {
@@ -1551,27 +1556,57 @@ body {
 }
 
 .message-content {
-  padding: 8px 16px;
-  border-radius: var(--radius-lg);
+  position: relative;
+  padding: 6px 14px;
+  border-radius: 18px;
   word-wrap: break-word;
   overflow-wrap: break-word;
   font-size: 14px;
   line-height: 1.75;
 }
 
-/* User bubble */
+/* Chat bubbles: user on the right, agent on the left, each with a tail at
+   its bottom outer corner. The tail is a bubble-coloured box whose concave
+   edge is masked out by an ellipse anchored at its top outer corner. */
 .message.user .message-content {
   background: var(--user-bubble);
   color: var(--user-bubble-text);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  border-bottom-right-radius: 6px;
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  box-shadow: var(--shadow-sm);
+  border-bottom-right-radius: 0;
   white-space: pre-wrap;
   font-weight: 500;
 }
+
+.message.assistant .message-content {
+  background: var(--assistant-bubble);
+  border-bottom-left-radius: 0;
+  color: var(--text-primary);
+}
+
+.message.user .message-content::before,
+.message.assistant .message-content::before {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  width: 9px;
+  height: 14px;
+}
+
+.message.user .message-content::before {
+  right: -9px;
+  background-color: var(--user-bubble);
+  -webkit-mask: radial-gradient(100% 100% at 100% 0, transparent 98%, #000 100%);
+  mask: radial-gradient(100% 100% at 100% 0, transparent 98%, #000 100%);
+}
+
+.message.assistant .message-content::before {
+  left: -9px;
+  background-color: var(--assistant-bubble);
+  -webkit-mask: radial-gradient(100% 100% at 0 0, transparent 98%, #000 100%);
+  mask: radial-gradient(100% 100% at 0 0, transparent 98%, #000 100%);
+}
+
+/* An agent message holding only thinking is empty while thinking is hidden. */
+body.hide-thinking .message.assistant:has(> .message-content > .thinking-block:only-child) { display: none; }
 
 /* User bubble markdown */
 .message.user .message-content blockquote {
@@ -1580,14 +1615,6 @@ body {
   margin: 4px 0;
   opacity: 0.75;
   font-style: italic;
-}
-
-/* Assistant — clean, no container */
-.message.assistant .message-content {
-  background: none;
-  border: none;
-  padding: 4px 0;
-  color: var(--text-primary);
 }
 
 /* Markdown */
@@ -2352,6 +2379,25 @@ body.hide-thinking .thinking-block { display: none !important; }
   color: var(--error);
   animation: pulse 1.5s infinite;
 }
+
+.input-mic-btn.transcribing {
+  color: var(--accent);
+  animation: pulse 0.8s infinite;
+}
+
+.input-mic-btn.unavailable { opacity: 0.4; }
+
+.voice-status {
+  margin: 0 0 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.voice-status.error { color: var(--error); }
+.voice-status.hidden { display: none; }
 
 #message-input:disabled { opacity: 0.35; cursor: not-allowed; }
 #message-input::placeholder { color: var(--text-dim); }
@@ -3317,7 +3363,7 @@ body.hide-thinking .thinking-block { display: none !important; }
     display: flex !important;
   }
 
-  .message.assistant { max-width: 100%; width: 100%; flex-wrap: wrap; }
+  .message.assistant { max-width: 100%; flex-wrap: wrap; }
   .message.assistant .message-usage { width: 100%; }
 
   .message-content {

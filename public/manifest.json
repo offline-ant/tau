@@ -3,7 +3,7 @@
   "short_name": "Pi Tau",
   "description": "Standalone web server for managing multiple Pi RPC sessions in the browser",
   "start_url": "/",
-  "display": "standalone",
+  "display": "fullscreen",
   "background_color": "#f5f3ef",
   "theme_color": "#f5f3ef",
   "orientation": "any",

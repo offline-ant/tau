@@ -141,6 +141,17 @@ machine. Pass `--bind 127.0.0.1` to restrict an instance to local access.
 - Copy any message with one click
 - Inline diff viewer for edit tool calls
 - Message queuing while the agent is working
+- **Voice dictation** — tap the microphone to record, tap again to stop. The
+  browser streams 16 kHz PCM to the authenticated `/ws/voice` socket; the final
+  transcript is inserted once at the cursor and never sent. Switching or closing
+  the tab cancels. Browsers require HTTPS (or localhost) for the microphone; put
+  Tau behind any TLS proxy, e.g.
+  `caddy reverse-proxy --from https://<ip>:3443 --to http://127.0.0.1:3001 --internal-certs --disable-redirects`.
+  The backend is read from `<PI_CODING_AGENT_DIR>/voice.json` at each recording:
+  `{"backend":"claude"}` (default; Claude Code's subscription speech endpoint,
+  using the pi-claude-agent default account's Claude login, never refreshed by
+  Tau) or `{"backend":"local","localUrl":"http://127.0.0.1:8090"}` (any
+  OpenAI-compatible `/v1/audio/transcriptions` server). English only; no fallback.
 
 ### Live Session Management
 
@@ -150,6 +161,15 @@ machine. Pass `--bind 127.0.0.1` to restrict an instance to local access.
 - Multiple browser clients see the same live session list
 - Historical sessions remain read-only
 - **Session tree and branching** — inspect the active session's full tree and jump to any earlier entry, mirroring Pi TUI's `/tree` behavior; choose a user message to restore it to the composer and create a new branch
+- **Live-tab links** — `/#session=<URL-encoded live-tab id>` selects an existing
+  live tab after connection, or when the URL fragment changes. Links contain no
+  credentials or session-file paths. They never resume historical files or submit
+  prompts; queued input stays paused until you select a tab normally or submit
+  input yourself. Missing/malformed links report an error without selecting a
+  fallback tab or waiting to select a future matching tab. Once handled, the
+  session fragment is removed, including invalid/missing targets; path, query and
+  unrelated fragments stay unchanged. Reconnect does not reapply an old link,
+  and reload restores your last selected tab normally.
 
 ### Model & Thinking
 
@@ -177,9 +197,12 @@ machine. Pass `--bind 127.0.0.1` to restrict an instance to local access.
 - Slimmed header, model picker stays accessible
 - Larger touch targets and font sizes optimized for mobile
 - Auto-reconnect WebSocket on return from background
-- PWA: installable as a standalone app on iOS, Android, and macOS
+- Fullscreen by default on touch devices: entered on the first tap (browsers require a gesture); turning it off in Settings is remembered. iPhone Safari has no page fullscreen, so Settings suggests adding Tau to the Home Screen instead
+- PWA: installable as a fullscreen app (standalone where fullscreen is unsupported, e.g. iOS)
 
 ### Themes
+
+Chat uses messenger-style bubbles: your messages on the right and agent replies on the left, each with a tail; tool cards stay full width.
 
 Six built-in themes: Dusk (clean neutral dark, default), Dawn (warm blue dark), Midnight (OLED black), Clean (Apple-style light with cyan-blue accents), Terracotta (warm light), Sage (warm olive-green). All with frosted glass header and input area.
 
@@ -238,9 +261,24 @@ Three pieces make that work:
   and `env` next to `cwd` and `model`, so a caller runs the child with its own
   session file, model flags, and environment. `args` is appended after tau's own
   arguments; `sessionFile` must live under Pi's session directory.
+  `POST /api/live-sessions/resume` accepts `filePath`, optional `cwd`/`model`,
+  and the same `args`/`env` overrides. Resume reuses an existing live tab or joins
+  an in-progress resume of that file; overrides apply only when a child is spawned.
+  A successful resume returns `started: true` only to the request that spawned
+  the child; reuse/join returns `started: false, reused: true`.
+  With optional `refresh: true`, an existing idle tab for that file reloads it
+  through Pi's native same-file `switch_session`, verifies state and active tree,
+  replaces its cached history, and returns `started: false, reused: true,
+  refreshed: true`. A streaming tab, queued prompts, or pending mutating commands
+  reject the refresh without cancelling anything or closing the tab. Arbitrary
+  `switch_session` remains unavailable through `/api/rpc`.
+  Resume restores the child's selected branch, not every abandoned branch in the file.
 - **Discovery.** While running, the server writes `~/.pi/agent/tau/server.json`
   (mode `0600`) containing its endpoint URL, with HTTP Basic credentials in the
-  URL userinfo when auth is configured. A Pi session started anywhere on the
+  URL userinfo when auth is configured, and credential-free `browserUrls` derived
+  from the actual listener address and local interfaces. A wildcard bind publishes
+  a loopback endpoint for local orchestration; `browserUrls` lists reachable
+  numeric addresses such as a WireGuard IP. A Pi session started anywhere on the
   machine can then select this server with `/orchestration-host web`. A second
   concurrent server does not overwrite the first one's record; target it with
   `PI_ORCHESTRATION_ENDPOINT`. Children tau spawns inherit
@@ -254,6 +292,30 @@ Three pieces make that work:
   /api/sessions/:project/:file?since=<byte offset>` serves those incremental
   reads. The registry is advisory — a crashed orchestrator leaves its record
   behind — so `{"force": true}` still resumes.
+
+Create/resume succeed only after Pi answers `get_state` successfully. For an
+existing file, Tau verifies that exact file and fetches its active tree path before
+publishing the tab. State/tree checks each have a 30-second deadline; they never
+submit a model prompt. Startup failures clean up the child before responding.
+`DELETE /api/live-sessions/:id` likewise waits for actual child exit, using SIGTERM
+and then SIGKILL if needed. Concurrent resumes wait for deletion to finish.
+
+Lifecycle failures return `{error, sessionId, childStopped}`. `childStopped: true`
+(HTTP 400) means the failed startup's child is confirmed stopped; `false` (HTTP 503)
+means exit is unconfirmed. An uncertain child remains tracked and blocks another
+resume until it exits or an explicit DELETE confirms cleanup.
+
+Resume validation failures (HTTP 400) also return `childStopped: true` when the
+request identifies a file, no spawn was attempted, and Tau knows of no existing,
+starting, pending-resume, closing, or terminal-registry owner for that path.
+Otherwise validation returns `childStopped: false`. Missing/invalid `filePath`
+types, malformed request bodies, unexpected errors, and ownership conflicts
+(HTTP 409) omit `childStopped`. An ownership
+conflict remains unsafe even if this request never spawned a child. A transport
+failure or ordinary error without `childStopped` is not evidence of child exit.
+These are per-request guarantees using Tau's known state and advisory registry,
+not a lock against independently launched Pi processes. Never use `force` as an
+automatic transfer mechanism.
 
 Tau has no terminal, so it hosts Pi sessions only: `panel-start` and other shell
 work stay on a terminal host.
@@ -313,6 +375,10 @@ npm test
 
 The test suite uses Node.js built-in `node --test` and covers session-file path validation, the `PiRpcSession` state machine, `LiveSessionManager`, the `/api/rpc` shim, HTTP + WebSocket server surface (including same-origin/CORS hardening and malformed-URL hardening), and WebSocket auth gating.
 
+Dictation: `node --test test/voice.test.ts test/voice-route.test.ts test/e2e/voice-input.e2e.ts`
+uses fake speech backends and Chromium's fake microphone. The live Claude check is
+opt-in because it uses subscription quota: `TAU_VOICE_LIVE=1 node --test test/voice-live.test.ts`.
+
 Each test file points `PI_CODING_AGENT_DIR` at an isolated temp tree so real Pi settings and sessions are never touched. The `LiveSessionManager` tests replace the real `spawn` with a test stub.
 
 ### Project structure
@@ -326,6 +392,7 @@ Each test file points `PI_CODING_AGENT_DIR` at an isolated temp tree so real Pi 
 │   │   ├── sessions.ts      # PiRpcSession + LiveSessionManager
 │   │   ├── model-utils.ts   # Model parsing and formatting
 │   │   ├── config.ts        # Settings, paths, CLI args
+│   │   ├── voice*.ts        # Dictation socket, configuration, speech backends
 │   │   └── types.ts         # Shared type definitions
 │   └── public/     # Browser TypeScript source
 │       ├── app.ts, app-main.ts, state.ts, themes.ts, ...

@@ -22,9 +22,10 @@ import type { JsonRecord, RpcCommand, RpcResponse, StatusError } from './types.j
 import { ARGS, AUTH_CONFIGURED, HOST, MIME_TYPES, PI_AGENT_DIR, PORT, SESSIONS_DIR, STATIC_DIR, TAU_SETTINGS, expandHome, loadTauSettings, parseArgs, saveTauSetting } from './config.js';
 import { SESSION_COOKIE_NAME, SESSION_REFRESH_THRESHOLD_SECONDS, buildSessionCookie, issueSessionToken, parseCookies, verifySessionToken } from './auth.js';
 import { getAvailableModels, modelLabel, normalizeModel, parseModelSpecToModel, parsePiListModels, _clearModelListCacheForTest, _setExecFileForTest } from './model-utils.js';
-import { LiveSessionManager, PiRpcSession, isGenericSessionName, liveManager, makeId, _setSpawnPiForTest } from './sessions.js';
+import { LiveSessionManager, PiRpcSession, SessionLifecycleError, isGenericSessionName, liveManager, makeId, _setSpawnPiForTest } from './sessions.js';
 import { buildEndpoint, orchestrationEndpoint, publishEndpoint, unpublishEndpoint } from './orchestration.js';
 import { sessionOwner, sessionOwners } from './session-owners.js';
+import { MAX_FRAME_BYTES, VOICE_PATH, configuredTranscriber, handleVoiceSocket } from './voice.js';
 import { NAVIGATE_COMMAND, NAVIGATION_MARKER_TYPE, flattenTree, isTreeNavigationInProgress, leafDescendsFrom, navigateTree, pathFromRoot, selectNavigationTarget } from './tree.js';
 
 type TauWs = WsType & { isAlive?: boolean };
@@ -108,6 +109,15 @@ function json(res: ServerResponse, status: number, data: unknown, extraHeaders: 
   res.end(JSON.stringify(data));
 }
 
+function sendLifecycleError(res: ServerResponse, error: unknown) {
+  if (error instanceof SessionLifecycleError) {
+    return json(res, error.childStopped ? 400 : 503, {
+      error: error.message, sessionId: error.sessionId, childStopped: error.childStopped,
+    });
+  }
+  return json(res, 400, { error: errorMessage(error) });
+}
+
 function readBody(req: IncomingMessage): Promise<RpcCommand> {
   return new Promise((resolve, reject) => {
     let body = '';
@@ -137,7 +147,7 @@ function resolveSessionFile(filePath: string) {
 }
 
 /**
- * Validates the programmatic spawn fields of POST /api/live-sessions.
+ * Validates programmatic spawn fields for live-session create and resume.
  *
  * These let an orchestration client (pi-ant) run the child with its own
  * extensions, model flags, and environment. They do not widen the server's
@@ -218,20 +228,6 @@ function openUrl(url: string): Promise<void> {
   });
 }
 
-// Fire-and-forget: refresh session.model/thinkingLevel from pi's get_state.
-// Used after prompt/steer/follow_up acks so extension-driven model/thinking
-// changes (e.g. pi-session-model's /session-model) propagate to tau and all
-// clients. Silently skips on failure — the next user input or snapshot resyncs.
-async function refreshSessionModel(session: PiRpcSession | null | undefined) {
-  if (!session || session.terminating) return;
-  const resp = await session.send({ type: 'get_state' }, { timeoutMs: 5000 });
-  const data = (resp && (resp.data || resp.result || resp)) as RpcCommand;
-  if (!data) return;
-  if (data.model !== undefined) session.model = normalizeModel(data.model);
-  if (data.thinkingLevel) session.thinkingLevel = String(data.thinkingLevel);
-  liveManager.broadcastUpdated(session.id);
-}
-
 async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
   const id = command.id;
   const cmd = command.type;
@@ -248,7 +244,7 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
     liveManager.broadcast({ type: 'event', event: { type: 'auth_changed', enabled: authEnabled } });
     if (!wasEnabled && authEnabled) {
       const timer = setTimeout(() => {
-        for (const client of Array.from(liveManager.clients)) {
+        for (const client of [...liveManager.clients, ...voiceWss.clients]) {
           try { client.close(4001, 'Authentication enabled'); } catch {}
         }
       }, 25);
@@ -264,11 +260,15 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
     let resolvedFile = null;
     const targetFile = command.filePath || session?.sessionFile;
     if (targetFile) {
-      try { resolvedFile = appendSessionName(targetFile, name); } catch (e) { return error(errorMessage(e)); }
+      try { resolvedFile = resolveSessionFile(targetFile); } catch (e) { return error(errorMessage(e)); }
     }
     const matchingLive = resolvedFile
       ? Array.from(liveManager.sessions.values()).find((s) => s.sessionFile && path.resolve(s.sessionFile) === resolvedFile)
       : null;
+    if (session?.refreshing || matchingLive?.refreshing) return error('Session refresh is in progress; wait a moment and send again');
+    if (resolvedFile) {
+      try { appendSessionName(resolvedFile, name); } catch (e) { return error(errorMessage(e)); }
+    }
     if (session) updateLiveSessionName(session, name);
     else if (matchingLive) updateLiveSessionName(matchingLive, name);
     else if (!resolvedFile) return error('sessionId or filePath required');
@@ -351,15 +351,6 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
     const resp = await session.send(command, { timeoutMs: cmd === 'prompt' ? 10000 : 60000 });
     if (isSetThinkingLevel && resp.success === false && prevThinkingLevel !== null) {
       session.thinkingLevel = prevThinkingLevel;
-    }
-    // Extension-driven model/thinking changes (e.g. the pi-session-model
-    // `/session-model` slash command) call pi.setModel/pi.setThinkingLevel
-    // inside a prompt/steer/follow_up. Those acks carry no model data and emit
-    // no runtime stream event, so tau would stay stale. Fire-and-forget a
-    // get_state refresh so tau and all clients learn the new model/level. Do
-    // NOT block this HTTP response — return the original ack first.
-    if (resp.success !== false && (cmd === 'prompt' || cmd === 'steer' || cmd === 'follow_up')) {
-      refreshSessionModel(session).catch(() => {});
     }
     return { ...resp, success: resp.success !== false };
   } catch (e) {
@@ -444,17 +435,35 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
       try {
         const session = await liveManager.create({ cwd: body.cwd, model: body.model || '', ...overrides });
         json(res, 200, { session: session.metadata() });
-      } catch (e) { json(res, 400, { error: errorMessage(e) }); }
+      } catch (e) { sendLifecycleError(res, e); }
     }).catch((e) => json(res, 400, { error: errorMessage(e) }));
     return;
   }
   if (cleanPath === '/api/live-sessions/resume' && req.method === 'POST') {
     readBody(req).then(async (body) => {
       if (!body.filePath || typeof body.filePath !== 'string') return json(res, 400, { error: 'filePath required' });
+      const requestedFile = path.resolve(body.filePath);
+      // Only these synchronous validation failures prove this request never
+      // spawned. An existing, starting, or closing destination (or a terminal
+      // owner) still makes source rollback unsafe, even with invalid input.
+      const rejectBeforeSpawn = (message: string) => json(res, 400, {
+        error: message,
+        childStopped: !liveManager.findBySessionFile(requestedFile)
+          && !liveManager.hasStartingSession(requestedFile)
+          && !liveManager.hasPendingResume(requestedFile)
+          && !liveManager.hasTerminatingResume(requestedFile)
+          && !sessionOwner(requestedFile),
+      });
       let resolvedFile: string;
-      try { resolvedFile = resolveSessionFile(body.filePath); } catch (e) { return json(res, 400, { error: errorMessage(e) }); }
+      let overrides: { args?: string[]; env?: Record<string, string> };
+      try {
+        resolvedFile = resolveSessionFile(body.filePath);
+        overrides = parseSpawnOverrides({ args: body.args, env: body.env });
+        if (body.model !== undefined && typeof body.model !== 'string') throw new Error('model must be a string');
+        if (body.refresh !== undefined && typeof body.refresh !== 'boolean') throw new Error('refresh must be a boolean');
+      } catch (e) { return rejectBeforeSpawn(errorMessage(e)); }
       const existing = liveManager.findBySessionFile(resolvedFile);
-      if (existing) return json(res, 200, { session: existing.metadata(), reused: true });
+      if (existing && body.refresh !== true && !existing.terminating && !liveManager.hasTerminatingResume(resolvedFile) && !liveManager.hasPendingResume(resolvedFile)) return json(res, 200, { session: existing.metadata(), reused: true, started: false });
       // Another Pi process is appending to this file. Resuming would make this
       // server a second writer on the same conversation.
       const owner = sessionOwner(resolvedFile);
@@ -466,16 +475,17 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
       }
       let cwd: string | null = normalizeSessionCwd(body.cwd);
       if (!cwd) cwd = readSessionHeaderCwd(resolvedFile);
-      if (!cwd || !fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
-        return json(res, 400, { error: 'Cannot resume session because its project directory no longer exists' });
-      }
+      try {
+        if (!cwd || !fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
+          return rejectBeforeSpawn('Cannot resume session because its project directory no longer exists');
+        }
+      } catch (e) { return rejectBeforeSpawn(errorMessage(e)); }
       const entries = readSessionEntries(resolvedFile) as JsonRecord[];
       const sessionName = deriveSessionNameFromEntries(entries);
-      const reusedPending = liveManager.hasPendingResume(resolvedFile);
       try {
-        const session = await liveManager.resume({ sessionFile: resolvedFile, cwd, model: body.model || '', entries, sessionName });
-        json(res, 200, { session: session.metadata(), ...(reusedPending ? { reused: true } : {}) });
-      } catch (e) { json(res, 400, { error: errorMessage(e) }); }
+        const { session, started, refreshed } = await liveManager.resume({ sessionFile: resolvedFile, cwd, model: body.model || '', entries, sessionName, refresh: body.refresh === true, ...overrides });
+        json(res, 200, { session: session.metadata(), started, ...(!started ? { reused: true } : {}), ...(refreshed ? { refreshed: true } : {}) });
+      } catch (e) { sendLifecycleError(res, e); }
     }).catch((e) => json(res, 400, { error: errorMessage(e) }));
     return;
   }
@@ -491,7 +501,13 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
     if (!session) return json(res, 404, { error: 'Live session not found' });
     const isSnapshotRoute = cleanPath.endsWith('/snapshot');
     if (isSnapshotRoute && req.method === 'GET') return json(res, 200, session.snapshot());
-    if (!isSnapshotRoute && req.method === 'DELETE') { liveManager.delete(id, 'closed_by_user').then(() => json(res, 200, { success: true })); return; }
+    if (!isSnapshotRoute && req.method === 'DELETE') {
+      liveManager.delete(id, 'closed_by_user').then(
+        () => json(res, 200, { success: true }),
+        (error) => sendLifecycleError(res, error),
+      );
+      return;
+    }
   }
 
   if (cleanPath === '/api/projects' && req.method === 'GET') return serveProjectsList(res);
@@ -917,6 +933,7 @@ function computeUrls(port: number) {
 
 const server = http.createServer(serveStaticFile);
 const wss = new WebSocketServer({ noServer: true });
+const voiceWss = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_BYTES });
 
 server.on('upgrade', (request: IncomingMessage, socket: Socket, head: Buffer) => {
   if (!isAllowedApiOrigin(request)) {
@@ -930,6 +947,7 @@ server.on('upgrade', (request: IncomingMessage, socket: Socket, head: Buffer) =>
     return;
   }
   if (request.url === '/ws') wss.handleUpgrade(request, socket, head, (ws: TauWs) => wss.emit('connection', ws, request));
+  else if (request.url === VOICE_PATH) voiceWss.handleUpgrade(request, socket, head, (ws) => handleVoiceSocket(ws, configuredTranscriber(PI_AGENT_DIR)));
   else socket.destroy();
 });
 
@@ -973,7 +991,9 @@ function listen(port: number, attemptsLeft = 10) {
   });
   server.listen(port, HOST, () => {
     computeUrls(port);
-    publishEndpoint(port);
+    const actual = server.address();
+    if (actual && typeof actual === 'object') publishEndpoint(actual.port, actual.address);
+    else publishEndpoint(port);
     console.log(`[Tau] Server running on ${lanUrl}${tailscaleUrl ? `  •  Tailscale: ${tailscaleUrl}` : ''}`);
     console.log(`[Tau] Static assets: ${STATIC_DIR}`);
     if (ARGS.open) openUrl(lanUrl).catch(() => {});
@@ -986,10 +1006,16 @@ async function shutdown(signal: string) {
   shuttingDown = true;
   console.log(`\n[Tau] Shutting down (${signal}); terminating ${liveManager.sessions.size} Pi session(s)...`);
   try { wss.close(); } catch {}
+  try { voiceWss.close(); } catch {}
   unpublishEndpoint();
-  await liveManager.shutdown();
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 2500).unref();
+  let exitCode = 0;
+  try { await liveManager.shutdown(); }
+  catch (error) {
+    exitCode = 1;
+    console.error(`[Tau] Child cleanup failed: ${errorMessage(error)}`);
+  }
+  server.close(() => process.exit(exitCode));
+  setTimeout(() => process.exit(exitCode), 2500).unref();
 }
 function startCli() {
   process.on('SIGINT', () => shutdown('SIGINT'));
@@ -1027,6 +1053,7 @@ export {
   getAvailableModels,
   makeId,
   PiRpcSession,
+  SessionLifecycleError,
   LiveSessionManager,
   liveManager,
   resolveSessionFile,

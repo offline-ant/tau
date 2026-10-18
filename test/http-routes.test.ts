@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { EventEmitter } from 'node:events';
-import { PassThrough } from 'node:stream';
+import { FakePi } from './fake-pi.ts';
+import type { SessionTreeNodeLike, TreeEntry } from '../src/server/tree.ts';
 
 // Loopback host so computeUrls() sets a localhost lanUrl; isolate settings.
 process.env.TAU_HOST = '127.0.0.1';
@@ -23,7 +23,7 @@ process.env.TAU_PASS = '';
 
 // Load the server after the env is in place: the module reads it at load
 // time, and ESM hoists static imports ahead of this body.
-const { server, computeUrls, liveManager, SESSIONS_DIR, _setSpawnPiForTest } = (await import('../bin/tau.js')) as any;
+const { server, computeUrls, liveManager, SESSIONS_DIR, _setSpawnPiForTest, SessionLifecycleError, PiRpcSession } = (await import('../bin/tau.js')) as any;
 import type { TestContext } from 'node:test';
 
 let base = '';
@@ -74,15 +74,20 @@ function fakeSession(id: string): FakeHttpSession {
   };
 }
 
-// A realistic fake `pi` child: real streams so start()'s setEncoding/on('data')
-// wiring works, and an EventEmitter so on('error')/on('exit') resolve startup.
-function makeFakeChild() {
-  const child: any = new EventEmitter();
-  child.stdin = new PassThrough();
-  child.stdout = new PassThrough();
-  child.stderr = new PassThrough();
-  child.pid = 12345;
-  child.kill = (sig: string) => { child.killedSignal = sig; };
+function installFakeChild(t: TestContext, child = new FakePi()) {
+  _setSpawnPiForTest((_cmd: string, args: string[]) => {
+    const index = args.indexOf('--session');
+    if (index !== -1) {
+      const file = args[index + 1];
+      child.state.sessionFile = file;
+      const entries = fs.readFileSync(file, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as TreeEntry)
+        .filter((entry) => entry.type !== 'session' && typeof entry.id === 'string');
+      child.tree = entries.map((entry): SessionTreeNodeLike => ({ entry }));
+      child.leafId = entries.at(-1)?.id ?? null;
+    }
+    return child.asChild();
+  });
+  t.after(() => _setSpawnPiForTest(null));
   return child;
 }
 
@@ -391,11 +396,16 @@ test('a session owned by an orchestration worker is listed as owned and is not r
   const refusedBody = await jsonBody(refused);
   assert.deepEqual(refusedBody.owner, { name: 'delegate-7', host: 'tmux' });
   assert.match(refusedBody.error, /running as delegate-7 on tmux/);
+  assert.equal(refusedBody.childStopped, undefined, 'an ownership conflict never authorizes source rollback');
   assert.equal(liveManager.findBySessionFile(sessionFile), undefined);
+  const invalid = await fetch(`${base}/api/live-sessions/resume`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filePath: sessionFile, args: [42], force: true }),
+  });
+  assert.equal(invalid.status, 400);
+  assert.equal((await jsonBody(invalid)).childStopped, false, 'invalid input and force do not erase a terminal owner');
 
-  const child = makeFakeChild();
-  _setSpawnPiForTest(() => child);
-  t.after(() => _setSpawnPiForTest(null));
+  const child = installFakeChild(t);
   const forced = await fetch(`${base}/api/live-sessions/resume`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Origin: base, Host: new URL(base).host },
@@ -599,9 +609,7 @@ test('POST /api/rpc with a malformed JSON body returns 400', async () => {
 });
 
 test('POST /api/live-sessions creates a live session and returns 200', async (t: TestContext) => {
-  const child = makeFakeChild();
-  _setSpawnPiForTest(() => child);
-  t.after(() => _setSpawnPiForTest(null));
+  const child = installFakeChild(t);
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-post-create-'));
   const res = await fetch(`${base}/api/live-sessions`, {
     method: 'POST',
@@ -613,8 +621,7 @@ test('POST /api/live-sessions creates a live session and returns 200', async (t:
   assert.equal(body.session.id.startsWith('tau_'), true);
   assert.equal(body.session.cwd, path.resolve(cwd));
   assert.equal(body.session.modelSpec, 'openai/gpt-5.5');
-  // end the fake stdin so start()'s 250ms get_state/get_session_stats probes
-  // reject immediately instead of scheduling long pending timers.
+  // No more RPC commands are expected after this request.
   child.stdin.end();
 });
 
@@ -635,7 +642,9 @@ test('POST /api/live-sessions/resume rejects a filePath outside SESSIONS_DIR wit
     body: JSON.stringify({ filePath: '/etc/hosts' }),
   });
   assert.equal(res.status, 400);
-  assert.match((await jsonBody(res)).error, /Invalid session file/);
+  const body = await jsonBody(res);
+  assert.match(body.error, /Invalid session file/);
+  assert.equal(body.childStopped, true);
 });
 
 test('POST /api/live-sessions/resume creates a live session with matching sessionFile', async (t: TestContext) => {
@@ -648,9 +657,7 @@ test('POST /api/live-sessions/resume creates a live session with matching sessio
   ]);
   const sessionFile = path.join(PROJ_DIR, 'resume.jsonl');
 
-  const child = makeFakeChild();
-  _setSpawnPiForTest(() => child);
-  t.after(() => _setSpawnPiForTest(null));
+  const child = installFakeChild(t);
 
   const res = await fetch(`${base}/api/live-sessions/resume`, {
     method: 'POST',
@@ -663,6 +670,7 @@ test('POST /api/live-sessions/resume creates a live session with matching sessio
   assert.equal(body.session.sessionFile, path.resolve(sessionFile));
   assert.equal(body.session.sessionName, 'Named Chat');
   assert.equal(body.reused, undefined);
+  assert.equal(body.started, true);
   // Verify the session was added to liveManager.
   assert.equal(liveManager.get(body.session.id)?.sessionFile, path.resolve(sessionFile));
   child.stdin.end();
@@ -672,16 +680,14 @@ test('POST /api/live-sessions/resume exposes historical entries through the live
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-resume-snapshot-'));
   const entries = [
     { type: 'session', id: 'resume-snapshot-sess', timestamp: '2026-01-01T00:00:00.000Z', cwd },
-    { type: 'message', message: { role: 'user', content: 'resume this historical thread' } },
-    { type: 'message', message: { role: 'assistant', content: [{ type: 'text', text: 'historical reply' }] } },
-    { type: 'session_info', name: 'Snapshot Chat' },
+    { id: 'user', parentId: null, type: 'message', message: { role: 'user', content: 'resume this historical thread' } },
+    { id: 'answer', parentId: 'user', type: 'message', message: { role: 'assistant', content: [{ type: 'text', text: 'historical reply' }] } },
+    { id: 'name', parentId: 'answer', type: 'session_info', name: 'Snapshot Chat' },
   ];
   writeSessionFileAt(PROJ_DIR, 'resume-snapshot.jsonl', entries);
   const sessionFile = path.join(PROJ_DIR, 'resume-snapshot.jsonl');
 
-  const child = makeFakeChild();
-  _setSpawnPiForTest(() => child);
-  t.after(() => _setSpawnPiForTest(null));
+  const child = installFakeChild(t);
 
   const resumeRes = await fetch(`${base}/api/live-sessions/resume`, {
     method: 'POST',
@@ -710,9 +716,7 @@ test('POST /api/live-sessions/resume falls back to the first user message for ge
   ]);
   const sessionFile = path.join(PROJ_DIR, 'resume-title.jsonl');
 
-  const child = makeFakeChild();
-  _setSpawnPiForTest(() => child);
-  t.after(() => _setSpawnPiForTest(null));
+  const child = installFakeChild(t);
 
   const res = await fetch(`${base}/api/live-sessions/resume`, {
     method: 'POST',
@@ -732,9 +736,7 @@ test('POST /api/live-sessions/resume returns reused:true when a live session alr
   ]);
   const sessionFile = path.join(PROJ_DIR, 'reuse.jsonl');
 
-  const child = makeFakeChild();
-  _setSpawnPiForTest(() => child);
-  t.after(() => _setSpawnPiForTest(null));
+  const child = installFakeChild(t);
 
   // First resume creates the session.
   const res1 = await fetch(`${base}/api/live-sessions/resume`, {
@@ -755,6 +757,8 @@ test('POST /api/live-sessions/resume returns reused:true when a live session alr
   assert.equal(res2.status, 200);
   const body2 = await jsonBody(res2);
   assert.equal(body2.reused, true);
+  assert.equal(body1.started, true);
+  assert.equal(body2.started, false);
   assert.equal(body2.session.id, body1.session.id);
   // Only one session in the manager.
   assert.equal(liveManager.sessions.size, 1);
@@ -773,11 +777,13 @@ test('POST /api/live-sessions/resume rejects when the session header cwd no long
     body: JSON.stringify({ filePath: sessionFile }),
   });
   assert.equal(res.status, 400);
-  assert.match((await jsonBody(res)).error, /Cannot resume session because its project directory no longer exists/);
+  const body = await jsonBody(res);
+  assert.match(body.error, /Cannot resume session because its project directory no longer exists/);
+  assert.equal(body.childStopped, true);
 });
 
 test('POST /api/live-sessions returns 400 when the cwd does not exist', async (t: TestContext) => {
-  _setSpawnPiForTest(() => makeFakeChild());
+  _setSpawnPiForTest(() => new FakePi().asChild());
   t.after(() => _setSpawnPiForTest(null));
   const res = await fetch(`${base}/api/live-sessions`, {
     method: 'POST',
@@ -786,6 +792,127 @@ test('POST /api/live-sessions returns 400 when the cwd does not exist', async (t
   });
   assert.equal(res.status, 400);
   assert.match((await jsonBody(res)).error, /Directory not found/);
+});
+
+test('resume forwards validated args/env and rejects malformed overrides before spawn', async (t: TestContext) => {
+  const file = writeSessionFileAt(PROJ_DIR, 'overrides.jsonl', [{ type: 'session', id: 'overrides', cwd: PROJECTS_DIR }]);
+  const calls: Array<{ args: string[]; env: Record<string, string> }> = [];
+  _setSpawnPiForTest((_cmd: string, args: string[], opts: { env: Record<string, string> }) => {
+    calls.push({ args, env: opts.env });
+    return new FakePi({ sessionFile: file }).asChild();
+  });
+  t.after(() => _setSpawnPiForTest(null));
+  const request = (body: Record<string, unknown>) => fetch(`${base}/api/live-sessions/resume`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filePath: file, ...body }),
+  });
+  for (const invalid of [{ args: '--model' }, { args: [42] }, { env: { KEY: 2 } }, { env: { 'BAD KEY': 'value' } }, { model: 42 }, { refresh: 'true' }, { refresh: null }]) {
+    const response = await request(invalid);
+    assert.equal(response.status, 400);
+    assert.equal((await jsonBody(response)).childStopped, true);
+  }
+  assert.equal(calls.length, 0);
+  const args = ['--provider', 'example', '--model', 'model', '--thinking', 'high'];
+  const env = { PI_CODING_AGENT_DIR: '/tmp/original-agent', HERDR_SOCKET_PATH: '/tmp/original-herdr.sock' };
+  const response = await request({ args, env });
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].args.slice(-args.length), args);
+  for (const [key, value] of Object.entries(env)) assert.equal(calls[0].env[key], value);
+  await liveManager.delete((await jsonBody(response)).session.id);
+});
+
+test('resume validation never authorizes rollback for an existing, pending, or closing writer', async (t: TestContext) => {
+  const file = writeSessionFileAt(PROJ_DIR, 'validation-writer.jsonl', [{ type: 'session', id: 'writer', cwd: PROJECTS_DIR }]);
+  const session = new PiRpcSession(liveManager, { id: 'writer', cwd: PROJECTS_DIR, sessionFile: file });
+  t.after(() => {
+    liveManager.sessions.delete(session.id);
+    liveManager.pendingResumes.delete(file);
+    liveManager.terminatingResumes.delete(file);
+  });
+  for (const state of ['existing', 'pending', 'terminating']) {
+    if (state === 'existing') liveManager.sessions.set(session.id, session);
+    if (state === 'pending') liveManager.pendingResumes.set(file, Promise.resolve(session));
+    if (state === 'terminating') liveManager.terminatingResumes.set(file, Promise.resolve());
+    const response = await fetch(`${base}/api/live-sessions/resume`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filePath: file, args: [42] }),
+    });
+    assert.equal(response.status, 400);
+    assert.equal((await jsonBody(response)).childStopped, false, state);
+    liveManager.sessions.delete(session.id);
+    liveManager.pendingResumes.delete(file);
+    liveManager.terminatingResumes.delete(file);
+  }
+});
+
+test('resume validation accounts for an in-progress create on the same file', async (t: TestContext) => {
+  const file = writeSessionFileAt(PROJ_DIR, 'creating-writer.jsonl', [{ type: 'session', id: 'creating', cwd: PROJECTS_DIR }]);
+  const child = installFakeChild(t, new FakePi({ autoRespond: false }));
+  const creating = liveManager.create({ cwd: PROJECTS_DIR, sessionFile: file });
+  try {
+    assert.equal(liveManager.hasStartingSession(file), true);
+    assert.equal(liveManager.findBySessionFile(file), undefined);
+    assert.equal(liveManager.hasPendingResume(file), false);
+    const response = await fetch(`${base}/api/live-sessions/resume`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filePath: file, env: [] }),
+    });
+    assert.equal(response.status, 400);
+    assert.equal((await jsonBody(response)).childStopped, false);
+  } finally {
+    child.autoRespond = true;
+    child.respond(child.commands[0]);
+    const session = await creating;
+    assert.equal(liveManager.hasStartingSession(file), false);
+    await liveManager.delete(session.id);
+  }
+});
+
+test('unidentified and unexpected resume errors do not authorize rollback', async (t: TestContext) => {
+  for (const body of ['{bad-json', '{}', '{"filePath":42}']) {
+    const response = await fetch(`${base}/api/live-sessions/resume`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+    });
+    assert.equal(response.status, 400);
+    assert.equal((await jsonBody(response)).childStopped, undefined);
+  }
+  const file = writeSessionFileAt(PROJ_DIR, 'unexpected.jsonl', [{ type: 'session', id: 'unexpected', cwd: PROJECTS_DIR }]);
+  t.mock.method(liveManager, 'findBySessionFile', () => { throw new Error('unexpected lookup failure'); });
+  const response = await fetch(`${base}/api/live-sessions/resume`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filePath: file }),
+  });
+  assert.equal(response.status, 400);
+  const body = await jsonBody(response);
+  assert.equal(body.error, 'unexpected lookup failure');
+  assert.equal(body.childStopped, undefined);
+});
+
+test('failed startup reports childStopped only after cleanup and does not keep a dead tab', async (t: TestContext) => {
+  const file = writeSessionFileAt(PROJ_DIR, 'failed-start.jsonl', [{ type: 'session', id: 'failed', cwd: PROJECTS_DIR }]);
+  const child = installFakeChild(t);
+  t.mock.method(child, 'respond', (command: { id?: string; type?: string }) => {
+    child.stdout.write(JSON.stringify({ type: 'response', id: command.id, command: command.type, success: false, error: 'cannot load state' }) + '\n');
+  });
+  const response = await fetch(`${base}/api/live-sessions/resume`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filePath: file }),
+  });
+  const body = await jsonBody(response);
+  assert.equal(response.status, 400);
+  assert.equal(body.childStopped, true);
+  assert.equal(typeof body.sessionId, 'string');
+  assert.match(body.error, /cannot load state/);
+  assert.deepEqual(child.signals, ['SIGTERM']);
+  assert.equal(liveManager.findBySessionFile(file), undefined);
+});
+
+test('DELETE cleanup uncertainty is an explicit error and keeps the child tracked', async () => {
+  const session = fakeSession('uncertain');
+  session.terminate = async () => { throw new SessionLifecycleError('exit not confirmed', session.id, false); };
+  liveManager.sessions.set(session.id, session);
+  const response = await fetch(`${base}/api/live-sessions/${session.id}`, { method: 'DELETE' });
+  assert.equal(response.status, 503);
+  assert.deepEqual(await jsonBody(response), { error: 'exit not confirmed', sessionId: session.id, childStopped: false });
+  assert.equal(liveManager.get(session.id), session);
 });
 
 test('GET /api/files filters dotfiles and ignored directories from the listing', async () => {
@@ -803,4 +930,75 @@ test('GET /api/files filters dotfiles and ignored directories from the listing',
   assert.ok(names.includes('a.txt'));
   assert.ok(!names.includes('node_modules'));
   assert.ok(!names.includes('.hidden'));
+});
+
+test('resume refresh keeps the tab and reloads its confirmed active history; ordinary reuse does not reload', async (t: TestContext) => {
+  const file = writeSessionFileAt(PROJ_DIR, 'refresh.jsonl', [{ type: 'session', id: 'refresh', cwd: PROJECTS_DIR }]);
+  const child = installFakeChild(t, new FakePi({ state: { isStreaming: false, isCompacting: false, pendingMessageCount: 0 } }));
+  const respond = child.respond.bind(child);
+  t.mock.method(child, 'respond', (command: { type?: string; id?: string }) => {
+    respond(command, command.type === 'switch_session' ? { data: { cancelled: false } } : {});
+  });
+  const request = (refresh?: boolean) => fetch(`${base}/api/live-sessions/resume`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filePath: file, refresh }),
+  });
+  const created = await jsonBody(await request(true));
+  assert.equal(created.started, true);
+  assert.equal(created.refreshed, undefined);
+  assert.equal(child.commands.some((command) => command.type === 'switch_session'), false);
+  const entry = { id: 'new-entry', parentId: null, type: 'message', message: { role: 'user', content: 'latest from terminal' } };
+  child.tree = [{ entry }];
+  child.leafId = entry.id;
+  const reused = await jsonBody(await request());
+  assert.equal(reused.started, false);
+  assert.equal(reused.refreshed, undefined);
+  assert.equal(child.commands.some((command) => command.type === 'switch_session'), false);
+  const refreshed = await jsonBody(await request(true));
+  assert.equal(refreshed.session.id, created.session.id);
+  assert.equal(refreshed.started, false);
+  assert.equal(refreshed.reused, true);
+  assert.equal(refreshed.refreshed, true);
+  const snapshot = await jsonBody(await fetch(`${base}/api/live-sessions/${created.session.id}/snapshot`));
+  assert.equal(snapshot.entries.at(-1).id, entry.id);
+  assert.equal(liveManager.sessions.size, 1);
+  const arbitrary = await jsonBody(await fetch(`${base}/api/rpc`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 'switch_session', sessionId: created.session.id, sessionPath: file }),
+  }));
+  assert.equal(arbitrary.success, false);
+  assert.match(arbitrary.error, /Unknown command/);
+  child.state.pendingMessageCount = 1;
+  const busy = await request(true);
+  assert.equal(busy.status, 400);
+  const rejected = await jsonBody(busy);
+  assert.match(rejected.error, /queued prompts/);
+  assert.equal(rejected.refreshed, undefined);
+  assert.equal(rejected.childStopped, undefined);
+  assert.equal(liveManager.sessions.size, 1);
+  assert.deepEqual(child.signals, []);
+  await liveManager.delete(created.session.id);
+});
+
+test('refresh never bypasses a terminal owner and succeeds after source teardown removes ownership', async (t: TestContext) => {
+  const file = writeSessionFileAt(PROJ_DIR, 'refresh-owner.jsonl', [{ type: 'session', id: 'owner-refresh', cwd: PROJECTS_DIR }]);
+  const child = installFakeChild(t, new FakePi({ state: { isStreaming: false, isCompacting: false, pendingMessageCount: 0 } }));
+  const respond = child.respond.bind(child);
+  t.mock.method(child, 'respond', (command: { type?: string; id?: string }) => respond(command, command.type === 'switch_session' ? { data: { cancelled: false } } : {}));
+  const request = () => fetch(`${base}/api/live-sessions/resume`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filePath: file, refresh: true }),
+  });
+  const created = await jsonBody(await request());
+  const registry = path.join(os.tmpdir(), 'pi-orchestration-targets');
+  fs.mkdirSync(registry, { recursive: true });
+  const ownerFile = path.join(registry, 'refresh-source.json');
+  fs.writeFileSync(ownerFile, JSON.stringify({ target: { host: 'herdr', name: 'source', id: 'p1', kind: 'pi', sessionFile: file } }));
+  t.after(() => fs.rmSync(ownerFile, { force: true }));
+  const denied = await request();
+  assert.equal(denied.status, 409);
+  assert.equal(child.commands.some((command) => command.type === 'switch_session'), false);
+  fs.rmSync(ownerFile);
+  const refreshed = await jsonBody(await request());
+  assert.equal(refreshed.refreshed, true);
+  assert.equal(refreshed.session.id, created.session.id);
+  await liveManager.delete(created.session.id);
 });

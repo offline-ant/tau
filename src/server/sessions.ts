@@ -8,7 +8,7 @@ import type { JsonRecord, LiveClient, ModelIdentity, PendingCommand, RpcCommand,
 import { expandHome } from './config.js';
 import { orchestrationEndpoint } from './orchestration.js';
 import { modelLabel, normalizeModel, parseModelSpecToModel } from './model-utils.js';
-import { NAVIGATE_COMMAND } from './tree.js';
+import { NAVIGATE_COMMAND, flattenTree, isTreeNavigationInProgress, pathFromRoot, type SessionTreeNodeLike } from './tree.js';
 
 type SpawnFn = (cmd: string, args: string[], opts: JsonRecord) => ChildProcess;
 type PiMessageContent = string | Array<{ type: string; text?: string }>;
@@ -47,10 +47,22 @@ const TAU_TREE_EXTENSION = path.resolve(import.meta.dirname, '..', 'src', 'pi-ex
 
 /** Bound on retained child stderr; startup diagnostics are short. */
 const STDERR_TAIL_LINES = 20;
+const INPUT_COMMANDS = new Set(['prompt', 'steer', 'follow_up']);
 
 export function isGenericSessionName(name: unknown) {
   const normalized = String(name || '').trim().toLowerCase();
   return normalized === 'chat' || normalized === 'new chat' || normalized === 'untitled' || normalized === 'untitled chat' || normalized === 'session';
+}
+
+/** A failed spawn/cleanup reports whether reopening the file is safe. */
+export class SessionLifecycleError extends Error {
+  readonly sessionId: string;
+  readonly childStopped: boolean;
+  constructor(message: string, sessionId: string, childStopped: boolean) {
+    super(message);
+    this.sessionId = sessionId;
+    this.childStopped = childStopped;
+  }
 }
 
 export class PiRpcSession {
@@ -74,11 +86,22 @@ export class PiRpcSession {
   /** Extra child environment supplied by a programmatic caller; overrides tau's defaults. */
   extraEnv: Record<string, string>;
   pending: Map<string, PendingCommand>;
+  // A slash command can temporarily replace its session and then roll back.
+  // Keep its original file associated with this child until post-command state
+  // is confirmed, even if the caller times out or observes the temporary file.
+  private inputSessionFiles = new Map<string, string>();
+  // Timeouts stop waiting, not execution. Keep mutating commands busy until
+  // their actual acknowledgement so refresh cannot cancel an unknown operation.
+  private activeCommands = new Set<string>();
+  refreshing = false;
+  private runActive = false;
   stdoutBuffer: string;
   /** Recent child stderr, so an exit can say why instead of only reporting its code. */
   stderrTail: string[];
   terminating: boolean;
   exitCode: number | null;
+  exited = false;
+  private termination: Promise<void> | null = null;
   titleSet: boolean;
   userMessages: string[];
   /** Last extension_error event from the child; navigate_tree reads this to explain a failed leaf move. */
@@ -149,89 +172,144 @@ export class PiRpcSession {
   }
 
   async start() {
-    if (!fs.existsSync(this.cwd) || !fs.statSync(this.cwd).isDirectory()) {
-      throw new Error(`Directory not found: ${this.cwd}`);
-    }
-    const args = ['--mode', 'rpc', '--extension', TAU_TREE_EXTENSION];
-    if (this.sessionFile) args.push('--session', this.sessionFile);
-    if (this.modelSpec) args.push('--model', this.modelSpec);
-    args.push(...this.extraArgs);
-    this.navigateCommandChecked = false;
-    const spawnFn: SpawnFn = _spawnPiForTest || spawn;
-    // Children can orchestrate through this server: they inherit its endpoint
-    // unless the caller pins a different host explicitly.
-    const endpoint = orchestrationEndpoint();
-    const orchestration = endpoint ? { PI_ORCHESTRATION_HOST: 'web', PI_ORCHESTRATION_ENDPOINT: endpoint } : {};
-    const child = spawnFn('pi', args, {
-      cwd: this.cwd,
-      env: { ...process.env, TAU_DISABLED: '1', ...orchestration, ...this.extraEnv },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    this.child = child;
-    this.pid = child.pid || null;
-
-    child.stdout!.setEncoding('utf8');
-    child.stdout!.on('data', (chunk: string) => this.handleStdout(chunk));
-    child.stderr!.setEncoding('utf8');
-    child.stderr!.on('data', (chunk: string) => {
-      for (const line of chunk.split(/\r?\n/).filter(Boolean)) {
-        console.error(`[Pi ${this.id}] ${line}`);
-        this.stderrTail.push(line);
-        if (this.stderrTail.length > STDERR_TAIL_LINES) this.stderrTail.shift();
+    const expectedFile = this.sessionFile;
+    try {
+      if (!fs.existsSync(this.cwd) || !fs.statSync(this.cwd).isDirectory()) {
+        throw new Error(`Directory not found: ${this.cwd}`);
       }
-    });
-    child.on('error', (err: Error) => this.handleExit(null, null, err));
-    child.on('exit', (code: number | null, signal: NodeJS.Signals | null) => this.handleExit(code, signal));
-
-    await new Promise<void>((resolve, reject) => {
-      let settled = false;
-      const cleanup = () => {
-        child.off('error', onError);
-        child.off('exit', onExit);
-      };
-      const onError = (err: Error) => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        reject(err);
-      };
-      const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        reject(new Error(`Pi RPC process exited during startup — ${this.exitError(code, signal).message}`));
-      };
-      child.once('error', onError);
-      child.once('exit', onExit);
-      setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        resolve();
-      }, 100);
-    });
-
-    // Give Pi a moment to enter RPC mode, then probe its state. get_state
-    // populates model/thinkingLevel (and sessionFile/sessionName) via
-    // updateStateFromResponse so the tab shows the real model immediately on
-    // create/resume instead of a placeholder until the first message.
-    // get_session_stats fills in context usage. Both are fire-and-forget: do
-    // not fail session creation if unavailable, and a response landing after
-    // the 5s ack timeout is still applied (handleResponse processes every
-    // response regardless of pending state).
-    setTimeout(() => {
-      this.send({ type: 'get_state' }, { timeoutMs: 5000 }).catch(() => {});
+      const args = ['--mode', 'rpc', '--extension', TAU_TREE_EXTENSION];
+      if (expectedFile) args.push('--session', expectedFile);
+      if (this.modelSpec) args.push('--model', this.modelSpec);
+      args.push(...this.extraArgs);
+      this.navigateCommandChecked = false;
+      const spawnFn: SpawnFn = _spawnPiForTest || spawn;
+      const endpoint = orchestrationEndpoint();
+      const orchestration = endpoint ? { PI_ORCHESTRATION_HOST: 'web', PI_ORCHESTRATION_ENDPOINT: endpoint } : {};
+      const child = spawnFn('pi', args, {
+        cwd: this.cwd,
+        env: { ...process.env, TAU_DISABLED: '1', ...orchestration, ...this.extraEnv },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      this.child = child;
+      this.pid = child.pid || null;
+      child.stdin!.on('error', (error: Error) => this.rejectPending(error));
+      child.stdout!.setEncoding('utf8');
+      child.stdout!.on('data', (chunk: string) => this.handleStdout(chunk));
+      child.stderr!.setEncoding('utf8');
+      child.stderr!.on('data', (chunk: string) => {
+        for (const line of chunk.split(/\r?\n/).filter(Boolean)) {
+          console.error(`[Pi ${this.id}] ${line}`);
+          this.stderrTail.push(line);
+          if (this.stderrTail.length > STDERR_TAIL_LINES) this.stderrTail.shift();
+        }
+      });
+      child.on('error', (err: Error) => {
+        // A failed spawn has no child to reap. A later kill/write error does
+        // not prove process exit, so keep ownership until an actual exit.
+        if (!child.pid) this.handleExit(null, null, err);
+        else this.rejectPending(err);
+      });
+      child.on('exit', (code: number | null, signal: NodeJS.Signals | null) => this.handleExit(code, signal));
+      const state = await this.send({ type: 'get_state' }, { timeoutMs: 30000 });
+      if (state.success !== true) throw new Error(`Pi startup state failed: ${state.error || 'unsuccessful response'}`);
+      const data = state.data as PiRpcPayload | undefined;
+      if (!data || (expectedFile && (typeof data.sessionFile !== 'string' || path.resolve(data.sessionFile) !== path.resolve(expectedFile)))) {
+        throw new Error('Pi did not load the requested session file');
+      }
+      if (expectedFile) {
+        // The file contains every branch; only the child's selected path is
+        // the resumed conversation. Retain file-header metadata separately.
+        const response = await this.send({ type: 'get_tree' }, { timeoutMs: 30000 });
+        const tree = response.data as { tree?: SessionTreeNodeLike[]; leafId?: string | null } | undefined;
+        if (response.success !== true || !Array.isArray(tree?.tree) || !(tree.leafId === null || typeof tree.leafId === 'string')) {
+          throw new Error(`Pi startup tree failed: ${response.error || 'invalid tree response'}`);
+        }
+        this.entries = [...this.entries.filter((entry) => entry.type === 'session'), ...pathFromRoot(flattenTree(tree.tree), tree.leafId)];
+      }
+      if (this.exited || this.terminating) throw new Error('Pi exited or was closed during startup');
       this.send({ type: 'get_session_stats' }, { timeoutMs: 5000 }).catch(() => {});
-    }, 250);
+    } catch (error) {
+      if (expectedFile) this.sessionFile = expectedFile;
+      const message = error instanceof Error ? error.message : String(error);
+      try {
+        await this.terminate('startup_failed');
+      } catch (cleanup) {
+        throw new SessionLifecycleError(`${message}; ${cleanup instanceof Error ? cleanup.message : String(cleanup)}`, this.id, false);
+      }
+      throw new SessionLifecycleError(message, this.id, true);
+    }
+  }
+
+  async refresh(sessionFile: string) {
+    const expectedFile = path.resolve(sessionFile);
+    if (this.refreshing || this.isStreaming || this.runActive || this.pending.size || this.activeCommands.size || this.inputSessionFiles.size || isTreeNavigationInProgress(this.id)) {
+      throw new Error('Session is busy; finish its active commands before refreshing');
+    }
+    if (!this.sessionFile || path.resolve(this.sessionFile) !== expectedFile) throw new Error('Session no longer has the requested file open');
+    this.refreshing = true;
+    try {
+      const before = await this.sendCommand({ type: 'get_state' }, { timeoutMs: 30000 });
+      const state = before.data as PiRpcPayload | undefined;
+      if (before.success !== true || !state || typeof state.sessionFile !== 'string' || path.resolve(state.sessionFile) !== expectedFile) throw new Error('Could not confirm the current session state');
+      if (this.runActive || this.isStreaming || state.isStreaming !== false || state.isCompacting !== false || state.pendingMessageCount !== 0) {
+        throw new Error('Session is busy or has queued prompts; finish them before refreshing');
+      }
+      const switched = await this.sendCommand({ type: 'switch_session', sessionPath: expectedFile }, { timeoutMs: 30000 });
+      const result = switched.data as { cancelled?: boolean } | undefined;
+      if (switched.success !== true || result?.cancelled !== false) throw new Error(`Session refresh failed: ${switched.error || 'switch was cancelled or not confirmed'}`);
+      const current = await this.sendCommand({ type: 'get_state' }, { timeoutMs: 30000 });
+      const data = current.data as PiRpcPayload | undefined;
+      if (current.success !== true || typeof data?.sessionFile !== 'string' || path.resolve(data.sessionFile) !== expectedFile) {
+        throw new Error('Pi did not reload the requested session file');
+      }
+      if (this.runActive || data.isStreaming !== false || data.isCompacting !== false || data.pendingMessageCount !== 0) {
+        throw new Error('Session became busy during refresh');
+      }
+      const response = await this.sendCommand({ type: 'get_tree' }, { timeoutMs: 30000 });
+      const tree = response.data as { tree?: SessionTreeNodeLike[]; leafId?: string | null } | undefined;
+      if (response.success !== true || !Array.isArray(tree?.tree) || !(tree.leafId === null || typeof tree.leafId === 'string')) {
+        throw new Error(`Session refresh tree failed: ${response.error || 'invalid tree response'}`);
+      }
+      const flat = flattenTree(tree.tree);
+      if (tree.leafId !== null && !flat.has(tree.leafId)) throw new Error('Session refresh tree omitted the active leaf');
+      if (this.exited || this.terminating) throw new Error('Pi exited or was closed during refresh');
+      this.entries = [...this.entries.filter((entry) => entry.type === 'session'), ...pathFromRoot(flat, tree.leafId)];
+      this.model = normalizeModel(data.model);
+      this.thinkingLevel = typeof data.thinkingLevel === 'string' ? data.thinkingLevel : 'off';
+      this.sessionName = typeof data.sessionName === 'string' ? data.sessionName : null;
+      this.contextUsage = null;
+      this.isStreaming = false;
+      this.userMessages = [];
+      this.titleSet = !!this.sessionName;
+      this.lastExtensionError = null;
+      this.navigateCommandChecked = false;
+      this.manager.broadcast({ type: 'live_session_snapshot', sessionId: this.id, ...this.snapshot() });
+      this.manager.broadcastUpdated(this.id);
+    } catch (error) {
+      // A failed state check does not release this tab's file association.
+      this.sessionFile = expectedFile;
+      throw error;
+    } finally {
+      this.refreshing = false;
+    }
   }
 
   send(command: RpcCommand, opts: { timeoutMs?: number } = {}) {
+    if (this.refreshing && command.type !== 'extension_ui_response') return Promise.reject(new Error('Session refresh is in progress; wait a moment and send again'));
+    return this.sendCommand(command, opts);
+  }
+
+  private sendCommand(command: RpcCommand, opts: { timeoutMs?: number } = {}) {
     const child = this.child;
-    if (!child || !child.stdin!.writable || this.terminating) {
+    if (!child || !child.stdin!.writable || this.terminating || this.exited) {
       return Promise.reject(new Error('Pi RPC session is not running'));
     }
     const id = command.id || `cmd_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     const outbound = { ...command, id };
+    if (command.type && !command.type.startsWith('get_') && command.type !== 'extension_ui_response') this.activeCommands.add(id);
+    if (INPUT_COMMANDS.has(command.type ?? '') && this.sessionFile) {
+      this.inputSessionFiles.set(id, path.resolve(this.sessionFile));
+    }
     delete outbound.sessionId;
     const timeoutMs = opts.timeoutMs ?? 60000;
     return new Promise<RpcResponse>((resolve, reject) => {
@@ -277,6 +355,7 @@ export class PiRpcSession {
 
   handleResponse(resp: PiRpcMessage) {
     const id = resp.id;
+    if (id) this.activeCommands.delete(id);
     if (id && this.pending.has(id)) {
       const pending = this.pending.get(id);
       if (pending) {
@@ -287,6 +366,20 @@ export class PiRpcSession {
     }
     this.updateStateFromResponse(resp);
     this.manager.broadcast({ type: 'event', sessionId: this.id, event: resp });
+    // Observe acknowledgements here, not in the HTTP request's promise: a
+    // command may finish after that promise timed out. State updates and their
+    // broadcasts use the same authoritative response path as every get_state.
+    if (INPUT_COMMANDS.has(resp.command ?? '') && !this.terminating && !this.exited) {
+      this.send({ type: 'get_state' }, { timeoutMs: 5000 }).then((state) => {
+        const data = state.data as PiRpcPayload | undefined;
+        if (id && state.success === true && typeof data?.sessionFile === 'string') this.inputSessionFiles.delete(id);
+      }).catch(() => { /* Unconfirmed state keeps the original file associated until exit. */ });
+    }
+  }
+
+  referencesSessionFile(resolvedFile: string) {
+    return (this.sessionFile !== null && path.resolve(this.sessionFile) === resolvedFile)
+      || Array.from(this.inputSessionFiles.values()).includes(resolvedFile);
   }
 
   updateStateFromResponse(resp: PiRpcMessage) {
@@ -309,6 +402,8 @@ export class PiRpcSession {
   handleEvent(event: PiRpcMessage) {
     this.touch(false);
     const type = event.type;
+    if (type === 'agent_start') this.runActive = true;
+    if (type === 'agent_settled') this.runActive = false;
     if (type === 'agent_start' || type === 'turn_start') this.isStreaming = true;
     if (type === 'agent_end' || type === 'turn_end') this.isStreaming = false;
     // Extension command handlers report their errors as extension_error
@@ -387,20 +482,46 @@ export class PiRpcSession {
     if (broadcast) this.manager.broadcastUpdated(this.id);
   }
 
-  async terminate(reason = 'closed') {
-    if (this.terminating) return;
-    this.terminating = true;
-    for (const [, pending] of this.pending) {
+  private rejectPending(error: Error | { message?: string }) {
+    for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
-      pending.reject(new Error(`Session terminated: ${reason}`));
+      pending.reject(error);
     }
     this.pending.clear();
-    if (!this.child || this.child.exitCode !== null) return;
-    try { this.child.kill('SIGTERM'); } catch {}
-    await new Promise((resolve) => setTimeout(resolve, 1500));
-    if (this.child && this.child.exitCode === null && this.child.signalCode === null) {
-      try { this.child.kill('SIGKILL'); } catch {}
-    }
+  }
+
+  private waitForExit(timeoutMs: number): Promise<boolean> {
+    const child = this.child;
+    if (!child || this.exited || child.exitCode != null || child.signalCode != null) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const finish = (exited: boolean) => {
+        clearTimeout(timer);
+        child.off('exit', onExit);
+        child.off('error', onError);
+        resolve(exited);
+      };
+      const onExit = () => finish(true);
+      const onError = () => { if (!child.pid) finish(true); };
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      child.once('exit', onExit);
+      child.on('error', onError);
+    });
+  }
+
+  terminate(reason = 'closed'): Promise<void> {
+    if (this.termination) return this.termination;
+    this.terminating = true;
+    this.rejectPending(new Error(`Session terminated: ${reason}`));
+    this.termination = (async () => {
+      if (!this.child || this.exited || this.child.exitCode != null || this.child.signalCode != null) return;
+      const gracefulExit = this.waitForExit(1500);
+      try { this.child.kill('SIGTERM'); } catch { /* Escalate if exit is not observed. */ }
+      if (await gracefulExit) return;
+      const forcedExit = this.waitForExit(5000);
+      try { this.child.kill('SIGKILL'); } catch { /* The bounded exit wait determines safety. */ }
+      if (!await forcedExit) throw new SessionLifecycleError('Pi child exit could not be confirmed; do not reopen its session file', this.id, false);
+    })().finally(() => { this.termination = null; });
+    return this.termination;
   }
 
   /**
@@ -415,13 +536,12 @@ export class PiRpcSession {
   }
 
   handleExit(code: number | null, signal: string | null, err?: { message?: string }) {
-    if (this.exitCode !== null) return;
+    if (this.exited) return;
+    this.exited = true;
+    this.inputSessionFiles.clear();
+    this.activeCommands.clear();
     this.exitCode = code;
-    for (const [, pending] of this.pending) {
-      clearTimeout(pending.timer);
-      pending.reject(err || this.exitError(code, signal));
-    }
-    this.pending.clear();
+    this.rejectPending(err || this.exitError(code, signal));
     this.manager.removeExited(this.id, err?.message || `process_exit:${signal || code}`);
   }
 }
@@ -429,8 +549,9 @@ export class PiRpcSession {
 export class LiveSessionManager {
   sessions: Map<string, PiRpcSession>;
   clients: Set<LiveClient>;
-  pendingResumes: Map<string, Promise<PiRpcSession>>;
+  pendingResumes: Map<string, Promise<{ session: PiRpcSession; refreshed: boolean }>>;
   terminatingResumes: Map<string, Promise<void>>;
+  private startingSessions = new Set<PiRpcSession>();
 
   constructor() {
     this.sessions = new Map();
@@ -454,7 +575,11 @@ export class LiveSessionManager {
   get(id: string) { return this.sessions.get(id); }
   findBySessionFile(sessionFile: string) {
     const resolved = path.resolve(sessionFile);
-    return Array.from(this.sessions.values()).find((s) => s.sessionFile && path.resolve(s.sessionFile) === resolved);
+    return Array.from(this.sessions.values()).find((session) => session.referencesSessionFile(resolved));
+  }
+  hasStartingSession(sessionFile: string) {
+    const resolved = path.resolve(sessionFile);
+    return Array.from(this.startingSessions).some((session) => session.sessionFile && path.resolve(session.sessionFile) === resolved);
   }
   hasPendingResume(sessionFile: string) { return this.pendingResumes.has(path.resolve(sessionFile)); }
   hasTerminatingResume(sessionFile: string) { return this.terminatingResumes.has(path.resolve(sessionFile)); }
@@ -464,45 +589,70 @@ export class LiveSessionManager {
       cwd: resolved, modelSpec: (model || '').trim(),
       ...(sessionFile ? { sessionFile: path.resolve(expandHome(sessionFile)) } : {}), args, env,
     });
-    await session.start();
+    return this.startSession(session);
+  }
+  private async startSession(session: PiRpcSession) {
+    // A create can open an existing file too; it is not in pendingResumes.
+    // Keep it visible to pre-spawn rollback checks until readiness/cleanup ends.
+    this.startingSessions.add(session);
+    try {
+      await session.start();
+      if (session.exited) throw new SessionLifecycleError('Pi exited during startup', session.id, true);
+    } catch (error) {
+      // Retain an uncertain child so it cannot be replaced by another resume,
+      // and so DELETE can retry cleanup using the error's sessionId.
+      if (error instanceof SessionLifecycleError && !error.childStopped) this.sessions.set(session.id, session);
+      throw error;
+    } finally {
+      this.startingSessions.delete(session);
+    }
     this.sessions.set(session.id, session);
     this.broadcast({ type: 'live_session_created', session: session.metadata() });
     return session;
   }
-  async resume({ sessionFile, cwd, model, entries, sessionName }: { sessionFile: string; cwd: string; model?: string; entries?: JsonRecord[]; sessionName?: string | null }) {
+  async resume(options: { sessionFile: string; cwd: string; model?: string; entries?: JsonRecord[]; sessionName?: string | null; refresh?: boolean } & SessionSpawnOverrides): Promise<{ session: PiRpcSession; started: boolean; refreshed: boolean }> {
+    const { sessionFile, cwd, model, entries, sessionName, args, env, refresh } = options;
     const resolved = path.resolve(sessionFile);
-    const existing = this.findBySessionFile(resolved);
-    if (existing) return existing;
     const pending = this.pendingResumes.get(resolved);
-    if (pending) return pending;
-    const resumePromise = (async () => {
+    if (pending) {
+      const result = await pending;
+      if (refresh && !result.refreshed) return this.resume(options);
+      return { ...result, started: false };
+    }
+    let started = false;
+    // Defer execution so even an immediate failure removes the map entry only
+    // after it has been installed. Concurrent callers join the same startup.
+    const resumePromise = Promise.resolve().then(async () => {
       try {
         const terminating = this.terminatingResumes.get(resolved);
-        if (terminating) await terminating.catch(() => {});
-        const afterTerminationExisting = this.findBySessionFile(resolved);
-        if (afterTerminationExisting) return afterTerminationExisting;
-        const session = new PiRpcSession(this, { cwd, modelSpec: (model || '').trim(), sessionFile: resolved, entries, sessionName });
-        await session.start();
-        this.sessions.set(session.id, session);
-        this.broadcast({ type: 'live_session_created', session: session.metadata() });
-        return session;
+        if (terminating) await terminating;
+        const existing = this.findBySessionFile(resolved);
+        if (existing) {
+          if (existing.terminating) throw new SessionLifecycleError('Previous Pi child exit is unconfirmed; close it before resuming', existing.id, false);
+          if (refresh) await existing.refresh(resolved);
+          return { session: existing, refreshed: !!refresh };
+        }
+        const session = new PiRpcSession(this, { cwd, modelSpec: (model || '').trim(), sessionFile: resolved, entries, sessionName, args, env });
+        const readySession = await this.startSession(session);
+        started = true;
+        return { session: readySession, refreshed: false };
       } finally {
         this.pendingResumes.delete(resolved);
       }
-    })();
+    });
     this.pendingResumes.set(resolved, resumePromise);
-    return resumePromise;
+    return { ...await resumePromise, started };
   }
   async delete(id: string, reason = 'closed_by_user') {
     const session = this.sessions.get(id);
     if (!session) return false;
     const resolvedFile = session.sessionFile ? path.resolve(session.sessionFile) : null;
-    const termination = session.terminate(reason).then(() => undefined, () => undefined).finally(() => {
+    const termination = session.terminate(reason).then(() => {
+      this.removeExited(id, reason);
+    }).finally(() => {
       if (resolvedFile && this.terminatingResumes.get(resolvedFile) === termination) this.terminatingResumes.delete(resolvedFile);
     });
     if (resolvedFile) this.terminatingResumes.set(resolvedFile, termination);
-    this.sessions.delete(id);
-    this.broadcast({ type: 'live_session_closed', sessionId: id, reason });
     await termination;
     return true;
   }
@@ -512,9 +662,9 @@ export class LiveSessionManager {
     this.broadcast({ type: 'live_session_closed', sessionId: id, reason });
   }
   async shutdown() {
-    const sessions = Array.from(this.sessions.values());
-    this.sessions.clear();
-    await Promise.allSettled(sessions.map((s) => s.terminate('server_shutdown')));
+    const results = await Promise.allSettled(Array.from(this.sessions.keys(), (id) => this.delete(id, 'server_shutdown')));
+    const failures = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+    if (failures.length) throw new AggregateError(failures.map((result) => result.reason), `${failures.length} Pi child exit(s) unconfirmed`);
   }
 }
 

@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { EventEmitter } from 'node:events';
-import { PassThrough } from 'node:stream';
+import { FakePi } from '../fake-pi.ts';
+import type { TreeEntry } from '../../src/server/tree.ts';
 import { chromium } from 'playwright';
 
 // Real-browser test of the progressive session-history render: it drives the
@@ -32,16 +32,11 @@ const contexts: BrowserContext[] = [];
 
 const PROJ_DIR = path.join(SESSIONS_DIR, '--tmp--e2eproj');
 
-// Same realistic fake `pi` child as test/http-routes.test.ts: real streams so
-// the RPC wiring works, an EventEmitter so error/exit listeners resolve.
-function makeFakeChild() {
-  const child: any = new EventEmitter();
-  child.stdin = new PassThrough();
-  child.stdout = new PassThrough();
-  child.stderr = new PassThrough();
-  child.pid = 12345;
-  child.kill = () => {};
-  return child;
+function makeFakeChild(args: string[]) {
+  const sessionFile = args[args.indexOf('--session') + 1];
+  const entries = fs.readFileSync(sessionFile, 'utf8').trim().split('\n')
+    .map((line) => JSON.parse(line) as TreeEntry).filter((entry) => entry.type !== 'session');
+  return new FakePi({ sessionFile, tree: entries.map((entry) => ({ entry })), leafId: entries.at(-1)?.id ?? null }).asChild();
 }
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
@@ -97,7 +92,9 @@ function buildSmallSession(cwd: string) {
 function writeSession(fileName: string, lines: Array<Record<string, unknown>>) {
   fs.mkdirSync(PROJ_DIR, { recursive: true });
   const filePath = path.join(PROJ_DIR, fileName);
-  fs.writeFileSync(filePath, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+  const entries = lines.map((entry, index) => index === 0 ? entry
+    : { ...entry, id: `entry-${index}`, parentId: index === 1 ? null : `entry-${index - 1}` });
+  fs.writeFileSync(filePath, entries.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
   return filePath;
 }
 
@@ -206,7 +203,7 @@ before(async () => {
   largeFile = writeSession('large.jsonl', buildLargeSession(cwd));
   smallFile = writeSession('small.jsonl', buildSmallSession(cwd));
 
-  _setSpawnPiForTest(() => makeFakeChild());
+  _setSpawnPiForTest((_cmd: string, args: string[]) => makeFakeChild(args));
   _setExecFileForTest((_file: string, _args: string[], _opts: object, cb: (err: Error | null, stdout: string, stderr: string) => void) =>
     cb(null, '', '')
   );
