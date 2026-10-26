@@ -165,7 +165,7 @@ run_instance() {
   [[ -n "$instance" ]] || die 'run requires an instance name'
   validate_instance "$instance"
 
-  local port=3001 bind_address=0.0.0.0 detached=1
+  local port=3443 bind_address=0.0.0.0 detached=1
   while (($#)); do
     case "$1" in
       --port)
@@ -219,13 +219,13 @@ run_instance() {
     --tmpfs "/tmp:rw,nosuid,nodev,mode=1777"
     --cap-drop ALL
     --security-opt no-new-privileges
-    --publish "${bind_address}:${port}:3001"
+    --publish "${bind_address}:${port}:3443"
     --env TAU_USER
     --env TAU_PASS
     --env HOME=/state/home
     --env PI_CODING_AGENT_DIR=/state/agent
     --env TAU_HOST=0.0.0.0
-    --env TAU_PORT=3001
+    --env TAU_PORT=3443
     --env TAU_PROJECTS_DIR=/state/home/projects
     --volume "$state_dir:/state:rw"
     --volume "$projects_dir:/state/home/projects:rw"
@@ -241,13 +241,13 @@ run_instance() {
   run_args+=("$IMAGE")
 
   if [[ "$bind_address" == '0.0.0.0' || "$bind_address" == '::' ]]; then
-    printf 'Warning: port %s will be exposed on every host interface. Use HTTPS for remote access.\n' "$port" >&2
+    printf 'Warning: port %s will be exposed on every host interface.\n' "$port" >&2
   fi
 
   "$runtime" "${run_args[@]}"
 
   if ((detached)); then
-    printf 'Tau instance %s is running at http://localhost:%s\n' "$instance" "$port"
+    printf 'Tau instance %s is running at https://localhost:%s\n' "$instance" "$port"
     printf 'Writable instance state: %s\n' "$state_dir"
   fi
 }

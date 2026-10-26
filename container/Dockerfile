@@ -20,6 +20,7 @@ RUN apt-get update \
         git \
         jq \
         openssh-client \
+        openssl \
         ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
@@ -40,10 +41,10 @@ RUN chmod 0755 /usr/local/bin/tau-entrypoint
 ENV PATH="/app/node_modules/.bin:${PATH}" \
     NODE_ENV="production" \
     TAU_HOST="0.0.0.0" \
-    TAU_PORT="3001" \
+    TAU_PORT="3443" \
     TAU_STATIC_DIR="/app/public"
 
-EXPOSE 3001
+EXPOSE 3443
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl --fail --silent --show-error http://127.0.0.1:3001/api/health >/dev/null || exit 1

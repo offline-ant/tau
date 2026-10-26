@@ -1,8 +1,15 @@
 /**
- * Theme system — four themes: two light, two dark
+ * Theme system. Telegram (light blue/white) is the default; an explicit choice
+ * in Settings is remembered.
  */
 
 export const themes = {
+  telegram: {
+    name: 'Telegram',
+    dark: false,
+    colors: ['#ffffff', '#3390ec', '#d7ebfd', '#dfe9f3'],
+    vars: {},
+  },
   night: {
     name: 'Dusk',
     dark: true,
@@ -43,31 +50,20 @@ export const themes = {
 
 export type ThemeId = keyof typeof themes;
 
-export function applyTheme(themeId: string) {
-  const root = document.documentElement;
-  // Validate
-  if (!(themeId in themes)) themeId = 'night';
-  root.setAttribute('data-theme', themeId);
-  localStorage.setItem('tau-theme', themeId);
+const DEFAULT_THEME: ThemeId = 'telegram';
+// Written only by an explicit Settings choice, so the default can change.
+const THEME_CHOICE_KEY = 'tau-theme-choice';
+
+export function applyTheme(themeId: ThemeId) {
+  document.documentElement.setAttribute('data-theme', themeId);
+}
+
+export function chooseTheme(themeId: ThemeId) {
+  applyTheme(themeId);
+  localStorage.setItem(THEME_CHOICE_KEY, themeId);
 }
 
 export function getCurrentTheme(): ThemeId {
-  const saved = localStorage.getItem('tau-theme');
-  // Migrate old values
-  if (saved === 'dark') return 'night';
-  if (saved === 'light') return 'terracotta';
-  if (saved && saved in themes) return saved as ThemeId;
-  // Auto-detect from OS
-  if (window.matchMedia?.('(prefers-color-scheme: light)').matches) return 'terracotta';
-  return 'night';
-}
-
-// Listen for OS theme changes if no explicit preference saved
-if (!localStorage.getItem('tau-theme')) {
-  window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', (e) => {
-    if (!localStorage.getItem('tau-theme')) {
-      const root = document.documentElement;
-      root.setAttribute('data-theme', e.matches ? 'terracotta' : 'night');
-    }
-  });
+  const saved = localStorage.getItem(THEME_CHOICE_KEY);
+  return saved && saved in themes ? saved as ThemeId : DEFAULT_THEME;
 }

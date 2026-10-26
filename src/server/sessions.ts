@@ -6,6 +6,7 @@ import { WebSocket } from 'ws';
 import type { ChildProcess } from 'node:child_process';
 import type { JsonRecord, LiveClient, ModelIdentity, PendingCommand, RpcCommand, RpcResponse, SessionSpawnOverrides } from './types.js';
 import { expandHome } from './config.js';
+import { readSessionHeader } from './session-header.js';
 import { orchestrationEndpoint } from './orchestration.js';
 import { modelLabel, normalizeModel, parseModelSpecToModel } from './model-utils.js';
 import { NAVIGATE_COMMAND, flattenTree, isTreeNavigationInProgress, pathFromRoot, type SessionTreeNodeLike } from './tree.js';
@@ -33,6 +34,7 @@ type PiRpcMessage = PiRpcPayload & {
   data?: PiRpcPayload;
   result?: PiRpcPayload;
   message?: PiMessage;
+  entry?: JsonRecord;
 };
 
 export function makeId() {
@@ -90,6 +92,9 @@ export class PiRpcSession {
   // Keep its original file associated with this child until post-command state
   // is confirmed, even if the caller times out or observes the temporary file.
   private inputSessionFiles = new Map<string, string>();
+  // A handled extension command may replace the entire runtime. Snapshot readers
+  // and the actual command response wait for its authoritative state and history.
+  private inputSynchronization: Promise<void> = Promise.resolve();
   // Timeouts stop waiting, not execution. Keep mutating commands busy until
   // their actual acknowledgement so refresh cannot cancel an unknown operation.
   private activeCommands = new Set<string>();
@@ -158,7 +163,19 @@ export class PiRpcSession {
     };
   }
 
-  snapshot() {
+  async snapshot() {
+    try {
+      await this.inputSynchronization;
+    } catch {
+      // A failed rebuild must not poison every later reader. Ask the child
+      // again instead of serving a cache whose conversation is unconfirmed.
+      this.inputSynchronization = this.inputSynchronization.catch(() => {}).then(() => this.synchronizeInput(true));
+      await this.inputSynchronization;
+    }
+    return this.currentSnapshot();
+  }
+
+  private currentSnapshot() {
     return {
       session: this.metadata(),
       entries: this.entries,
@@ -184,10 +201,17 @@ export class PiRpcSession {
       this.navigateCommandChecked = false;
       const spawnFn: SpawnFn = _spawnPiForTest || spawn;
       const endpoint = orchestrationEndpoint();
-      const orchestration = endpoint ? { PI_ORCHESTRATION_HOST: 'web', PI_ORCHESTRATION_ENDPOINT: endpoint } : {};
+      const env = { ...process.env };
+      // The server may have been launched inside a terminal Pi. A new Tau tab
+      // is not that pane or its managed worker; explicit spawn overrides below
+      // can still provide a new worker identity.
+      for (const key of ['PI_NESTED', 'PI_ORCHESTRATION_TARGET', 'PI_ORCHESTRATION_CONTROL',
+        'PI_ORCHESTRATION_HOST', 'PI_ORCHESTRATION_ENDPOINT', 'HERDR_ENV',
+        'HERDR_WORKSPACE_ID', 'HERDR_TAB_ID', 'HERDR_PANE_ID', 'TMUX', 'TMUX_PANE']) delete env[key];
       const child = spawnFn('pi', args, {
         cwd: this.cwd,
-        env: { ...process.env, TAU_DISABLED: '1', ...orchestration, ...this.extraEnv },
+        env: { ...env, TAU_DISABLED: '1', PI_ORCHESTRATION_HOST: 'web',
+          ...(endpoint ? { PI_ORCHESTRATION_ENDPOINT: endpoint } : {}), ...this.extraEnv },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       this.child = child;
@@ -219,12 +243,7 @@ export class PiRpcSession {
       if (expectedFile) {
         // The file contains every branch; only the child's selected path is
         // the resumed conversation. Retain file-header metadata separately.
-        const response = await this.send({ type: 'get_tree' }, { timeoutMs: 30000 });
-        const tree = response.data as { tree?: SessionTreeNodeLike[]; leafId?: string | null } | undefined;
-        if (response.success !== true || !Array.isArray(tree?.tree) || !(tree.leafId === null || typeof tree.leafId === 'string')) {
-          throw new Error(`Pi startup tree failed: ${response.error || 'invalid tree response'}`);
-        }
-        this.entries = [...this.entries.filter((entry) => entry.type === 'session'), ...pathFromRoot(flattenTree(tree.tree), tree.leafId)];
+        await this.loadActiveHistory(this.entries.find((entry) => entry.type === 'session'));
       }
       if (this.exited || this.terminating) throw new Error('Pi exited or was closed during startup');
       this.send({ type: 'get_session_stats' }, { timeoutMs: 5000 }).catch(() => {});
@@ -265,15 +284,8 @@ export class PiRpcSession {
       if (this.runActive || data.isStreaming !== false || data.isCompacting !== false || data.pendingMessageCount !== 0) {
         throw new Error('Session became busy during refresh');
       }
-      const response = await this.sendCommand({ type: 'get_tree' }, { timeoutMs: 30000 });
-      const tree = response.data as { tree?: SessionTreeNodeLike[]; leafId?: string | null } | undefined;
-      if (response.success !== true || !Array.isArray(tree?.tree) || !(tree.leafId === null || typeof tree.leafId === 'string')) {
-        throw new Error(`Session refresh tree failed: ${response.error || 'invalid tree response'}`);
-      }
-      const flat = flattenTree(tree.tree);
-      if (tree.leafId !== null && !flat.has(tree.leafId)) throw new Error('Session refresh tree omitted the active leaf');
+      await this.loadActiveHistory(this.entries.find((entry) => entry.type === 'session'));
       if (this.exited || this.terminating) throw new Error('Pi exited or was closed during refresh');
-      this.entries = [...this.entries.filter((entry) => entry.type === 'session'), ...pathFromRoot(flat, tree.leafId)];
       this.model = normalizeModel(data.model);
       this.thinkingLevel = typeof data.thinkingLevel === 'string' ? data.thinkingLevel : 'off';
       this.sessionName = typeof data.sessionName === 'string' ? data.sessionName : null;
@@ -283,7 +295,7 @@ export class PiRpcSession {
       this.titleSet = !!this.sessionName;
       this.lastExtensionError = null;
       this.navigateCommandChecked = false;
-      this.manager.broadcast({ type: 'live_session_snapshot', sessionId: this.id, ...this.snapshot() });
+      this.manager.broadcast({ type: 'live_session_snapshot', sessionId: this.id, ...await this.snapshot() });
       this.manager.broadcastUpdated(this.id);
     } catch (error) {
       // A failed state check does not release this tab's file association.
@@ -354,6 +366,24 @@ export class PiRpcSession {
   }
 
   handleResponse(resp: PiRpcMessage) {
+    if (INPUT_COMMANDS.has(resp.command ?? '') && !this.terminating && !this.exited) {
+      // Observe even late acknowledgements after the HTTP caller timed out. A
+      // timeout is not completion and must not release the original file.
+      const synchronization = this.inputSynchronization.catch(() => {}).then(() => this.synchronizeInput(resp.data?.disposition === 'handled', resp.id));
+      this.inputSynchronization = synchronization;
+      void synchronization.then(
+        () => this.completeResponse(resp),
+        (error: unknown) => this.completeResponse({
+          ...resp, success: false,
+          error: `Could not synchronize the session: ${error instanceof Error ? error.message : String(error)}`,
+        }),
+      );
+      return;
+    }
+    this.completeResponse(resp);
+  }
+
+  private completeResponse(resp: PiRpcMessage) {
     const id = resp.id;
     if (id) this.activeCommands.delete(id);
     if (id && this.pending.has(id)) {
@@ -366,15 +396,50 @@ export class PiRpcSession {
     }
     this.updateStateFromResponse(resp);
     this.manager.broadcast({ type: 'event', sessionId: this.id, event: resp });
-    // Observe acknowledgements here, not in the HTTP request's promise: a
-    // command may finish after that promise timed out. State updates and their
-    // broadcasts use the same authoritative response path as every get_state.
-    if (INPUT_COMMANDS.has(resp.command ?? '') && !this.terminating && !this.exited) {
-      this.send({ type: 'get_state' }, { timeoutMs: 5000 }).then((state) => {
-        const data = state.data as PiRpcPayload | undefined;
-        if (id && state.success === true && typeof data?.sessionFile === 'string') this.inputSessionFiles.delete(id);
-      }).catch(() => { /* Unconfirmed state keeps the original file associated until exit. */ });
+  }
+
+  private async synchronizeInput(rebuildHistory: boolean, responseId?: string) {
+    const state = await this.sendCommand({ type: 'get_state' }, { timeoutMs: 5000 });
+    const data = state.data as PiRpcPayload | undefined;
+    if (state.success !== true || typeof data?.sessionFile !== 'string') throw new Error('Pi did not confirm its current session file');
+    const currentFile = path.resolve(data.sessionFile);
+    const changedFile = Array.from(this.inputSessionFiles.values()).some(file => file !== currentFile);
+    const rebuiltHistory = changedFile || rebuildHistory;
+    if (rebuiltHistory) {
+      // Unwritten fresh sessions have no on-disk header. Their existing cwd
+      // remains authoritative; only an actual file change requires a new one.
+      const header = changedFile ? readSessionHeader(currentFile) : this.entries.find(entry => entry.type === 'session');
+      await this.loadActiveHistory(header);
+      if (typeof header?.cwd === 'string') this.cwd = header.cwd;
+      this.sessionName = typeof data.sessionName === 'string' ? data.sessionName : null;
+      this.userMessages = [];
+      this.titleSet = !!this.sessionName;
+      this.contextUsage = null;
+      if (changedFile) {
+        this.lastExtensionError = null;
+        this.navigateCommandChecked = false;
+      }
     }
+    for (const id of this.inputSessionFiles.keys()) {
+      if (id === responseId || !this.activeCommands.has(id)) this.inputSessionFiles.delete(id);
+    }
+    if (rebuiltHistory) {
+      // Publish the authoritative replacement to every view before completing
+      // the input. snapshot() would wait on this synchronization itself.
+      this.manager.broadcast({ type: 'live_session_snapshot', sessionId: this.id, ...this.currentSnapshot() });
+      this.manager.broadcastUpdated(this.id);
+    }
+  }
+
+  private async loadActiveHistory(header?: JsonRecord) {
+    const response = await this.sendCommand({ type: 'get_tree' }, { timeoutMs: 30000 });
+    const tree = response.data as { tree?: SessionTreeNodeLike[]; leafId?: string | null } | undefined;
+    if (response.success !== true || !Array.isArray(tree?.tree) || !(tree.leafId === null || typeof tree.leafId === 'string')) {
+      throw new Error(`Session history refresh failed: ${response.error || 'invalid tree response'}`);
+    }
+    const flat = flattenTree(tree.tree);
+    if (tree.leafId !== null && !flat.has(tree.leafId)) throw new Error('Session history refresh omitted the active leaf');
+    this.entries = [...(header ? [header] : []), ...pathFromRoot(flat, tree.leafId)];
   }
 
   referencesSessionFile(resolvedFile: string) {
@@ -390,6 +455,7 @@ export class PiRpcSession {
     if (data.contextUsage) this.contextUsage = data.contextUsage;
     if (data.model) this.model = normalizeModel(data.model);
     if (data.thinkingLevel) this.thinkingLevel = data.thinkingLevel;
+    if (command === 'get_state' && typeof data.isStreaming === 'boolean') this.isStreaming = data.isStreaming;
     if (data.level) this.thinkingLevel = data.level;
     if (data.tokens) this.contextUsage = { ...(this.contextUsage || {}), tokens: data.tokens };
     if (command === 'set_model' || command === 'cycle_model') {
@@ -405,7 +471,7 @@ export class PiRpcSession {
     if (type === 'agent_start') this.runActive = true;
     if (type === 'agent_settled') this.runActive = false;
     if (type === 'agent_start' || type === 'turn_start') this.isStreaming = true;
-    if (type === 'agent_end' || type === 'turn_end') this.isStreaming = false;
+    if (type === 'agent_end') this.isStreaming = false;
     // Extension command handlers report their errors as extension_error
     // events while the triggering prompt still acks with success. Keep the
     // last one so navigate_tree can explain WHY a leaf verification failed
@@ -425,6 +491,9 @@ export class PiRpcSession {
 
     if ((type === 'message_start' || type === 'message_end') && event.message) {
       this.trackMessage(event.message, type);
+    }
+    if (type === 'entry_appended' && event.entry?.type === 'compaction') {
+      this.entries.push(event.entry);
     }
     // NOTE: the assistant `message_end` event carries `event.message.model` as
     // a bare id describing WHICH model produced that message, not a selection

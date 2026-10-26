@@ -67,17 +67,75 @@ remain tracked, deletion errors propagate, and concurrent resumes cannot bypass
 pending/failed cleanup. Tests use `test/fake-pi.ts` for explicit RPC readiness and
 exit events; fake children that merely survive 100 ms no longer represent startup.
 Input acknowledgements refresh authoritative child state in `PiRpcSession`, even
-when the HTTP/RPC caller already timed out. A slash command can temporarily
-replace its session and roll back; keep its original file associated with that
-child until post-command state is confirmed, so an intervening `get_state` cannot
-make resume start a second writer. Failed refreshes retain that association until
-child exit. Do not put this refresh back in the HTTP request's promise or add
-polling/switch-specific notifications.
+when the HTTP/RPC caller already timed out. Handled extension commands also
+rebuild the active tree; a changed file requires its bounded first-line header
+for cwd because Pi's `get_state` does not expose it. Same-file commands reuse the
+cached header and cwd: fresh tabs do not have a transcript until the first
+message, so `/tools` or a cancelled `/take` must not require one. Snapshot reads
+and the actual forwarded input completion await this synchronization. Rebuilt history is also
+broadcast with the existing `live_session_snapshot` event before input completion,
+so passive browser views update too. Ordinary inference keeps using streamed
+events; failed synchronization never publishes a replacement. Later snapshots
+retry a failed rebuild against the child instead of retaining a rejected promise
+forever. Confirmed rebuilds update both snapshots and live-tab metadata for all
+clients. The HTTP prompt deadline
+remains only an early acknowledgement, not proof of completion. A slash command
+can temporarily replace its session and roll back; keep its original file
+associated with that child until state and required history are confirmed, so an
+intervening `get_state` cannot make resume start a second writer. Failed refreshes
+retain that association until child exit. Keep synchronization on actual child
+acknowledgements, not the HTTP request's promise; no polling or switch-specific
+notifications.
 
 Focused checks: `npm run typecheck`, then `tsc -p tsconfig.server.json` and
 `node --test test/pi-rpc-session.test.ts test/live-session-manager.test.ts
  test/orchestration.test.ts test/http-routes.test.ts test/session-refresh.test.ts
- test/tree-navigate.test.ts`.
+ test/tree-navigate.test.ts test/input-synchronization.test.ts`.
+
+## Assistant activity blocks
+
+Consecutive assistant thinking, text and tool calls share one visual bubble in
+both live rendering and saved history. While working, collapsed blocks show only
+type labels; when finished their last item is the result, without stop-reason
+classification. Expansion reveals all eager DOM in chronological order. User
+messages and standalone compaction entries are boundaries; `turn_end` is only a
+tool-round boundary, not completion. Only `agent_end` finishes live activity.
+Compaction after `self_compact` finishes the preceding block and subsequent
+activity starts a fresh one. Live events are Pi 1.3's `compaction_start/end`
+(the summary is `result.summary`), not the removed `auto_compaction_*` events.
+No protocol or persisted UI state is involved. The session snapshot cache retains
+compaction `entry_appended` entries alongside messages so reconnects preserve
+boundaries. A client attaching during compaction may receive only its end event;
+that event must still create a standalone compaction item and split the blocks.
+Snapshots and live-tab indicators remain working through tool-round `turn_end`
+events and become idle only on `agent_end`.
+After compiling public TS, check `node --test test/history-render.test.ts
+ test/e2e/assistant-blocks.e2e.ts test/e2e/chat-layout.e2e.ts
+ test/e2e/history-render.e2e.ts`. Session event/cache regression:
+`node --test test/session-events.test.ts` after compiling server TS.
+
+## Taking a Herdr conversation
+
+Tau may itself be launched inside Herdr or a managed Pi worker. Its children
+must not inherit that terminal pane, nesting depth, target or control socket.
+Keep the Herdr server socket for discovery, set the frontend to web, and apply
+explicit per-child worker overrides only after clearing inherited identities.
+
+The tab-strip arrow and command palette send `/take herdr` to the current idle
+Pi child through authenticated `/api/rpc`, not through the composer. Pi-ant owns
+the source picker and takeover; Tau uses its ordinary RPC extension dialog.
+Drafts, attachments and browser queues must not be submitted or rewritten.
+Refuse a working tab, queued input or existing dialog before dispatch. Tau may
+acknowledge a prompt timeout before the picker finishes: only the child's actual
+forwarded response completes the action, after the server's authoritative snapshot
+broadcast. Do not fetch the same snapshot again. Apply a changed cwd to an open
+file browser; late completion must not change a tab selected while the picker was
+open. A handled
+command can still report an error through `ctx.ui.notify` or `extension_error`;
+keep structured takeover errors in the status bar through snapshot redraws,
+without interpreting notification prose.
+Browser regression: `node --test test/e2e/session-take.e2e.ts` after compiling
+public TS. It uses a fake backend, including an early HTTP acknowledgement.
 
 ## Live-tab links
 
@@ -93,6 +151,15 @@ started or refreshed live tab is ready. Unit/browser checks:
 `tsc -p tsconfig.public.json`. The focused browser test serves the compiled UI
 with a read-only fake backend and uses installed Chromium (`CHROMIUM_BINARY`
 can override it); no Pi children or inference.
+
+## Listeners and TLS
+
+The network listener is HTTPS only (`src/server/tls.ts` keeps a local CA and
+server certificate under `<agentDir>/tau/tls/`); plain HTTP binds only
+`127.0.0.1` for local orchestration and the published endpoint. Do not add an
+option to expose plain HTTP beyond loopback. Reissue server certificates with the
+existing CA so devices that trusted `ca.crt` keep working. Checks:
+`node --test test/tls.test.ts test/https.test.ts test/orchestration.test.ts`.
 
 ## Voice dictation
 

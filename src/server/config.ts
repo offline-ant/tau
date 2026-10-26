@@ -42,8 +42,12 @@ export function loadTauSettings(): TauSettings {
     settings = ((JSON.parse(fs.readFileSync(settingsPath, 'utf8')) as TauSettingsFile).tau || {});
   } catch {}
   return {
-    port: parseInt(String(ARGS.port || process.env.TAU_PORT || settings.port || '3001'), 10),
+    port: parseInt(String(ARGS.port || process.env.TAU_PORT || settings.port || '3443'), 10),
+    httpPort: parseInt(String(ARGS['http-port'] || process.env.TAU_HTTP_PORT || settings.httpPort || '3001'), 10),
     host: ARGS.host || process.env.TAU_HOST || settings.host || '0.0.0.0',
+    hostnames: process.env.TAU_HOSTNAMES !== undefined
+      ? process.env.TAU_HOSTNAMES.split(',').map((name) => name.trim()).filter(Boolean)
+      : settings.hostnames ?? [],
     user: process.env.TAU_USER ?? settings.user ?? DEFAULT_USER,
     pass: process.env.TAU_PASS ?? settings.pass ?? DEFAULT_PASS,
     authEnabled: settings.authEnabled,
@@ -54,8 +58,12 @@ export function loadTauSettings(): TauSettings {
 
 export const TAU_SETTINGS = loadTauSettings();
 export const AUTH_CONFIGURED = !!(TAU_SETTINGS.user && TAU_SETTINGS.pass);
+/** HTTPS port: the only listener reachable from the network. */
 export const PORT = TAU_SETTINGS.port;
 export const HOST = TAU_SETTINGS.host;
+/** Plain HTTP port, always bound to loopback, for local Pi orchestration. */
+export const HTTP_PORT = TAU_SETTINGS.httpPort;
+export const TLS_DIR = path.join(PI_AGENT_DIR, 'tau', 'tls');
 export const STATIC_DIR = process.env.TAU_STATIC_DIR || findPublicDir();
 
 function findPublicDir() {

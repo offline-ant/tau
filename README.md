@@ -69,12 +69,30 @@ npm install --global pi-tau-web-server
 pi-tau-web-server
 ```
 
-Open the printed URL (default `http://localhost:3001`). Click `+` in the tab bar or sidebar to create an in-page Tau tab, choose or type a project directory, optionally enter a Pi `/model`-style model string, then chat.
+Open the printed URL (default `https://localhost:3443`). Click `+` in the tab bar or sidebar to create an in-page Tau tab, choose or type a project directory, optionally enter a Pi `/model`-style model string, then chat.
 
 ```bash
-pi-tau-web-server --host 127.0.0.1 --port 3001 --open
-TAU_PORT=3001 TAU_HOST=0.0.0.0 TAU_PROJECTS_DIR="$HOME/projects" pi-tau-web-server
+pi-tau-web-server --host 127.0.0.1 --port 3443 --open
+TAU_PORT=3443 TAU_HOST=0.0.0.0 TAU_PROJECTS_DIR="$HOME/projects" pi-tau-web-server
 ```
+
+### HTTPS
+
+The network listener (`--host`/`--port`, default `0.0.0.0:3443`) always speaks
+HTTPS; browsers need a secure context for the microphone. Plain HTTP exists only
+on loopback (`127.0.0.1`, `--http-port`, default `3001`) for local Pi
+orchestration and is never reachable from the network. Both listeners share the
+same routes, WebSockets and authentication.
+
+On first start Tau creates a small local certificate authority under
+`<PI_CODING_AGENT_DIR>/tau/tls/` (directory `0700`, keys `0600`) and prints the
+path of its `ca.crt`. Install that file once as a trusted CA on each phone or
+browser to avoid certificate warnings. The server certificate (825 days, signed
+by that CA) covers `localhost`, the machine's host name, names listed in
+`hostnames`/`TAU_HOSTNAMES`, `127.0.0.1`, `::1` and every non-link-local
+interface address. It is reissued by the same CA at startup when those names or
+addresses change or expiry is within 30 days, so installed trust survives.
+Certificates are signed with the `openssl` CLI, which must be on `PATH`.
 
 ## Containers
 
@@ -91,7 +109,7 @@ Start an instance with credentials in the environment:
 
 ```bash
 TAU_USER=alice TAU_PASS='choose-a-password' \
-  container/tau-container run personal-workspace --port 3001
+  container/tau-container run personal-workspace --port 3443
 ```
 
 Missing credentials are prompted for, with the password input hidden. Start
@@ -99,7 +117,7 @@ additional isolated instances by giving each one a different name and host
 port:
 
 ```bash
-container/tau-container run work-workspace --port 3002
+container/tau-container run work-workspace --port 3444
 container/tau-container status
 container/tau-container logs work-workspace
 container/tau-container stop work-workspace
@@ -127,16 +145,19 @@ ${XDG_DATA_HOME:-$HOME/.local/share}/pi-tau-web-server/instances/<instance>/
 The host-side projects directory is `<instance>/projects/` beneath that path.
 Override the state root with `TAU_CONTAINER_STATE_DIR`.
 
-Ports bind to all host interfaces by default. HTTP Basic Auth does not encrypt
-credentials or traffic, so use a TLS reverse proxy for access from another
-machine. Pass `--bind 127.0.0.1` to restrict an instance to local access.
+Ports bind to all host interfaces by default and serve HTTPS with the
+instance's own certificate authority, stored in its state under
+`agent/tau/tls/ca.crt`. Pass `--bind 127.0.0.1` to restrict an instance to local
+access.
 
 ## Features
 
 ### Chat
 
 - Full markdown rendering with syntax-highlighted code blocks
-- Streaming responses with typing indicator
+- Assistant activity shares one bubble: while working, a growing list of step types (`thinking · bash · bash · text`); when finished, only the last item is shown. Click the list to reveal all steps in order. Long lists keep the latest eight labels with an earlier-step count.
+- Expanded blocks stream their full content; collapsed blocks show only activity labels until completion. User messages and context compaction stay separate; compaction starts a new block.
+- Expand/Collapse All Steps commands; thinking visibility also controls thinking labels.
 - Image attachments (paste, drag & drop, or button)
 - Copy any message with one click
 - Inline diff viewer for edit tool calls
@@ -144,9 +165,8 @@ machine. Pass `--bind 127.0.0.1` to restrict an instance to local access.
 - **Voice dictation** — tap the microphone to record, tap again to stop. The
   browser streams 16 kHz PCM to the authenticated `/ws/voice` socket; the final
   transcript is inserted once at the cursor and never sent. Switching or closing
-  the tab cancels. Browsers require HTTPS (or localhost) for the microphone; put
-  Tau behind any TLS proxy, e.g.
-  `caddy reverse-proxy --from https://<ip>:3443 --to http://127.0.0.1:3001 --internal-certs --disable-redirects`.
+  the tab cancels. Browsers require HTTPS (or localhost) for the microphone,
+  which Tau's network listener provides (see [HTTPS](#https)).
   The backend is read from `<PI_CODING_AGENT_DIR>/voice.json` at each recording:
   `{"backend":"claude"}` (default; Claude Code's subscription speech endpoint,
   using the pi-claude-agent default account's Claude login, never refreshed by
@@ -160,6 +180,7 @@ machine. Pass `--bind 127.0.0.1` to restrict an instance to local access.
 - Browser reload or reconnect restores live Tau tabs from the backend
 - Multiple browser clients see the same live session list
 - Historical sessions remain read-only
+- **Take from Herdr…** — use the arrow beside the Tau tabs or the command palette to select an idle Herdr conversation and load it into the current Tau tab. Requires pi-ant's `/take` command and an idle tab with no queued messages or pending dialogs. The existing RPC picker handles selection; drafts, attachments, and other tabs' queues stay untouched.
 - **Session tree and branching** — inspect the active session's full tree and jump to any earlier entry, mirroring Pi TUI's `/tree` behavior; choose a user message to restore it to the composer and create a new branch
 - **Live-tab links** — `/#session=<URL-encoded live-tab id>` selects an existing
   live tab after connection, or when the URL fragment changes. Links contain no
@@ -198,13 +219,14 @@ machine. Pass `--bind 127.0.0.1` to restrict an instance to local access.
 - Larger touch targets and font sizes optimized for mobile
 - Auto-reconnect WebSocket on return from background
 - Fullscreen by default on touch devices: entered on the first tap (browsers require a gesture); turning it off in Settings is remembered. iPhone Safari has no page fullscreen, so Settings suggests adding Tau to the Home Screen instead
+- The layout follows the visible viewport, so the composer and latest message stay above the on-screen keyboard, including in fullscreen where browsers do not resize the page
 - PWA: installable as a fullscreen app (standalone where fullscreen is unsupported, e.g. iOS)
 
 ### Themes
 
-Chat uses messenger-style bubbles: your messages on the right and agent replies on the left, each with a tail; tool cards stay full width.
+Chat uses messenger-style bubbles: your messages on the right and grouped agent activity on the left, each with a tail. Tool details live inside their assistant block.
 
-Six built-in themes: Dusk (clean neutral dark, default), Dawn (warm blue dark), Midnight (OLED black), Clean (Apple-style light with cyan-blue accents), Terracotta (warm light), Sage (warm olive-green). All with frosted glass header and input area.
+Seven built-in themes: Telegram (default: blue header, white agent bubbles, light blue user bubbles on a faint doodle wallpaper), Dusk (clean neutral dark), Dawn (warm blue dark), Midnight (OLED black), Clean (Apple-style light with cyan-blue accents), Terracotta (warm light), Sage (warm olive-green). Only an explicit choice in Settings is remembered; otherwise Telegram applies.
 
 ## Configuration
 
@@ -213,23 +235,26 @@ Six built-in themes: Dusk (clean neutral dark, default), Dawn (warm blue dark), 
 | Flag                                  |                                                  Description |
 | ------------------------------------- | -----------------------------------------------------------: |
 | `--open`                              |                 Open the URL in the default browser on start |
-| `--port` / `TAU_PORT`                 |                                Server port (default: `3001`) |
-| `--host` / `TAU_HOST`                 |                            Bind address (default: `0.0.0.0`) |
+| `--port` / `TAU_PORT`                 |                                 HTTPS port (default: `3443`) |
+| `--host` / `TAU_HOST`                 |                      HTTPS bind address (default: `0.0.0.0`) |
+| `--http-port` / `TAU_HTTP_PORT`       |               Loopback-only plain HTTP port (default: `3001`) |
 | `--projects-dir` / `TAU_PROJECTS_DIR` | Directory scanned for project chips in the new-session modal |
 
 ### Environment variables
 
 | Variable           |     Default |                                              Description |
 | ------------------ | ----------: | -------------------------------------------------------: |
-| `TAU_PORT`         |      `3001` |                                              Server port |
-| `TAU_HOST`         |   `0.0.0.0` |                                             Bind address |
+| `TAU_PORT`         |      `3443` |                                               HTTPS port |
+| `TAU_HOST`         |   `0.0.0.0` |                                       HTTPS bind address |
+| `TAU_HTTP_PORT`    |      `3001` |                            Loopback-only plain HTTP port |
+| `TAU_HOSTNAMES`    |    _(none)_ |      Comma-separated extra certificate/browser host names |
 | `TAU_PROJECTS_DIR` |    _(none)_ | Directory scanned for project chips in the new-tab modal |
 | `TAU_STATIC_DIR`   | _(bundled)_ |                               Override static files path |
 | `TAU_USER`         |        `rs` |                                 HTTP Basic Auth username |
 | `TAU_PASS`         |         `l` |                                 HTTP Basic Auth password |
 | `TAU_COOKIE_SECRET`| _(generated)_ |            Secret that signs session cookies (optional) |
 
-Tau also reads matching values from `~/.pi/agent/settings.json` under the `tau` key (`host`, `port`, `projectsDir`, `user`, `pass`, `authEnabled`, `cookieSecret`).
+Tau also reads matching values from `~/.pi/agent/settings.json` under the `tau` key (`host`, `port`, `httpPort`, `hostnames` (array), `projectsDir`, `user`, `pass`, `authEnabled`, `cookieSecret`).
 
 ### Authentication
 
@@ -275,10 +300,10 @@ Three pieces make that work:
   Resume restores the child's selected branch, not every abandoned branch in the file.
 - **Discovery.** While running, the server writes `~/.pi/agent/tau/server.json`
   (mode `0600`) containing its endpoint URL, with HTTP Basic credentials in the
-  URL userinfo when auth is configured, and credential-free `browserUrls` derived
-  from the actual listener address and local interfaces. A wildcard bind publishes
-  a loopback endpoint for local orchestration; `browserUrls` lists reachable
-  numeric addresses such as a WireGuard IP. A Pi session started anywhere on the
+  URL userinfo when auth is configured, and credential-free `browserUrls`. The
+  endpoint is always the loopback plain HTTP listener; `browserUrls` are HTTPS
+  origins derived from the actual HTTPS listener: configured `hostnames` first,
+  then reachable numeric addresses such as a WireGuard IP. A Pi session started anywhere on the
   machine can then select this server with `/orchestration-host web`. A second
   concurrent server does not overwrite the first one's record; target it with
   `PI_ORCHESTRATION_ENDPOINT`. Children tau spawns inherit

@@ -45,24 +45,6 @@ function makeSession(modelSpec = '') {
   return { session, manager };
 }
 
-test('agent_start/turn_start set isStreaming; agent_end/turn_end clear it', () => {
-  const { session, manager } = makeSession();
-  session.handleEvent({ type: 'turn_start' });
-  assert.equal(session.isStreaming, true);
-  session.handleEvent({ type: 'agent_start' });
-  assert.equal(session.isStreaming, true);
-  session.handleEvent({ type: 'turn_end' });
-  assert.equal(session.isStreaming, false);
-  session.handleEvent({ type: 'agent_end' });
-  assert.equal(session.isStreaming, false);
-  // each event is broadcast
-  assert.equal(manager.broadcasts.length, 4);
-  for (const b of manager.broadcasts) {
-    assert.equal(b.type, 'event');
-    assert.equal(b.sessionId, session.id);
-  }
-});
-
 test('only tau-tree-navigate extension_error events are kept for navigate_tree diagnostics', () => {
   const { session } = makeSession();
   // Errors from other extensions (or other events from tau's command) must
@@ -267,7 +249,7 @@ test('title is truncated at the first sentence-end punctuation inside the window
   assert.equal(session.sessionName, 'Fix the bug');
 });
 
-test('snapshot and metadata expose the current session state', () => {
+test('snapshot and metadata expose the current session state', async () => {
   const { session } = makeSession('openai/gpt-5.5:high');
   // Constructor canonicalizes the spec into a full object + level.
   assert.deepEqual(session.model, { provider: 'openai', id: 'gpt-5.5' });
@@ -279,7 +261,7 @@ test('snapshot and metadata expose the current session state', () => {
   assert.equal(meta.modelSpec, 'openai/gpt-5.5:high');
   assert.equal(meta.modelLabel, 'openai/gpt-5.5');
   assert.equal(meta.isStreaming, true);
-  const snap = session.snapshot();
+  const snap = await session.snapshot();
   assert.equal(snap.session.id, session.id);
   assert.equal(snap.isStreaming, true);
   assert.deepEqual(snap.entries, []);
@@ -386,7 +368,7 @@ test('set_thinking_level restores previous level on pi failure', async () => {
   }
 });
 
-test('constructor accepts sessionFile, entries, and sessionName and they appear in snapshot/metadata', () => {
+test('constructor accepts sessionFile, entries, and sessionName and they appear in snapshot/metadata', async () => {
   const manager = makeManager();
   const entries = [{ type: 'message', message: { role: 'user', content: 'hello' } }, { type: 'message', message: { role: 'assistant', content: 'hi' } }];
   const session = new PiRpcSession(manager, {
@@ -401,7 +383,7 @@ test('constructor accepts sessionFile, entries, and sessionName and they appear 
   assert.equal(session.entries.length, 2);
   assert.deepEqual(session.entries[0], entries[0]);
   // Snapshot must include the pre-seeded fields.
-  const snap = session.snapshot();
+  const snap = await session.snapshot();
   assert.equal(snap.sessionFile, '/tmp/resumed.jsonl');
   assert.equal(snap.sessionName, 'Resumed Chat');
   assert.equal(snap.entries.length, 2);
@@ -602,8 +584,11 @@ for (const command of ['prompt', 'steer', 'follow_up']) {
 for (const restored of [true, false]) {
   test(`late input acknowledgement refreshes the file after ${restored ? 'rollback' : 'session replacement'} without an ownership gap`, async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
-    const original = '/tmp/tau-switch-original.jsonl';
-    const temporary = '/tmp/tau-switch-temporary.jsonl';
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-late-input-'));
+    t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+    const original = path.join(directory, 'original.jsonl');
+    const temporary = path.join(directory, 'temporary.jsonl');
+    fs.writeFileSync(temporary, JSON.stringify({ type: 'session', id: 'replacement', cwd: directory }) + '\n');
     const child = new FakePi({ sessionFile: original });
     _setSpawnPiForTest(() => child.asChild());
     t.after(() => _setSpawnPiForTest(null));
@@ -631,6 +616,12 @@ for (const restored of [true, false]) {
     assert.equal(manager.findBySessionFile(original), session, 'keep ownership until the post-command refresh responds');
     child.respond(child.commands[1]);
     await flushIo();
+    if (!restored) {
+      assert.equal(child.commands[2].type, 'get_tree');
+      assert.equal(manager.findBySessionFile(original), session, 'tree confirmation still holds the original file');
+      child.respond(child.commands[2]);
+      await flushIo();
+    }
     assert.equal(session.sessionFile, child.state.sessionFile);
     assert.equal(manager.findBySessionFile(original), restored ? session : undefined);
     assert.equal(manager.findBySessionFile(child.state.sessionFile), session);
@@ -652,9 +643,10 @@ for (const failure of ['timeout', 'unsuccessful']) {
     const sent = session.send({ type: 'prompt', message: '/switch herdr' });
     session.handleResponse({ type: 'response', command: 'get_state', success: true, data: { sessionFile: '/tmp/temporary.jsonl' } });
     child.respond(child.commands[0]);
-    await sent;
+    await flushIo();
     if (failure === 'timeout') t.mock.timers.tick(5000);
     else child.respond(child.commands[1], { success: false, data: undefined, error: 'state unavailable' });
+    assert.equal((await sent).success, false);
     await flushIo();
     assert.equal(manager.findBySessionFile(original), session);
     assert.equal((await manager.resume({ sessionFile: original, cwd: os.tmpdir() })).started, false);

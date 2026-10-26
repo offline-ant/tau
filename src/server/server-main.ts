@@ -8,6 +8,7 @@
  */
 
 import http from 'node:http';
+import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -16,15 +17,18 @@ import { WebSocketServer, WebSocket } from 'ws';
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Stats, Dirent } from 'node:fs';
-import type { Socket } from 'node:net';
+import type { AddressInfo, Socket } from 'node:net';
+import type { TLSSocket } from 'node:tls';
 import type { WebSocket as WsType } from 'ws';
 import type { JsonRecord, RpcCommand, RpcResponse, StatusError } from './types.js';
-import { ARGS, AUTH_CONFIGURED, HOST, MIME_TYPES, PI_AGENT_DIR, PORT, SESSIONS_DIR, STATIC_DIR, TAU_SETTINGS, expandHome, loadTauSettings, parseArgs, saveTauSetting } from './config.js';
+import { ARGS, AUTH_CONFIGURED, HOST, HTTP_PORT, MIME_TYPES, PI_AGENT_DIR, PORT, SESSIONS_DIR, STATIC_DIR, TAU_SETTINGS, TLS_DIR, expandHome, loadTauSettings, parseArgs, saveTauSetting } from './config.js';
 import { SESSION_COOKIE_NAME, SESSION_REFRESH_THRESHOLD_SECONDS, buildSessionCookie, issueSessionToken, parseCookies, verifySessionToken } from './auth.js';
 import { getAvailableModels, modelLabel, normalizeModel, parseModelSpecToModel, parsePiListModels, _clearModelListCacheForTest, _setExecFileForTest } from './model-utils.js';
 import { LiveSessionManager, PiRpcSession, SessionLifecycleError, isGenericSessionName, liveManager, makeId, _setSpawnPiForTest } from './sessions.js';
+import { readSessionHeader } from './session-header.js';
 import { buildEndpoint, orchestrationEndpoint, publishEndpoint, unpublishEndpoint } from './orchestration.js';
 import { sessionOwner, sessionOwners } from './session-owners.js';
+import { ensureTlsCertificate } from './tls.js';
 import { MAX_FRAME_BYTES, VOICE_PATH, configuredTranscriber, handleVoiceSocket } from './voice.js';
 import { NAVIGATE_COMMAND, NAVIGATION_MARKER_TYPE, flattenTree, isTreeNavigationInProgress, leafDescendsFrom, navigateTree, pathFromRoot, selectNavigationTarget } from './tree.js';
 
@@ -58,8 +62,9 @@ function checkAuth(req: IncomingMessage): AuthResult {
   return { ok: false, via: 'none' };
 }
 
-function isForwardedHttps(req: IncomingMessage): boolean {
-  return String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
+function isHttpsRequest(req: IncomingMessage): boolean {
+  return (req.socket as TLSSocket).encrypted === true
+    || String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
 }
 
 // Mint when the request carries no valid session cookie (covers the page load
@@ -78,7 +83,7 @@ function maybeSetSessionCookie(req: IncomingMessage, res: ServerResponse, auth: 
     }
   }
   if (expiresAt !== undefined && expiresAt - Math.floor(Date.now() / 1000) >= SESSION_REFRESH_THRESHOLD_SECONDS) return;
-  res.setHeader('Set-Cookie', buildSessionCookie(issueSessionToken(), { secure: isForwardedHttps(req) }));
+  res.setHeader('Set-Cookie', buildSessionCookie(issueSessionToken(), { secure: isHttpsRequest(req) }));
 }
 
 function errorMessage(e: unknown): string {
@@ -98,7 +103,7 @@ function sendAuthRequired(res: ServerResponse, req?: IncomingMessage) {
   // Clear a presented-but-invalid session cookie so the browser stops
   // resending it and falls back to the Basic prompt.
   if (req && parseCookies(req.headers.cookie)[SESSION_COOKIE_NAME]) {
-    res.setHeader('Set-Cookie', buildSessionCookie('', { secure: isForwardedHttps(req), clear: true }));
+    res.setHeader('Set-Cookie', buildSessionCookie('', { secure: isHttpsRequest(req), clear: true }));
   }
   res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Tau"', 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Unauthorized' }));
@@ -320,7 +325,7 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
     });
   }
   if (cmd === 'get_messages') return success({ entries: session.entries });
-  if (cmd === 'live_session_snapshot_request') return { type: 'live_session_snapshot', sessionId: session.id, ...session.snapshot() };
+  if (cmd === 'live_session_snapshot_request') return { type: 'live_session_snapshot', sessionId: session.id, ...await session.snapshot() };
   if (cmd === 'set_auto_compaction') return success({ enabled: !!command.enabled });
 
   const native = new Set(['prompt', 'steer', 'follow_up', 'abort', 'compact', 'set_model', 'cycle_model', 'set_thinking_level', 'cycle_thinking_level', 'get_session_stats', 'get_tree', 'get_entries', 'extension_ui_response']);
@@ -500,7 +505,13 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
     const session = liveManager.get(id);
     if (!session) return json(res, 404, { error: 'Live session not found' });
     const isSnapshotRoute = cleanPath.endsWith('/snapshot');
-    if (isSnapshotRoute && req.method === 'GET') return json(res, 200, session.snapshot());
+    if (isSnapshotRoute && req.method === 'GET') {
+      session.snapshot().then(
+        (snapshot) => json(res, 200, snapshot),
+        (error: unknown) => json(res, 503, { error: errorMessage(error) }),
+      );
+      return;
+    }
     if (!isSnapshotRoute && req.method === 'DELETE') {
       liveManager.delete(id, 'closed_by_user').then(
         () => json(res, 200, { success: true }),
@@ -622,25 +633,8 @@ function titleFromMessageContent(content: unknown) {
 }
 
 function readSessionHeaderCwd(filePath: string) {
-  let fd: number | null = null;
-  try {
-    fd = fs.openSync(filePath, 'r');
-    const buffer = Buffer.alloc(64 * 1024);
-    const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, 0);
-    const text = buffer.toString('utf8', 0, bytesRead);
-    for (const line of text.split(/\r?\n/)) {
-      if (!line.trim()) continue;
-      const entry = JSON.parse(line);
-      if (entry?.type === 'session') return normalizeSessionCwd(entry.cwd);
-    }
-  } catch {
-    return null;
-  } finally {
-    if (fd !== null) {
-      try { fs.closeSync(fd); } catch {}
-    }
-  }
-  return null;
+  try { return readSessionHeader(filePath).cwd; }
+  catch { return null; }
 }
 
 function serveProjectsList(res: ServerResponse) {
@@ -927,15 +921,18 @@ function computeUrls(port: number) {
     }
     for (const name of Object.keys(nets)) for (const net of nets[name] || []) if (net.family === 'IPv4' && !net.internal && net.address.startsWith('100.')) tailscaleIp = net.address;
   }
-  lanUrl = `http://${localIp}:${port}`;
-  tailscaleUrl = tailscaleIp ? `http://${tailscaleIp}:${port}` : '';
+  lanUrl = `https://${localIp}:${port}`;
+  tailscaleUrl = tailscaleIp ? `https://${tailscaleIp}:${port}` : '';
 }
 
+// Plain HTTP serves only loopback (local Pi orchestration); the network listener
+// is HTTPS, created at startup once its certificate exists. Both share handlers.
 const server = http.createServer(serveStaticFile);
+let httpsServer: https.Server | null = null;
 const wss = new WebSocketServer({ noServer: true });
 const voiceWss = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_BYTES });
 
-server.on('upgrade', (request: IncomingMessage, socket: Socket, head: Buffer) => {
+function handleUpgrade(request: IncomingMessage, socket: Socket, head: Buffer) {
   if (!isAllowedApiOrigin(request)) {
     socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
     socket.destroy();
@@ -949,7 +946,8 @@ server.on('upgrade', (request: IncomingMessage, socket: Socket, head: Buffer) =>
   if (request.url === '/ws') wss.handleUpgrade(request, socket, head, (ws: TauWs) => wss.emit('connection', ws, request));
   else if (request.url === VOICE_PATH) voiceWss.handleUpgrade(request, socket, head, (ws) => handleVoiceSocket(ws, configuredTranscriber(PI_AGENT_DIR)));
   else socket.destroy();
-});
+}
+server.on('upgrade', handleUpgrade);
 
 wss.on('connection', (ws: TauWs) => {
   liveManager.addClient(ws);
@@ -978,26 +976,35 @@ setInterval(() => {
   }
 }, 20000).unref();
 
-function listen(port: number, attemptsLeft = 10) {
-  server.once('error', (err: NodeJS.ErrnoException) => {
-    if (err.code === 'EADDRINUSE' && attemptsLeft > 0) {
-      console.log(`[Tau] Port ${port} in use, trying ${port + 1}...`);
-      server.removeAllListeners('error');
-      listen(port + 1, attemptsLeft - 1);
-    } else {
-      console.error(`[Tau] Failed to start: ${err.message}`);
-      process.exit(1);
-    }
+function listenOn(target: http.Server, port: number, host: string, attemptsLeft = 10): Promise<AddressInfo> {
+  return new Promise((resolve, reject) => {
+    const onError = (err: NodeJS.ErrnoException) => {
+      if (err.code === 'EADDRINUSE' && port !== 0 && attemptsLeft > 0) {
+        console.log(`[Tau] Port ${port} in use, trying ${port + 1}...`);
+        resolve(listenOn(target, port + 1, host, attemptsLeft - 1));
+      } else reject(err);
+    };
+    target.once('error', onError);
+    target.listen(port, host, () => {
+      target.off('error', onError);
+      resolve(target.address() as AddressInfo);
+    });
   });
-  server.listen(port, HOST, () => {
-    computeUrls(port);
-    const actual = server.address();
-    if (actual && typeof actual === 'object') publishEndpoint(actual.port, actual.address);
-    else publishEndpoint(port);
-    console.log(`[Tau] Server running on ${lanUrl}${tailscaleUrl ? `  •  Tailscale: ${tailscaleUrl}` : ''}`);
-    console.log(`[Tau] Static assets: ${STATIC_DIR}`);
-    if (ARGS.open) openUrl(lanUrl).catch(() => {});
-  });
+}
+
+async function listen() {
+  const tls = ensureTlsCertificate(TLS_DIR, TAU_SETTINGS.hostnames);
+  httpsServer = https.createServer({ key: tls.key, cert: tls.cert }, serveStaticFile);
+  httpsServer.on('upgrade', handleUpgrade);
+  const local = await listenOn(server, HTTP_PORT, '127.0.0.1');
+  const secure = await listenOn(httpsServer, PORT, HOST);
+  computeUrls(secure.port);
+  publishEndpoint(local.port, secure.port, secure.address);
+  console.log(`[Tau] Server running on ${lanUrl}${tailscaleUrl ? `  •  Tailscale: ${tailscaleUrl}` : ''}`);
+  console.log(`[Tau] Local orchestration (loopback HTTP): http://127.0.0.1:${local.port}`);
+  console.log(`[Tau] TLS certificate authority (trust it once on other devices): ${tls.caFile}`);
+  console.log(`[Tau] Static assets: ${STATIC_DIR}`);
+  if (ARGS.open) openUrl(lanUrl).catch(() => {});
 }
 
 let shuttingDown = false;
@@ -1014,6 +1021,7 @@ async function shutdown(signal: string) {
     exitCode = 1;
     console.error(`[Tau] Child cleanup failed: ${errorMessage(error)}`);
   }
+  httpsServer?.close();
   server.close(() => process.exit(exitCode));
   setTimeout(() => process.exit(exitCode), 2500).unref();
 }
@@ -1028,7 +1036,10 @@ function startCli() {
   });
   process.on('uncaughtException', (err) => { console.error(err); shutdown('uncaughtException'); });
   process.on('unhandledRejection', (err) => { console.error(err); });
-  listen(PORT);
+  listen().catch((err: unknown) => {
+    console.error(`[Tau] Failed to start: ${errorMessage(err)}`);
+    process.exit(1);
+  });
 }
 
 // Test-only helper to reset module-level auth state between cases.

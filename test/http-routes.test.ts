@@ -53,7 +53,7 @@ interface FakeHttpSession {
   sessionName: string | null;
   contextUsage: { tokens?: number; usage?: { input_tokens: number; output_tokens: number } } | null;
   metadata: () => { id: string; cwd: string; model: string; isStreaming: boolean; sessionFile: string };
-  snapshot: () => { session: { id: string }; entries: unknown[]; model: string; isStreaming: boolean; sessionFile: string };
+  snapshot: () => Promise<{ session: { id: string }; entries: unknown[]; model: string; isStreaming: boolean; sessionFile: string }>;
   terminate: () => Promise<void>;
 }
 
@@ -69,7 +69,7 @@ function fakeSession(id: string): FakeHttpSession {
     sessionName: null,
     contextUsage: null,
     metadata: () => ({ id, cwd: '/tmp/proj', model: 'openai/gpt-5.5', isStreaming: false, sessionFile: `/tmp/${id}.jsonl` }),
-    snapshot: () => ({ session: { id }, entries: [], model: 'openai/gpt-5.5', isStreaming: false, sessionFile: `/tmp/${id}.jsonl` }),
+    snapshot: async () => ({ session: { id }, entries: [], model: 'openai/gpt-5.5', isStreaming: false, sessionFile: `/tmp/${id}.jsonl` }),
     terminate: async () => {},
   };
 }
@@ -122,7 +122,7 @@ test('GET /api/health reports server health and live session count', async () =>
   assert.equal(body.status, 'ok');
   assert.equal(body.role, 'rpc-session-manager');
   assert.equal(body.liveSessionCount, 1);
-  assert.match(body.lanUrl, /^http:\/\/localhost:\d+$/);
+  assert.match(body.lanUrl, /^https:\/\/localhost:\d+$/);
 });
 
 test('GET /api/live-sessions lists managed sessions', async () => {

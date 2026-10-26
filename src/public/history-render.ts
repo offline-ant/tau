@@ -1,27 +1,11 @@
-/**
- * History render pre-pass — pure, DOM-free.
- *
- * Turns a session's raw history entries into a flat list of renderable items
- * before any DOM work happens. The key transform: toolResult entries are
- * paired onto their originating toolCall item here, so a toolCall item is
- * self-contained. That lets the renderer draw history in any order (newest
- * chunk first, older chunks later) without ever orphaning a tool result whose
- * card lives in a chunk that has not been rendered yet.
- */
-
-import type { AppMessage, MessageContentBlock, UsageRecord } from './app-types.js';
+/** Pure history pre-pass. Tool results stay attached to their calls. */
+import type { AppMessage, AssistantStep, MessageContentBlock, UsageRecord } from './app-types.js';
 import type { ToolResult } from './tool-card.js';
 
-export type SessionHistoryEntry = { type?: string; message?: AppMessage; usage?: UsageRecord };
-
+export type SessionHistoryEntry = { type?: string; message?: AppMessage; usage?: UsageRecord; summary?: string };
 export type HistoryImage = { data: string; mimeType: string };
-
 export type HistoryUserItem = { kind: 'user'; content: string; images?: HistoryImage[] };
-export type HistoryAssistantItem = {
-  kind: 'assistant';
-  content: MessageContentBlock[] | string;
-  usage?: UsageRecord;
-};
+export type HistoryAssistantItem = { kind: 'assistant'; step: AssistantStep };
 export type HistoryToolCallItem = {
   kind: 'toolCall';
   toolCallId: string;
@@ -30,9 +14,7 @@ export type HistoryToolCallItem = {
   result?: ToolResult;
   isError?: boolean;
 };
-
-export type HistoryItem = HistoryUserItem | HistoryAssistantItem | HistoryToolCallItem;
-
+export type HistoryItem = HistoryUserItem | HistoryAssistantItem | HistoryToolCallItem | { kind: 'compaction'; summary?: string };
 export type HistoryBuildResult = {
   items: HistoryItem[];
   totalCost: number;
@@ -48,68 +30,39 @@ export function buildHistoryItems(entries: SessionHistoryEntry[]): HistoryBuildR
   let lastUsage: UsageRecord | null = null;
 
   for (const entry of entries) {
-    // Usage outside the conversation (e.g. cache warming) costs money but is
-    // neither displayed nor a measure of the context size.
+    if (entry.type === 'compaction') {
+      items.push({ kind: 'compaction', summary: entry.summary });
+    }
     if (entry.type === 'usage') totalCost += entry.usage?.cost?.total || 0;
     if (entry.type !== 'message') continue;
-
     const msg = entry.message;
     if (!msg) continue;
 
     if (msg.role === 'user') {
-      const content =
-        typeof msg.content === 'string'
-          ? msg.content
-          : (msg.content || [])
-              .filter((b) => b.type === 'text')
-              .map((b) => b.text)
-              .join('\n');
-      const images = Array.isArray(msg.content)
-        ? msg.content
-            .filter((b) => b.type === 'image')
-            .map((b) => ({ data: b.source?.data || b.data || '', mimeType: b.source?.media_type || b.media_type || 'image/png' }))
-        : [];
-      if (content || images.length > 0) {
-        items.push({ kind: 'user', content: content || '', images: images.length > 0 ? images : undefined });
-      }
+      const content = typeof msg.content === 'string' ? msg.content
+        : (msg.content || []).filter(block => block.type === 'text').map(block => block.text).join('\n');
+      const images = Array.isArray(msg.content) ? msg.content.filter(block => block.type === 'image')
+        .map(block => ({ data: block.source?.data || block.data || '', mimeType: block.source?.media_type || block.media_type || 'image/png' })) : [];
+      if (content || images.length) items.push({ kind: 'user', content, images: images.length ? images : undefined });
     } else if (msg.role === 'assistant') {
-      const blocks = (msg.content as MessageContentBlock[]) || [];
-      const textBlocks = blocks.filter((b) => b.type === 'text');
-      const thinkingBlocks = blocks.filter((b) => b.type === 'thinking');
-      const contentBlocks = blocks.filter((b) => b.type === 'text' || b.type === 'thinking');
-      const text = textBlocks.map((b) => b.text).join('\n');
-
-      if (text || thinkingBlocks.length > 0) {
-        items.push({
-          kind: 'assistant',
-          content: contentBlocks.length > 0 ? contentBlocks : text,
-          usage: msg.usage,
-        });
-
-        if (msg.usage?.cost?.total) {
-          totalCost += msg.usage.cost.total;
-        }
-        if (msg.usage?.input) {
-          lastInputTokens = msg.usage.input + (msg.usage.cacheRead || 0);
-          lastUsage = msg.usage;
-        }
+      // Usage belongs to the message, not each visual step within it.
+      totalCost += msg.usage?.cost?.total || 0;
+      if (msg.usage?.input) {
+        lastInputTokens = msg.usage.input + (msg.usage.cacheRead || 0);
+        lastUsage = msg.usage;
       }
-
-      for (const tc of blocks) {
-        if (tc.type !== 'toolCall') continue;
-        const item: HistoryToolCallItem = {
-          kind: 'toolCall',
-          toolCallId: String(tc.id || ''),
-          toolName: String(tc.name || ''),
-          args: tc.arguments || {},
-        };
-        items.push(item);
-        toolCallItems.set(item.toolCallId, item);
+      for (const block of (msg.content as MessageContentBlock[]) || []) {
+        if (block.type === 'text' || block.type === 'thinking') {
+          items.push({ kind: 'assistant', step: { type: block.type, text: block.type === 'thinking' ? block.thinking || '' : block.text || '' } });
+        } else if (block.type === 'toolCall') {
+          const item: HistoryToolCallItem = {
+            kind: 'toolCall', toolCallId: block.id || '', toolName: block.name || '', args: block.arguments || {},
+          };
+          items.push(item);
+          toolCallItems.set(item.toolCallId, item);
+        }
       }
     } else if (msg.role === 'toolResult') {
-      // Attach the result to its toolCall item instead of emitting an item of
-      // its own; unmatched results are dropped, matching the old behavior of
-      // addHistoryResult() silently ignoring unknown toolCallIds.
       const item = toolCallItems.get(msg.toolCallId ?? '');
       if (item) {
         item.result = { content: (msg.content as MessageContentBlock[]) || [] };
@@ -117,6 +70,5 @@ export function buildHistoryItems(entries: SessionHistoryEntry[]): HistoryBuildR
       }
     }
   }
-
   return { items, totalCost, lastInputTokens, lastUsage };
 }
