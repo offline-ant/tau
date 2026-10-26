@@ -179,7 +179,7 @@ test('Expand All Tools also expands cards rendered by later history chunks', asy
   );
 
   const cardState = await page.evaluate(() => {
-    const cards = Array.from(document.querySelectorAll('#messages > .tool-card'));
+    const cards = Array.from(document.querySelectorAll('#messages .assistant-block .tool-card'));
     return {
       total: cards.length,
       expanded: cards.filter((card) => card.querySelector('.tool-card-body')?.classList.contains('expanded')).length,

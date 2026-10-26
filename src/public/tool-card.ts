@@ -282,13 +282,15 @@ export class ToolCardRenderer {
   private bottomScrollFrame: number | undefined;
   private bottomScrollTop: number | undefined;
 
-  constructor(container: HTMLElement) {
+  // Grouped activity controls step visibility; tool bodies stay readable by
+  // default, while nested-call lists/details retain their independent toggles.
+  constructor(container: HTMLElement, private groupedActivity = false) {
     this.container = container;
     this.toolCards = new Map(); // toolCallId -> element
     this.historyCardsExpanded = false;
   }
 
-  createToolCard(toolExecution: ToolExecution) {
+  createToolCard(toolExecution: ToolExecution, target: ParentNode = this.container) {
     const { toolCallId, toolName, args, status } = toolExecution;
     const id = String(toolCallId || '');
     this.rememberRoot(toolExecution);
@@ -300,7 +302,7 @@ export class ToolCardRenderer {
     card.dataset.toolCallId = String(toolCallId || '');
 
     const argsPreview = this.getArgsPreview(String(toolName || ''), args);
-    const isExpanded = this.allChoice ?? (status === 'streaming' || status === 'pending');
+    const isExpanded = this.allChoice ?? (this.groupedActivity || status === 'streaming' || status === 'pending');
 
     card.innerHTML = `
       <div class="tool-card-header">
@@ -325,7 +327,7 @@ export class ToolCardRenderer {
     const argumentsEl = this.renderArguments(toolName || '', args);
     if (argumentsEl) body.insertBefore(argumentsEl, body.firstChild);
 
-    this.container.appendChild(card);
+    target.appendChild(card);
     this.toolCards.set(id, card);
     this.bindHeader(id, card);
     this.renderNestedCalls(id);
@@ -383,7 +385,7 @@ export class ToolCardRenderer {
 
     this.nestedCalls.finish(toolCallId);
     const summary = this.nestedCalls.get(toolCallId);
-    if (!isError && this.isClean(summary) && this.choice(toolCallId).body === undefined) {
+    if (!this.groupedActivity && !isError && this.isClean(summary) && this.choice(toolCallId).body === undefined) {
       this.setBodyExpanded(card, false);
     }
     this.renderNestedCalls(toolCallId);
@@ -480,6 +482,7 @@ export class ToolCardRenderer {
     target.appendChild(card);
     this.toolCards.set(id, card);
     this.bindHeader(id, card);
+    if (this.groupedActivity && this.choice(id).body === undefined) this.setBodyExpanded(card, true);
     this.renderNestedCalls(id);
 
     return card;
@@ -539,6 +542,7 @@ export class ToolCardRenderer {
     }
     if (result.nestedCalls) this.nestedCalls.replace(toolCallId, result.nestedCalls);
     this.finalizeToolCard(toolCallId, result, isError);
+    return this.toolCards.get(toolCallId);
   }
 
   settleNestedCalls() {
@@ -727,9 +731,9 @@ export class ToolCardRenderer {
     const status = card.querySelector('.tool-status')?.textContent;
     const completed = status === 'complete' || status === 'error';
     const clean = completed && status === 'complete' && this.isClean(summary);
-    const autoOpen = !history && !clean;
+    const autoOpen = this.groupedActivity || (!history && !clean);
     const choice = this.choice(id);
-    const open = choice.calls ?? (history ? this.historyCardsExpanded : autoOpen);
+    const open = choice.calls ?? (history ? this.historyCardsExpanded : !clean);
     view.toggle.setAttribute('aria-expanded', String(open));
     view.list.hidden = !open;
     view.notice.hidden = !open || !view.notice.textContent;
@@ -755,12 +759,8 @@ export class ToolCardRenderer {
     if (args.command) return String(args.command).substring(0, 80);
     if (args.query) return String(args.query).substring(0, 60);
     if (args.url) return String(args.url);
-
-    // Fallback: first string value
-    for (const val of Object.values(args)) {
-      if (typeof val === 'string' && val.length > 0) {
-        return val.substring(0, 60);
-      }
+    for (const value of Object.values(args)) {
+      if (typeof value === 'string' && value.length) return value.substring(0, 60);
     }
     return '';
   }

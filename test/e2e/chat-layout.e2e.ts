@@ -7,7 +7,8 @@ import { after, before, test } from 'node:test';
 import { chromium, type Browser, type BrowserContext, type BrowserContextOptions, type Page } from 'playwright';
 import { WebSocketServer, type WebSocket } from 'ws';
 
-// Chat bubble layout and the mobile fullscreen default, against the compiled
+// Chat bubble layout, the default theme, the mobile fullscreen default and the
+// on-screen keyboard layout, against the compiled
 // UI with a read-only fake backend (no Pi subprocess or inference). Set
 // TAU_E2E_SCREENSHOTS=<dir> to also save screenshots of the layouts.
 const publicDir = fileURLToPath(new URL('../../public/', import.meta.url));
@@ -87,19 +88,20 @@ after(async () => {
 const mobile: BrowserContextOptions = { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 };
 const desktop: BrowserContextOptions = { viewport: { width: 1100, height: 800 } };
 
-async function open(options: BrowserContextOptions, theme?: string) {
+async function open(options: BrowserContextOptions, theme?: string, init?: () => void) {
   const context = await browser.newContext({ ...options, serviceWorkers: 'block' });
   contexts.add(context);
   await context.addInitScript(saved => {
     localStorage.setItem('tau-active-live-session-id', 'chat');
-    if (saved && localStorage.getItem('tau-theme') === null) localStorage.setItem('tau-theme', saved);
+    if (saved && localStorage.getItem('tau-theme-choice') === null) localStorage.setItem('tau-theme-choice', saved);
   }, theme ?? '');
+  if (init) await context.addInitScript(init);
   const page = await context.newPage();
   const errors: string[] = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.goto(base + '/');
   await page.waitForSelector('.message.assistant >> text=Fixed.');
-  await page.waitForSelector('.tool-card');
+  await page.waitForSelector('.tool-card', { state: 'attached' });
   return { page, errors, async close() { await context.close(); contexts.delete(context); } };
 }
 
@@ -118,7 +120,7 @@ async function bubbles(page: Page) {
         background: getComputedStyle(content).backgroundColor,
         tail: tail.content !== 'none' ? tail.backgroundColor : null,
         tailSide: tail.content !== 'none' ? (tail.left.startsWith('-') ? 'left' : 'right') : null,
-        // History rows use content-visibility, which clips paint to the row.
+        // The tail stays inside the outer row.
         tailRoom: element.classList.contains('user') ? row.right - box.right : box.left - row.left,
         tailWidth: parseFloat(tail.width),
       };
@@ -127,13 +129,13 @@ async function bubbles(page: Page) {
 }
 
 for (const [name, options] of [['desktop', desktop], ['mobile', mobile]] as const) {
-  for (const theme of ['night', 'clean']) {
+  for (const theme of ['telegram', 'night', 'clean']) {
     test(`${name} ${theme}: user bubbles sit right with a right tail, agent bubbles left with a left tail`, async () => {
       const view = await open(options, theme);
       try {
         if (screenshots) await view.page.screenshot({ path: path.join(screenshots, `chat-${name}-${theme}.png`) });
         const found = await bubbles(view.page);
-        assert.deepEqual(found.map(bubble => bubble.role), ['user', 'assistant', 'assistant', 'user', 'assistant']);
+        assert.deepEqual(found.map(bubble => bubble.role), ['user', 'assistant', 'user', 'assistant']);
         for (const bubble of found) {
           assert.notEqual(bubble.background, 'rgba(0, 0, 0, 0)', `${bubble.role} bubble has a background`);
           assert.equal(bubble.tail, bubble.background, `${bubble.role} tail matches its bubble`);
@@ -147,22 +149,6 @@ for (const [name, options] of [['desktop', desktop], ['mobile', mobile]] as cons
     });
   }
 }
-
-test('thinking-only agent bubbles disappear when thinking is hidden', async () => {
-  const view = await open(desktop);
-  try {
-    await view.page.evaluate(() => {
-      const messages = document.getElementById('messages')!;
-      const only = document.createElement('div');
-      only.className = 'message assistant thinking-only-probe';
-      only.innerHTML = '<div class="message-content"><div class="thinking-block">t</div></div>';
-      messages.appendChild(only);
-      document.body.classList.add('hide-thinking');
-    });
-    assert.equal(await view.page.isVisible('.thinking-only-probe'), false);
-    assert.equal(await view.page.isVisible('.message.assistant >> text=Fixed.'), true);
-  } finally { await view.close(); }
-});
 
 async function fullscreen(page: Page) {
   return page.evaluate(() => Boolean(document.fullscreenElement));
@@ -197,5 +183,66 @@ test('desktop keeps fullscreen off by default', async () => {
     assert.equal(await toggle(view.page), false);
     await view.page.click('#messages');
     assert.equal(await fullscreen(view.page), false);
+  } finally { await view.close(); }
+});
+
+test('the Telegram theme is the default: blue header, patterned chat, light blue user bubbles', async () => {
+  const view = await open(desktop);
+  try {
+    const found = await view.page.evaluate(() => ({
+      theme: document.documentElement.dataset.theme,
+      scheme: getComputedStyle(document.documentElement).colorScheme,
+      header: getComputedStyle(document.querySelector('.header')!).backgroundColor,
+      wallpaper: getComputedStyle(document.getElementById('messages')!).backgroundImage,
+      user: getComputedStyle(document.querySelector('.message.user .message-content')!).backgroundColor,
+      agent: getComputedStyle(document.querySelector('.message.assistant .message-content')!).backgroundColor,
+    }));
+    assert.deepEqual(found, {
+      theme: 'telegram', scheme: 'light', header: 'rgb(51, 144, 236)',
+      wallpaper: found.wallpaper.startsWith('url("data:image/svg+xml') ? found.wallpaper : 'svg wallpaper',
+      user: 'rgb(215, 235, 253)', agent: 'rgb(255, 255, 255)',
+    });
+  } finally { await view.close(); }
+});
+
+// A keyboard that shrinks only the visual viewport, as Chrome does in
+// fullscreen: the layout viewport (innerHeight) keeps its full height.
+function fakeVisualViewport() {
+  const viewport = Object.assign(new EventTarget(), { width: innerWidth, height: innerHeight, offsetTop: 0, offsetLeft: 0, pageTop: 0, pageLeft: 0, scale: 1 });
+  Object.defineProperty(window, 'visualViewport', { configurable: true, get: () => viewport });
+}
+
+test('mobile keyboard: the composer and latest message stay above a keyboard covering the layout', async () => {
+  const view = await open(mobile, undefined, fakeVisualViewport);
+  try {
+    await view.page.tap('#message-input');
+    const keyboard = (height: number, offsetTop: number) => view.page.evaluate(([height, offsetTop]) => {
+      const viewport = window.visualViewport as unknown as EventTarget & { height: number; offsetTop: number };
+      Object.assign(viewport, { height, offsetTop });
+      viewport.dispatchEvent(new Event('resize'));
+    }, [height, offsetTop]);
+    const layout = () => view.page.evaluate(() => {
+      const input = document.querySelector('.input-area')!.getBoundingClientRect();
+      const last = [...document.querySelectorAll('#messages .message')].at(-1)!.getBoundingClientRect();
+      return { innerHeight, inputTop: input.top, inputBottom: input.bottom, lastBottom: last.bottom };
+    });
+    const height = mobile.viewport!.height;
+    await keyboard(height - 336, 0);
+    let found = await layout();
+    if (screenshots) await view.page.screenshot({ path: path.join(screenshots, 'chat-mobile-keyboard.png') });
+    assert.equal(found.innerHeight, height, 'the layout viewport keeps its height');
+    assert.ok(Math.abs(found.inputBottom - (height - 336)) < 1, `composer ends at the keyboard (${found.inputBottom})`);
+    assert.ok(found.lastBottom > 0 && found.lastBottom <= found.inputTop + 1, 'latest message is visible above the composer');
+    assert.equal(await view.page.evaluate(() => document.activeElement?.id), 'message-input');
+
+    await keyboard(height - 336, 120); // browser panned the visual viewport
+    found = await layout();
+    assert.ok(Math.abs(found.inputBottom - (height - 216)) < 1, `composer follows the panned viewport (${found.inputBottom})`);
+
+    await keyboard(height, 0);
+    found = await layout();
+    assert.ok(Math.abs(found.inputBottom - height) < 1, 'composer returns to the bottom without the keyboard');
+    assert.ok(found.lastBottom > 0 && found.lastBottom <= found.inputTop + 1, 'latest message is visible above the composer');
+    assert.deepEqual(view.errors, []);
   } finally { await view.close(); }
 });

@@ -6,12 +6,13 @@ import { WebSocketClient } from './websocket-client.js';
 import { StateManager } from './state.js';
 import { clearSessionLinkHash, SessionLink } from './session-link.js';
 import { MessageRenderer } from './message-renderer.js';
-import { ToolCardRenderer, type ToolExecution, type ToolResult } from './tool-card.js';
+import { ToolCardRenderer, type ToolResult } from './tool-card.js';
 import { attachCompletionList } from './completion-list.js';
 import { modelMeta, modelRef, normalizeModelList, searchModels } from './model-match.js';
+import { AssistantBlocks } from './assistant-blocks.js';
 import { DialogHandler, type DialogRequest } from './dialogs.js';
 import { SessionSidebar, type SidebarSession } from './session-sidebar.js';
-import { themes, applyTheme, getCurrentTheme } from './themes.js';
+import { themes, applyTheme, chooseTheme, getCurrentTheme, type ThemeId } from './themes.js';
 import { FileBrowser, getFileIcon } from './file-browser.js';
 import { setupLauncherPanel } from './launcher-panel.js';
 import { setupModelPicker } from './model-picker.js';
@@ -22,7 +23,7 @@ import { setupSessionStatsCard, type SessionStats } from './session-stats-card.j
 import { isImeComposition } from './keyboard.js';
 import { buildHistoryItems, type HistoryItem, type SessionHistoryEntry } from './history-render.js';
 
-import type { AppEvent, AppMessage, ExtensionUIRequest, InteractionState, LiveInstance, LiveSession, MessageContentBlock, ModelRecord, PendingDialog, PendingFilePath, PendingImage, QueuedCommand, RpcCommand, UsageRecord } from './app-types.js';
+import type { AppEvent, AppMessage, AssistantStep, ExtensionUIRequest, InteractionState, LiveInstance, LiveSession, MessageContentBlock, ModelRecord, PendingDialog, PendingFilePath, PendingImage, QueuedCommand, RpcCommand, UsageRecord } from './app-types.js';
 
 type LiveSessionSnapshotData = {
   sessionId?: string;
@@ -47,7 +48,7 @@ const state = new StateManager();
 // of <body>). A missing element means the page is structurally broken, so we
 // assert non-null at the query site rather than guarding every usage.
 const messageRenderer = new MessageRenderer(document.getElementById('messages')!);
-const toolCardRenderer = new ToolCardRenderer(document.getElementById('messages')!);
+const toolCardRenderer = new ToolCardRenderer(document.getElementById('messages')!, true);
 const dialogHandler = new DialogHandler(document.getElementById('dialog-container')!, {
   async send(command) {
     const response = await fetch('/api/rpc', {
@@ -57,6 +58,9 @@ const dialogHandler = new DialogHandler(document.getElementById('dialog-containe
     if (!response.ok || !data.success) throw new Error(data.error || 'Could not send response. Please retry.');
   },
 }, () => activeLiveSessionId);
+const assistantBlocks = new AssistantBlocks(document.getElementById('messages')!);
+const assistantBlockControllers = new Set([assistantBlocks]);
+let expandedAssistantBlocks = false;
 
 // Session sidebar
 const sidebar = new SessionSidebar(
@@ -173,13 +177,9 @@ const launcherPanel = setupLauncherPanel({
 });
 
 // State tracking
-let currentStreamingElement: HTMLElement | null = null;
-let currentStreamingText = '';
-let currentStreamingThinking = '';
-// A failed assistant reply is kept here until the whole turn settles. Pi may
-// still retry it, and an error the user never saw as final should not appear.
-type PendingAssistantError = { element: HTMLElement | null; errorMessage: string };
-let pendingAssistantError: PendingAssistantError | null = null;
+const currentMessageSteps = new Map<number, HTMLElement>();
+// A failed reply may still be replaced by Pi's retries before agent_settled.
+let pendingAssistantError: { errorMessage: string } | null = null;
 let retryStatusElement: HTMLElement | null = null;
 let sessionTotalCost = 0;
 let lastInputTokens = 0;
@@ -198,6 +198,7 @@ let liveInstances: LiveInstance[] = []; // Sidebar live indicators derived from 
 let liveSessions: LiveSession[] = [];
 let activeLiveSessionId = localStorage.getItem('tau-active-live-session-id') || null;
 let voiceInput: VoiceInput | null = null;
+let takeRequest: { id: string; sessionId: string } | null = null;
 let hasRestoredInitialLiveSession = false;
 const sessionLink = new SessionLink(location.hash);
 // A URL selects a view, not permission to submit that tab's queued input.
@@ -333,6 +334,29 @@ function scrollToBottom() {
   messagesContainer.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'smooth' });
 }
 
+// An on-screen keyboard shrinks only the visual viewport where the browser
+// does not resize the layout (Chrome in fullscreen, iOS Safari). Fit the app to
+// the visible area so the composer stays above the keyboard, keeping the latest
+// message in view. Pinch zoom also shrinks the visual viewport; ignore it.
+const visibleViewport = window.visualViewport;
+if (visibleViewport) {
+  const rootStyle = document.documentElement.style;
+  const fitVisibleViewport = () => {
+    const keepBottom = !isScrolledUp;
+    if (Math.abs(visibleViewport.scale - 1) < 0.01) {
+      rootStyle.setProperty('--visible-height', `${visibleViewport.height}px`);
+      rootStyle.setProperty('--visible-top', `${visibleViewport.offsetTop}px`);
+    } else {
+      rootStyle.removeProperty('--visible-height');
+      rootStyle.removeProperty('--visible-top');
+    }
+    if (keepBottom) messagesContainer.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'instant' });
+  };
+  visibleViewport.addEventListener('resize', fitVisibleViewport);
+  visibleViewport.addEventListener('scroll', fitVisibleViewport);
+  fitVisibleViewport();
+}
+
 function showNewMessageBadge() {
   if (isScrolledUp) {
     hasNewWhileScrolled = true;
@@ -356,6 +380,11 @@ wsClient.addEventListener('connected', () => {
 
 wsClient.addEventListener('disconnected', () => {
   updateConnectionStatus('disconnected');
+  if (takeRequest) {
+    takeRequest = null;
+    updateLiveSessionInputState();
+    flashStatusError('Connection lost during takeover. Reconnect and check the tab before trying again.', 8000);
+  }
 });
 
 wsClient.addEventListener('reconnectFailed', () => {
@@ -367,6 +396,21 @@ wsClient.addEventListener('rpcEvent', (e: Event) => {
   const detail = (e as CustomEvent<RpcEventDetail>).detail || {};
   const event = (detail.event || detail) as AppEvent;
   const sessionId = detail.sessionId;
+  if (takeRequest?.sessionId === sessionId && sessionId === activeLiveSessionId && viewingActiveSession) {
+    // A handled command can still report failure through the extension UI.
+    // Keep that structured error in the status bar through snapshot redraws.
+    if (event.type === 'extension_error') flashStatusError(String(event.error), 8000);
+    if (event.type === 'extension_ui_request' && event.method === 'notify' && event.notifyType === 'error') {
+      flashStatusError(String(event.message), 8000);
+    }
+  }
+  if (takeRequest && takeRequest.sessionId === sessionId && event.type === 'response' && event.id === takeRequest.id) {
+    // The server publishes its authoritative snapshot before this actual
+    // completion, even when HTTP already acknowledged a prompt timeout.
+    takeRequest = null;
+    updateLiveSessionInputState();
+    if (event.success !== true) flashStatusError(String(event.error || 'Session takeover failed.'));
+  }
   if (sessionId) {
     sessionStateRevisions.set(sessionId, (sessionStateRevisions.get(sessionId) || 0) + 1);
     const session = liveSessions.find(s => s.id === sessionId);
@@ -456,11 +500,12 @@ wsClient.addEventListener('liveSessionUpdated', (e: Event) => {
     settledWhileStopping.delete(detail.id);
     if (detail.id === activeLiveSessionId && viewingActiveSession && detail.isStreaming === false) {
       state.setStreaming(false);
+      assistantBlocks.setWorking(false);
       toolCardRenderer.settleNestedCalls();
       showTypingIndicator(false);
     }
   }
-  if (detail?.id === activeLiveSessionId) {
+  if (viewingActiveSession && detail?.id === activeLiveSessionId) {
     applyActiveSessionMetadata(detail);
     updateUI();
   }
@@ -475,8 +520,12 @@ wsClient.addEventListener('interactionState', (e: Event) => {
 });
 
 // Receive a full live-session state snapshot.
+// Passive fanout updates only the live conversation currently being viewed.
+// Explicit selection loads its own snapshot after setting viewingActiveSession.
 wsClient.addEventListener('liveSessionSnapshot', (e: Event) => {
-  applyLiveSessionSnapshot((e as CustomEvent<LiveSessionSnapshotData>).detail);
+  const snapshot = (e as CustomEvent<LiveSessionSnapshotData>).detail;
+  if (!viewingActiveSession || snapshot.sessionId !== activeLiveSessionId) return;
+  applyLiveSessionSnapshot(snapshot);
 });
 
 // A link is one navigation request, not a preference reapplied on reconnect.
@@ -515,6 +564,8 @@ window.addEventListener('hashchange', () => {
 
 const liveTabsList = document.getElementById('live-tabs-list');
 const liveTabAddBtn = document.getElementById('live-tab-add');
+const takeHerdrBtn = document.getElementById('take-herdr-btn')!;
+takeHerdrBtn.addEventListener('click', () => { void takeFromHerdr(); });
 const newLiveSessionOverlay = document.getElementById('new-live-session-overlay');
 const newLiveSessionModal = document.getElementById('new-live-session-modal');
 const newLiveSessionForm = document.getElementById('new-live-session-form');
@@ -553,9 +604,7 @@ function handleLiveSessionClosed(closedId: string) {
     localStorage.removeItem('tau-active-live-session-id');
     activeLiveSessionFile = null;
     sidebar.clearActive();
-    currentStreamingElement = null;
-    currentStreamingThinking = '';
-    currentStreamingText = '';
+    currentMessageSteps.clear();
     pendingAssistantError = null;
     retryStatusElement = null;
     state.reset();
@@ -699,9 +748,7 @@ async function selectLiveSession(id: string, resumeQueue = true) {
   renderLiveTabs();
   renderQueuedMessages();
   applyActiveSessionMetadata(session);
-  currentStreamingElement = null;
-  currentStreamingThinking = '';
-  currentStreamingText = '';
+  currentMessageSteps.clear();
   pendingAssistantError = null;
   retryStatusElement = null;
   state.reset();
@@ -885,24 +932,20 @@ function flushPendingAssistantError() {
   const pending = pendingAssistantError;
   pendingAssistantError = null;
   if (!pending) return;
-  if (pending.element?.isConnected) {
-    messageRenderer.appendMessageError(pending.element, pending.errorMessage);
-    return;
-  }
   // A snapshot might already have rendered this error from session history.
-  const alreadyShown = Array.from(messagesContainer.querySelectorAll('.message-error'))
-    .some(element => (element.textContent || '').includes(pending.errorMessage));
-  if (!alreadyShown) messageRenderer.renderError(pending.errorMessage);
+  const lastBlock = messagesContainer.lastElementChild;
+  const alreadyShown = lastBlock?.classList.contains('assistant-block') &&
+    Array.from(lastBlock.querySelectorAll('.message-error-detail'))
+      .some(element => element.textContent === pending.errorMessage);
+  if (!alreadyShown) {
+    appendLiveActivity(messageRenderer.renderAssistantError(pending.errorMessage), 'error');
+    messageRenderer.scrollToBottom();
+  }
 }
 
 function handleAutoRetryStart(event: AppEvent) {
-  // The failed reply is not final yet, so show retry progress instead of a
-  // red error the user would see even when the retry succeeds. A failed reply
-  // with no visible content would otherwise leave an empty bubble behind.
-  const emptyContent = pendingAssistantError?.element?.querySelector('.message-content');
-  if (pendingAssistantError?.element?.isConnected && emptyContent && !emptyContent.textContent?.trim()) {
-    pendingAssistantError.element.remove();
-  }
+  // Keep partial steps, but never materialize a provisional provider error
+  // (or an empty assistant bubble) while Pi is still retrying.
   pendingAssistantError = null;
   showRetryStatus(event);
 }
@@ -914,7 +957,7 @@ function handleAutoRetryEnd(event: AppEvent) {
     ? event.finalError
     : undefined;
   if (finalError && !pendingAssistantError) {
-    pendingAssistantError = { element: null, errorMessage: finalError };
+    pendingAssistantError = { errorMessage: finalError };
   }
 }
 
@@ -936,6 +979,11 @@ function handleRPCEvent(event: AppEvent, sessionId: string | null = null) {
       break;
     case 'turn_start':
       handleAgentStart();
+      break;
+    case 'agent_end':
+      // Reply rendering can finish before Pi's end hooks release input.
+      assistantBlocks.setWorking(false);
+      messageRenderer.scrollToBottom();
       break;
     case 'agent_settled':
       handleAgentSettled();
@@ -964,10 +1012,10 @@ function handleRPCEvent(event: AppEvent, sessionId: string | null = null) {
     case 'tool_execution_end':
       handleToolExecutionEnd(event);
       break;
-    case 'auto_compaction_start':
+    case 'compaction_start':
       handleCompactionStart();
       break;
-    case 'auto_compaction_end':
+    case 'compaction_end':
       handleCompactionEnd(event);
       break;
     case 'extension_ui_request':
@@ -986,21 +1034,25 @@ function handleRPCEvent(event: AppEvent, sessionId: string | null = null) {
 }
 
 function handleCompactionStart() {
+  assistantBlocks.boundary();
+  currentMessageSteps.clear();
   const el = document.createElement('div');
   el.className = 'system-message compaction-message';
   el.id = 'compaction-indicator';
   el.innerHTML = '<span class="compaction-spinner">⟳</span> Compacting context…';
   messagesContainer.appendChild(el);
   scrollToBottom();
+  return el;
 }
 
 function handleCompactionEnd(event: AppEvent) {
-  const indicator = document.getElementById('compaction-indicator');
-  if (indicator) {
-    const summary = event.summary ? ` — ${event.summary}` : '';
-    indicator.innerHTML = `✓ Context compacted${summary}`;
-    indicator.classList.add('compaction-done');
-  }
+  // A browser attaching during compaction has no start indicator or boundary.
+  const indicator = document.getElementById('compaction-indicator') || handleCompactionStart();
+  const result = event.result as { summary?: string } | undefined;
+  const summary = result?.summary ? ` — ${result.summary}` : '';
+  indicator.textContent = result ? `Context compacted${summary}` : event.aborted ? 'Compaction cancelled' : event.error || 'Compaction failed';
+  indicator.classList.add('compaction-done');
+  indicator.removeAttribute('id');
   // Reset token tracking — the stats refresh below and the next message
   // bring in fresh post-compaction numbers.
   lastInputTokens = 0;
@@ -1010,6 +1062,7 @@ function handleCompactionEnd(event: AppEvent) {
 }
 
 function handleAgentStart() {
+  assistantBlocks.setWorking(true);
   state.setStreaming(true);
   showTypingIndicator(true);
   updateUI();
@@ -1022,8 +1075,9 @@ function handleAgentSettled() {
   flushPendingAssistantError();
   state.setStreaming(false);
   showTypingIndicator(false);
-  currentStreamingElement = null;
-  currentStreamingText = '';
+  currentMessageSteps.clear();
+  assistantBlocks.setWorking(false);
+  messageRenderer.scrollToBottom();
   updateUI();
 
   // Pi has finished its end hooks, compaction and queued continuations.
@@ -1053,20 +1107,13 @@ function handleMessageStart(message: AppMessage) {
   if (message.role === 'assistant') {
     pendingAssistantError = null;
     clearRetryStatus();
-    currentStreamingText = '';
-    currentStreamingThinking = '';
-    currentStreamingElement = messageRenderer.renderAssistantMessage(
-      { content: '' },
-      true
-    );
+    currentMessageSteps.clear();
   } else if (message.role === 'user') {
-    // User messages can echo back via backend events; only render if we did
-    // not just send this message ourselves.
+    assistantBlocks.boundary();
+    // The prompt is already drawn locally when sent.
     if (!lastSentMessage || getMessageText(message) !== lastSentMessage) {
       const content = getMessageText(message);
-      if (content) {
-        messageRenderer.renderUserMessage({ content });
-      }
+      if (content) messageRenderer.renderUserMessage({ content });
     }
     lastSentMessage = null;
   }
@@ -1074,149 +1121,130 @@ function handleMessageStart(message: AppMessage) {
 
 function getMessageText(message: AppMessage) {
   if (typeof message.content === 'string') return message.content;
-  if (Array.isArray(message.content)) {
-    return message.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
-  }
-  return '';
+  return (message.content || []).filter(block => block.type === 'text').map(block => block.text).join('\n');
 }
 
-function getMessageThinking(message: AppMessage) {
-  if (!Array.isArray(message?.content)) return '';
-  return message.content
-    .filter(b => b.type === 'thinking')
-    .map(b => b.thinking || b.text || '')
-    .filter(Boolean)
-    .join('\n');
+function nextMessageStep(index: number) {
+  let next: HTMLElement | null = null;
+  let position = Infinity;
+  for (const [candidate, element] of currentMessageSteps) {
+    if (candidate > index && candidate < position) {
+      next = element;
+      position = candidate;
+    }
+  }
+  return next;
+}
+
+function updateMessageStep(index: number, step: AssistantStep, streaming: boolean) {
+  let element = currentMessageSteps.get(index);
+  if (!element) {
+    element = messageRenderer.renderAssistantStep(step, streaming);
+    // message_end supplies blocks missed when this browser joined mid-message.
+    appendLiveActivity(element, step.type, nextMessageStep(index));
+    currentMessageSteps.set(index, element);
+  } else {
+    messageRenderer.updateAssistantStep(element, step.text, streaming);
+  }
 }
 
 function handleMessageUpdate(event: AppEvent) {
   if (typeof event.message === 'object') rememberToolDefinitions(event.message);
-  const { assistantMessageEvent } = event;
-  if (!assistantMessageEvent) return;
+  const update = event.assistantMessageEvent;
+  if (!update) return;
+  const index = update.contentIndex;
+  if (index === undefined) return;
+  const type = update.type;
+  if (type !== 'thinking_start' && type !== 'thinking_delta' && type !== 'text_start' && type !== 'text_delta') return;
+  const kind = type.startsWith('thinking') ? 'thinking' : 'text';
+  const block = update.partial?.content?.[index];
+  const previous = currentMessageSteps.get(index)?.querySelector<HTMLElement>('.assistant-step-content')?.dataset.rawText || '';
+  const text = block && typeof block !== 'string'
+    ? (kind === 'thinking' ? block.thinking : block.text) || ''
+    : previous + (update.delta || '');
+  updateMessageStep(index, { type: kind, text }, true);
+  messageRenderer.scrollToBottom();
+}
 
-  if (assistantMessageEvent.type === 'thinking_delta') {
-    if (!currentStreamingElement) {
-      currentStreamingElement = messageRenderer.renderAssistantMessage({ content: '' }, true);
-    }
-    currentStreamingThinking += assistantMessageEvent.delta;
-    if (currentStreamingElement) {
-      messageRenderer.updateStreamingThinking(currentStreamingElement, currentStreamingThinking);
-    }
-  } else if (assistantMessageEvent.type === 'text_delta') {
-    if (!currentStreamingElement) {
-      currentStreamingElement = messageRenderer.renderAssistantMessage({ content: '' }, true);
-    }
-    currentStreamingText += assistantMessageEvent.delta;
-    if (currentStreamingElement) {
-      messageRenderer.updateStreamingMessage(
-        currentStreamingElement,
-        currentStreamingText
-      );
-    }
+function appendLiveActivity(element: HTMLElement, label: string, before: HTMLElement | null = null) {
+  assistantBlocks.append(element, label, before);
+  // Once a history block receives live content its height must not be deferred.
+  element.closest('.assistant-block')?.classList.remove('history');
+}
+
+function ensureToolCard(toolCallId: string, toolName: string, args: Record<string, unknown> = {}, before: HTMLElement | null = null) {
+  let card = toolCardRenderer.toolCards.get(toolCallId);
+  if (!card) {
+    card = toolCardRenderer.createToolCard({ toolCallId, toolName, args, status: 'pending' }, document.createDocumentFragment());
+    appendLiveActivity(card, toolName, before);
   }
+  card.classList.remove('history');
+  card.closest('.assistant-block')?.classList.remove('history');
+  return card;
 }
 
 function handleMessageEnd(message: AppMessage) {
   if (message?.role === 'toolResult') {
     if (message.toolCallId) {
-      toolCardRenderer.reconcileToolResult(message.toolCallId, {
-        content: Array.isArray(message.content) ? message.content : [],
+      const card = toolCardRenderer.reconcileToolResult(message.toolCallId, {
+        content: typeof message.content === 'string' ? [{ type: 'text', text: message.content }] : message.content || [],
         nestedCalls: message.nestedCalls,
       }, message.isError ?? false);
+      if (card?.parentElement === messagesContainer) {
+        appendLiveActivity(card, card.querySelector('.tool-name')?.textContent || 'tool');
+      }
     }
     return;
   }
   if (message?.role !== 'assistant') return;
   rememberToolDefinitions(message);
-  let finishedElement = currentStreamingElement;
-  if (!currentStreamingElement) {
-    finishedElement = messageRenderer.renderAssistantMessage(message, false, true);
-  }
-  if (currentStreamingElement) {
-    finishedElement = currentStreamingElement;
-    // If this client attached mid-stream, local deltas may be incomplete. The
-    // message_end payload is authoritative, so refresh the streaming DOM from it
-    // before finalizing.
-    const finalText = getMessageText(message);
-    const finalThinking = getMessageThinking(message);
-    if (finalText && finalText.length >= currentStreamingText.length) {
-      currentStreamingText = finalText;
-      messageRenderer.updateStreamingMessage(currentStreamingElement, currentStreamingText);
+  const blocks = typeof message.content === 'string' ? [{ type: 'text', text: message.content }] : message.content || [];
+  blocks.forEach((block, index) => {
+    if (block.type === 'text' || block.type === 'thinking') {
+      updateMessageStep(index, {
+        type: block.type, text: block.type === 'thinking' ? block.thinking || '' : block.text || '',
+      }, false);
+    } else if (block.type === 'toolCall') {
+      const card = ensureToolCard(block.id || '', block.name || '', block.arguments, nextMessageStep(index));
+      currentMessageSteps.set(index, card);
     }
-    if (finalThinking && finalThinking.length >= currentStreamingThinking.length) {
-      currentStreamingThinking = finalThinking;
-      messageRenderer.updateStreamingThinking(currentStreamingElement, currentStreamingThinking);
-    }
+  });
+  currentMessageSteps.clear();
 
-    // Pass usage info for cost display
-    const usage = message?.usage || null;
-    // Pass thinking and text so finalize renders each in its own place
-    messageRenderer.finalizeStreamingMessage(currentStreamingElement, usage, currentStreamingThinking, currentStreamingText);
-    currentStreamingElement = null;
-    currentStreamingThinking = '';
-    currentStreamingText = '';
-
-    // Track session cost and tokens
-    if (usage?.cost?.total) {
-      sessionTotalCost += usage.cost.total;
-    }
-    if (usage?.input) {
-      lastInputTokens = usage.input + (usage.cacheRead || 0);
-      lastUsage = usage;
-    }
-    updateContextPill();
-    showNewMessageBadge();
+  const usage = message.usage;
+  if (usage?.cost?.total) sessionTotalCost += usage.cost.total;
+  if (usage?.input) {
+    lastInputTokens = usage.input + (usage.cacheRead || 0);
+    lastUsage = usage;
   }
-
-  // Hold the error until agent_settled: an auto-retry may still replace this
-  // failed reply, and only the final failure should be shown inline.
-  if (message.stopReason === 'error') {
-    pendingAssistantError = { element: finishedElement, errorMessage: message.errorMessage || 'Request failed' };
-  } else {
-    pendingAssistantError = null;
-  }
+  updateContextPill();
+  showNewMessageBadge();
+  // Keep failures provisional until Pi's authoritative operation settles.
+  pendingAssistantError = message.stopReason === 'error'
+    ? { errorMessage: message.errorMessage || 'Request failed' } : null;
 }
 
 function handleToolExecutionStart(event: AppEvent) {
   const { toolCallId, toolName, args } = event;
   if (!toolCallId) return;
-
-  state.addToolExecution(toolCallId, {
-    toolName,
-    args,
-    status: 'pending',
-  });
-
-  const exec = state.getToolExecution(toolCallId);
-  if (exec) toolCardRenderer.createToolCard(exec as ToolExecution);
+  ensureToolCard(toolCallId, toolName || '', args);
+  toolCardRenderer.updateToolCard({ toolCallId, status: 'pending' });
+  messageRenderer.scrollToBottom();
 }
 
 function handleToolExecutionUpdate(event: AppEvent) {
-  const { toolCallId, partialResult } = event;
-  if (!toolCallId) return;
-  const output = formatToolOutput(partialResult);
-
-  state.updateToolExecution(toolCallId, {
-    status: 'streaming',
-    output,
+  if (!event.toolCallId) return;
+  ensureToolCard(event.toolCallId, event.toolName || '', event.args);
+  toolCardRenderer.updateToolCard({
+    toolCallId: event.toolCallId, status: 'streaming', output: formatToolOutput(event.partialResult),
   });
-
-  const exec = state.getToolExecution(toolCallId);
-  if (exec) toolCardRenderer.updateToolCard(exec as ToolExecution);
+  messageRenderer.scrollToBottom();
 }
 
 function handleToolExecutionEnd(event: AppEvent) {
-  const { toolCallId, result, isError } = event;
-  if (!toolCallId) return;
-  const output = formatToolOutput(result);
-
-  state.updateToolExecution(toolCallId, {
-    status: isError ? 'error' : 'complete',
-    output,
-    isError,
-  });
-
-  toolCardRenderer.finalizeToolCard(toolCallId, result as ToolResult, isError ?? false);
+  if (!event.toolCallId) return;
+  ensureToolCard(event.toolCallId, event.toolName || '', event.args);
+  toolCardRenderer.finalizeToolCard(event.toolCallId, event.result as ToolResult, event.isError ?? false);
 }
 
 function pendingInteractionCount(sessionId: string) {
@@ -1505,6 +1533,10 @@ function renderAttachmentPreviews() {
 let messageQueue: QueuedCommand[] = [];
 
 function sendMessage() {
+  if (takeRequest?.sessionId === activeLiveSessionId) {
+    flashStatusError('Finish taking the session before sending a message.');
+    return;
+  }
   const message = messageInput.value.trim();
   if (!message && pendingImages.length === 0) return;
 
@@ -1542,6 +1574,7 @@ function sendMessage() {
   }
 
   lastSentMessage = message;
+  assistantBlocks.boundary();
   messageRenderer.renderUserMessage({ content: message, images: cmd.images });
   wsClient.send(cmd);
 }
@@ -1595,12 +1628,13 @@ function escapeHtml(text: string) {
 }
 
 function flushQueue() {
-  if (!activeLiveSessionId || state.isStreaming || !resumeQueuedInput || sessionHasPendingWork(activeLiveSessionId)) return;
+  if (!activeLiveSessionId || state.isStreaming || !resumeQueuedInput || sessionHasPendingWork(activeLiveSessionId) || takeRequest?.sessionId === activeLiveSessionId) return;
   const idx = messageQueue.findIndex(cmd => cmd.sessionId === activeLiveSessionId);
   if (idx >= 0) {
     if (messageQueue[idx].error) return; // A failed instruction needs an explicit retry or cancellation.
     const [cmd] = messageQueue.splice(idx, 1);
     lastSentMessage = cmd.message ?? null;
+    assistantBlocks.boundary();
     messageRenderer.renderUserMessage({ content: cmd.message, images: cmd.images });
     renderQueuedMessages();
     // Paired settled/metadata updates may arrive before Pi starts this
@@ -1726,6 +1760,7 @@ function abortActiveSession() {
         session.isStreaming = false;
         if (viewingActiveSession && activeLiveSessionId === sessionId) {
           state.setStreaming(false);
+          assistantBlocks.setWorking(false);
           toolCardRenderer.settleNestedCalls();
           showTypingIndicator(false);
         }
@@ -1746,14 +1781,53 @@ function abortActiveSession() {
 
 abortBtn.addEventListener('click', abortActiveSession);
 
+async function takeFromHerdr() {
+  const session = liveSessions.find(item => item.id === activeLiveSessionId);
+  if (!viewingActiveSession || !session) {
+    flashStatusError('Select a live Tau tab first. The Herdr conversation will replace it here.');
+    return;
+  }
+  if (takeRequest || state.isStreaming || session.isStreaming || messageQueue.some(cmd => cmd.sessionId === session.id)
+    || sessionHasPendingWork(session.id) || dialogHandler.currentRequest?.sessionId === session.id) {
+    flashStatusError('Finish the current work, queued messages and dialogs before taking a session.');
+    return;
+  }
+  if (wsClient.ws?.readyState !== WebSocket.OPEN) {
+    flashStatusError('Reconnect to Tau before taking a session.');
+    return;
+  }
+  const request = { id: crypto.randomUUID(), sessionId: session.id };
+  takeRequest = request;
+  updateLiveSessionInputState();
+  try {
+    const response = await fetch('/api/rpc', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: request.id, sessionId: request.sessionId, type: 'prompt', message: '/take herdr' }),
+    });
+    const result = await response.json();
+    if (!response.ok || result.success !== true) throw new Error(result.error || 'Session takeover failed.');
+    // Pi's RPC select dialog supplies the picker. Its real prompt response is
+    // forwarded over the socket even if Tau stopped waiting after ten seconds.
+  } catch (error) {
+    if (takeRequest === request) {
+      takeRequest = null;
+      updateLiveSessionInputState();
+      flashStatusError(error instanceof Error ? error.message : 'Session takeover failed.');
+    }
+  }
+}
+
 // Command Palette
 const commandPaletteController = setupCommandPalette([
+  { icon: '↙', label: 'Take from Herdr…', desc: 'Take an idle Herdr conversation into this Tau tab', action: () => { void takeFromHerdr(); } },
   { icon: '🌳', label: 'Session tree', desc: 'Jump to any earlier point in the session tree', action: () => { void treeViewController.open(); } },
   { icon: '🗜️', label: 'Compact', desc: 'Compact context to save tokens', action: () => rpcCommand({ type: 'compact' }, 'Compacting...') },
   { icon: '📋', label: 'Export HTML', desc: 'Export session as HTML file', action: () => rpcExportHtml() },
   { icon: '📊', label: 'Session Stats', desc: 'Show session statistics', action: () => showSessionStats() },
-  { icon: '⬇️', label: 'Expand All Tools', desc: 'Expand all tool cards', action: () => toolCardRenderer.expandAll() },
-  { icon: '⬆️', label: 'Collapse All Tools', desc: 'Collapse all tool cards', action: () => toolCardRenderer.collapseAll() },
+  { icon: '⬇️', label: 'Expand All Steps', desc: 'Show all assistant activity', action: () => setAssistantBlocksExpanded(true) },
+  { icon: '⬆️', label: 'Collapse All Steps', desc: 'Show only results', action: () => setAssistantBlocksExpanded(false) },
+  { icon: '⬇️', label: 'Expand All Tools', desc: 'Show tool details and calls', action: () => toolCardRenderer.expandAll() },
+  { icon: '⬆️', label: 'Collapse All Tools', desc: 'Hide tool details and calls', action: () => toolCardRenderer.collapseAll() },
 ]);
 
 async function rpcCommand(cmd: RpcCommand, statusMsg = '') {
@@ -2067,9 +2141,7 @@ async function followSession(session: SidebarSession, owner: SessionOwner) {
 async function switchSession(sessionFile: string | null | undefined, session: SidebarSession | null = null) {
   try {
     // Clear any streaming state from previous session to prevent bleed
-    currentStreamingElement = null;
-    currentStreamingThinking = '';
-    currentStreamingText = '';
+    currentMessageSteps.clear();
     pendingAssistantError = null;
     retryStatusElement = null;
     dialogHandler.clearCurrentDialog();
@@ -2168,7 +2240,11 @@ function applyLiveSessionSnapshot(data: LiveSessionSnapshotData, requestedAtRevi
   // the past. Do not let an HTTP response overwrite newer WebSocket state.
   viewingActiveSession = true;
   if (!staleMetadata) {
-    if (data.session) upsertLiveSession(data.session);
+    const previousCwd = liveSessions.find(session => session.id === activeLiveSessionId)?.cwd;
+    if (data.session) {
+      upsertLiveSession(data.session);
+      if (data.session.cwd !== previousCwd && !fileSidebar.classList.contains('collapsed')) void fileBrowser.load();
+    }
     activeLiveSessionFile = data.sessionFile || data.session?.sessionFile || null;
     sidebar.setActive(activeLiveSessionFile);
     state.setStreaming(!!data.isStreaming);
@@ -2188,13 +2264,7 @@ function applyLiveSessionSnapshot(data: LiveSessionSnapshotData, requestedAtRevi
     modelPickerController.setThinkingLevel(data.thinkingLevel || 'off');
   }
 
-  // Clear and render message history. Reset streaming handles after the
-  // snapshot arrives because live deltas may have created a streaming element
-  // while the snapshot request was in flight; that element is about to be
-  // removed from the DOM.
-  currentStreamingElement = null;
-  currentStreamingThinking = '';
-  currentStreamingText = '';
+  // A snapshot replaces live DOM, including any deltas received in flight.
   clearConversation();
   retryStatusElement = null;
   sessionTotalCost = 0;
@@ -2206,6 +2276,8 @@ function applyLiveSessionSnapshot(data: LiveSessionSnapshotData, requestedAtRevi
   } else {
     messageRenderer.renderWelcome();
   }
+  assistantBlocks.setWorking(state.isStreaming);
+  if (state.isStreaming) messagesContainer.lastElementChild?.classList.remove('history');
 
   updateContextPill();
   // A snapshot means the session's entries/leaf may have moved (e.g. another
@@ -2263,7 +2335,7 @@ function updateLiveSessionInputState() {
   const hasLiveSession = viewingActiveSession && !!activeLiveSessionId;
   if (hasLiveSession) {
     messageInput.disabled = false;
-    sendBtn.disabled = false;
+    sendBtn.disabled = takeRequest?.sessionId === activeLiveSessionId;
     messageInput.placeholder = 'Message...';
     inputArea?.classList.remove('no-active-live-session');
   } else {
@@ -2272,6 +2344,7 @@ function updateLiveSessionInputState() {
     messageInput.placeholder = hasReceivedInitialServerState ? 'Create or select a Tau tab to chat' : 'Connecting...';
     inputArea?.classList.add('no-active-live-session');
   }
+  takeHerdrBtn.setAttribute('aria-busy', String(takeRequest !== null));
   document.getElementById('command-btn')!.disabled = !hasLiveSession;
   modelPickerController.setEnabled(hasLiveSession);
   treeViewController.setVisible(hasLiveSession);
@@ -2281,139 +2354,130 @@ function updateLiveSessionInputState() {
 // Session history rendering
 // ═══════════════════════════════════════
 
-// How many of the newest items are rendered synchronously before first paint;
-// everything older is prepended above in idle-scheduled chunks.
-const INITIAL_SYNC_ITEMS = 30;
-const HISTORY_CHUNK_ITEMS = 50;
-
-// Browsers with native scroll anchoring (Chrome, Firefox) keep the viewport
-// pinned to visible content when history is prepended above it; browsers
-// without it (Safari) need manual scrollTop compensation per chunk.
-const supportsScrollAnchoring =
-  typeof CSS !== 'undefined' && !!CSS.supports && CSS.supports('overflow-anchor', 'auto');
+// Chunk only at user/compaction boundaries: a deferred chunk must never split
+// one assistant activity block or steal the current live block's controller.
+const INITIAL_SYNC_GROUPS = 30;
+const HISTORY_CHUNK_GROUPS = 50;
+const supportsScrollAnchoring = typeof CSS !== 'undefined' && !!CSS.supports && CSS.supports('overflow-anchor', 'auto');
 messagesContainer.classList.toggle('native-scroll-anchoring', supportsScrollAnchoring);
-
-// Generation token for the progressive history fill. Bumping it invalidates
-// every scheduled chunk callback, so switching sessions (or re-applying a
-// snapshot) mid-fill cannot interleave stale chunks into the new conversation.
 let historyRenderToken = 0;
 
-function cancelHistoryRender() {
-  historyRenderToken++;
+function setAssistantBlocksExpanded(expanded: boolean) {
+  expandedAssistantBlocks = expanded;
+  for (const blocks of assistantBlockControllers) blocks.setExpanded(expanded);
 }
 
-// Tear down the conversation view as one unit. Clearing the tool-card map
-// alongside the DOM matters: a stale map would hand out detached cards to
-// later toolCallId lookups (expand/collapse, live tool results).
 function clearConversation() {
-  cancelHistoryRender();
+  historyRenderToken++;
+  messagesContainer.style.scrollBehavior = '';
+  currentMessageSteps.clear();
+  pendingAssistantError = null;
+  clearRetryStatus();
+  for (const blocks of assistantBlockControllers) blocks.clear();
+  assistantBlockControllers.clear();
+  assistantBlockControllers.add(assistantBlocks);
+  expandedAssistantBlocks = false;
   messageRenderer.clear();
   toolCardRenderer.clear();
   state.toolExecutions.clear();
 }
 
-function renderHistoryItem(item: HistoryItem, target: ParentNode) {
+function renderHistoryItem(item: HistoryItem, blocks: AssistantBlocks, target: HTMLElement) {
   if (item.kind === 'user') {
+    blocks.boundary();
     messageRenderer.renderUserMessage({ content: item.content, images: item.images }, true, target);
-  } else if (item.kind === 'assistant') {
-    messageRenderer.renderAssistantMessage({ content: item.content, usage: item.usage, error: item.error }, false, true, target);
+  } else if (item.kind === 'compaction') {
+    blocks.boundary();
+    messageRenderer.renderCompaction(item.summary, target);
   } else {
-    toolCardRenderer.createHistoryCard(
-      {
+    let element: HTMLElement;
+    let label: string;
+    if (item.kind === 'assistant') {
+      element = messageRenderer.renderAssistantStep(item.step);
+      label = item.step.type;
+    } else if (item.kind === 'assistantError') {
+      element = messageRenderer.renderAssistantError(item.error);
+      label = 'error';
+    } else {
+      element = toolCardRenderer.createHistoryCard({
         toolCallId: item.toolCallId, toolName: item.toolName, args: item.args,
         status: item.result !== undefined ? (item.isError ? 'error' : 'complete') : 'pending',
-      },
-      target
-    );
-    if (item.result !== undefined || item.isError) {
-      toolCardRenderer.addHistoryResult(item.toolCallId, item.result ?? { content: [] }, !!item.isError);
+      }, document.createDocumentFragment());
+      if (item.result !== undefined || item.isError) {
+        toolCardRenderer.addHistoryResult(item.toolCallId, item.result ?? { content: [] }, !!item.isError);
+      }
+      label = item.toolName;
     }
+    blocks.append(element, label);
+    element.closest('.assistant-block')?.classList.add('history');
   }
 }
 
 function renderSessionHistory(entries: SessionHistoryEntry[]) {
   const token = ++historyRenderToken;
-  const { items, totalCost, lastInputTokens: builtInputTokens, lastUsage: builtUsage } = buildHistoryItems(entries);
-  console.log(`[History] Rendering ${items.length} items from ${entries.length} entries`);
+  const { items, totalCost, lastInputTokens: inputTokens, lastUsage: usage } = buildHistoryItems(entries);
+  const groups: HistoryItem[][] = [];
   for (const item of items) {
+    if (!groups.length || item.kind === 'user' || item.kind === 'compaction') groups.push([]);
+    groups[groups.length - 1].push(item);
     if (item.kind === 'toolCall') {
-      toolCardRenderer.rememberRoot({
-        toolCallId: item.toolCallId, toolName: item.toolName, args: item.args,
-        status: item.result !== undefined ? (item.isError ? 'error' : 'complete') : 'pending',
-      });
+      toolCardRenderer.rememberRoot({ toolCallId: item.toolCallId, toolName: item.toolName, args: item.args,
+        status: item.result !== undefined ? (item.isError ? 'error' : 'complete') : 'pending' });
     }
   }
-
-  // Stats come from the pure pre-pass so the context pill is correct
-  // immediately, even though the DOM fills in newest-first below.
+  // Stats are authoritative immediately, not accumulated by progressive DOM.
   sessionTotalCost = totalCost;
-  lastInputTokens = builtInputTokens;
-  lastUsage = builtUsage;
+  lastInputTokens = inputTokens;
+  lastUsage = usage;
   updateContextPill();
   fetchContextWindow();
 
-  // Render the newest items synchronously so the first paint shows what the
-  // user actually looks at — the bottom of the conversation.
-  let cursor = Math.max(0, items.length - INITIAL_SYNC_ITEMS);
-  const tail = document.createDocumentFragment();
-  for (const item of items.slice(cursor)) renderHistoryItem(item, tail);
-  // Captured before insertion: after appendChild the fragment is empty.
-  let topAnchor: ChildNode | null = tail.firstChild;
-  messagesContainer.appendChild(tail);
-
-  // Jump to bottom instantly (no smooth scroll animation)
+  let cursor = Math.max(0, groups.length - INITIAL_SYNC_GROUPS);
+  const beforeTail = messagesContainer.lastChild;
+  for (const group of groups.slice(cursor)) {
+    for (const item of group) renderHistoryItem(item, assistantBlocks, messagesContainer);
+  }
+  let topAnchor = beforeTail ? beforeTail.nextSibling : messagesContainer.firstChild;
   messagesContainer.style.scrollBehavior = 'auto';
   requestAnimationFrame(() => {
+    if (token !== historyRenderToken) return;
     messagesContainer.scrollTop = messagesContainer.scrollHeight;
-    // Restore smooth scrolling after a frame
     requestAnimationFrame(() => {
-      messagesContainer.style.scrollBehavior = '';
+      if (token === historyRenderToken) messagesContainer.style.scrollBehavior = '';
     });
   });
 
-  if (cursor === 0) return;
-
-  // Fill in older history above the tail during idle time. Live streaming
-  // messages keep appending at the container's end, below the tail, so the
-  // two never interleave.
-  const scheduleChunk = (fn: () => void) =>
-    typeof requestIdleCallback === 'function' ? requestIdleCallback(fn, { timeout: 500 }) : setTimeout(fn, 16);
-
+  const scheduleChunk = (fn: () => void) => typeof requestIdleCallback === 'function'
+    ? requestIdleCallback(fn, { timeout: 500 }) : setTimeout(fn, 16);
   const renderOlderChunk = () => {
-    if (token !== historyRenderToken) return;
-    if (!topAnchor || !topAnchor.isConnected) return;
-
-    const start = Math.max(0, cursor - HISTORY_CHUNK_ITEMS);
+    if (token !== historyRenderToken || !topAnchor?.isConnected) return;
+    const start = Math.max(0, cursor - HISTORY_CHUNK_GROUPS);
+    const target = document.createElement('div');
+    const blocks = new AssistantBlocks(target);
+    assistantBlockControllers.add(blocks);
+    for (const group of groups.slice(start, cursor)) {
+      for (const item of group) renderHistoryItem(item, blocks, target);
+    }
+    blocks.setExpanded(expandedAssistantBlocks);
     const chunk = document.createDocumentFragment();
-    for (const item of items.slice(start, cursor)) renderHistoryItem(item, chunk);
-    const newTop: ChildNode | null = chunk.firstChild;
-
+    chunk.append(...Array.from(target.childNodes));
+    const newTop = chunk.firstChild;
     if (supportsScrollAnchoring) {
-      // Native scroll anchoring keeps the reading position fixed when content
-      // is inserted above the viewport — including the deferred size
-      // refinements content-visibility applies after insertion, which a
-      // one-shot manual compensation cannot track.
       messagesContainer.insertBefore(chunk, topAnchor);
     } else {
-      // Fallback (Safari): compensate scrollTop for the added height in the
-      // same task, so nothing paints in between. scroll-behavior must be
-      // forced instant for the assignment — the container's CSS smooth
-      // behavior would animate it and lag behind the chunks.
-      const prevBehavior = messagesContainer.style.scrollBehavior;
+      const behavior = messagesContainer.style.scrollBehavior;
       messagesContainer.style.scrollBehavior = 'auto';
-      const prevHeight = messagesContainer.scrollHeight;
-      const prevTop = messagesContainer.scrollTop;
+      const height = messagesContainer.scrollHeight;
+      const top = messagesContainer.scrollTop;
       messagesContainer.insertBefore(chunk, topAnchor);
-      messagesContainer.scrollTop = prevTop + (messagesContainer.scrollHeight - prevHeight);
-      messagesContainer.style.scrollBehavior = prevBehavior;
+      messagesContainer.scrollTop = top + messagesContainer.scrollHeight - height;
+      messagesContainer.style.scrollBehavior = behavior;
     }
-
     if (newTop) topAnchor = newTop;
     cursor = start;
     if (cursor > 0) scheduleChunk(renderOlderChunk);
   };
-
-  scheduleChunk(renderOlderChunk);
+  if (cursor > 0) scheduleChunk(renderOlderChunk);
 }
 
 // ═══════════════════════════════════════
@@ -2543,7 +2607,7 @@ function updateUI() {
   }
 
   messageInput.disabled = !hasLiveSession;
-  sendBtn.disabled = !hasLiveSession;
+  sendBtn.disabled = !hasLiveSession || takeRequest?.sessionId === activeLiveSessionId;
 
   if (isStreaming || hasPendingInteraction || stopping) {
     abortBtn.classList.remove('hidden');
@@ -2585,7 +2649,7 @@ function buildThemeGrid() {
   themeGrid.innerHTML = '';
   const current = getCurrentTheme();
 
-  for (const [id, theme] of Object.entries(themes)) {
+  for (const [id, theme] of Object.entries(themes) as [ThemeId, (typeof themes)[ThemeId]][]) {
     const btn = document.createElement('button');
     btn.className = `theme-swatch${current === id ? ' active' : ''}`;
     const dots = (theme.colors || []).map(c => 
@@ -2593,7 +2657,7 @@ function buildThemeGrid() {
     ).join('');
     btn.innerHTML = `<span class="swatch-colors">${dots}</span>`;
     btn.addEventListener('click', () => {
-      applyTheme(id);
+      chooseTheme(id);
       themeGrid.querySelectorAll('.theme-swatch').forEach(s => s.classList.remove('active'));
       btn.classList.add('active');
     });
@@ -2675,6 +2739,7 @@ toggleShowThinking.addEventListener('click', () => {
   const isOn = toggleShowThinking.classList.contains('on');
   toggleShowThinking.className = `settings-toggle${isOn ? '' : ' on'}`;
   document.body.classList.toggle('hide-thinking', isOn);
+  for (const blocks of assistantBlockControllers) blocks.refreshThinking();
   localStorage.setItem('tau-show-thinking', String(!isOn));
 });
 
@@ -2729,9 +2794,7 @@ toggleAuth.addEventListener('click', async () => {
 
 
 
-// Restore saved theme
-const savedTheme = getCurrentTheme();
-applyTheme(savedTheme);
+applyTheme(getCurrentTheme());
 
 // ═══════════════════════════════════════
 // Session stats card (opened from the context pill)

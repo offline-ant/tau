@@ -61,8 +61,9 @@ function makeFakeChild(args: string[]) {
 export const ROUNDS = 700;
 export const TOOL_EVERY = 5;
 const LAST_USAGE = { input: 12000, cacheRead: 30000, cost: { total: 0.001 } };
-// user + assistant per round, plus one toolCall item per tool round.
-export const TOTAL_ITEMS = ROUNDS * 2 + Math.ceil(ROUNDS / TOOL_EVERY);
+// Top-level visual rows: one user plus one grouped assistant block per round.
+// Tool items stay inside their owning block, not alongside it.
+export const TOTAL_ITEMS = ROUNDS * 2;
 export const LAST_MARKER = `msg-asst-${String(ROUNDS - 1).padStart(4, '0')}`;
 
 function buildLargeSession(cwd: string) {

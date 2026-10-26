@@ -75,6 +75,8 @@ export type MessageContentBlock = {
   arguments?: Record<string, unknown>;
 };
 
+export type AssistantStep = { type: 'text' | 'thinking'; text: string };
+
 export type AppMessage = {
   id?: string;
   role?: string;
@@ -94,7 +96,7 @@ export type AppEvent = {
   sessionId?: string;
   session?: LiveSession;
   message?: AppMessage | string;
-  assistantMessageEvent?: { type?: string; delta?: string };
+  assistantMessageEvent?: { type?: string; delta?: string; contentIndex?: number; partial?: AppMessage };
   toolCallId?: string;
   parentToolCallId?: string;
   toolName?: string;

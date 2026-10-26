@@ -2,7 +2,7 @@
 // No aggressive caching since Tau connects to a live local server
 /// <reference lib="webworker" />
 
-const CACHE_NAME = 'tau-v6';
+const CACHE_NAME = 'tau-fork-v7';
 const serviceWorker = self as unknown as ServiceWorkerGlobalScope;
 
 // Cache only the app shell on install
@@ -18,14 +18,30 @@ serviceWorker.addEventListener('install', (event: ExtendableEvent) => {
         '/themes.js',
         '/markdown.js',
         '/message-renderer.js',
+        '/assistant-blocks.js',
         '/tool-card.js',
         '/javascript-code-block.js',
+        '/nested-tool-calls.js',
+        '/completion-list.js',
+        '/model-match.js',
+        '/model-picker.js',
+        '/keyboard.js',
+        '/session-limit.js',
+        '/session-link.js',
+        '/history-render.js',
+        '/voice-input.js',
+        '/file-browser.js',
+        '/launcher.js',
+        '/launcher-panel.js',
         '/tree-view.js',
         '/dialogs.js',
         '/session-sidebar.js',
         '/session-stats-card.js',
         '/websocket-client.js',
         '/manifest.json',
+        '/icons/tau-192.png',
+        '/icons/tau-512.png',
+        '/icons/tau-maskable-512.png',
         // KaTeX shell assets; fonts are picked up on demand by the
         // network-first runtime cache so a missing font can't fail install.
         '/vendor/katex/katex.min.js',

@@ -10,7 +10,7 @@ process.env.PI_CODING_AGENT_SESSION_DIR = path.join(process.env.PI_CODING_AGENT_
 
 // Load the server after the env is in place: the module reads it at load
 // time, and ESM hoists static imports ahead of this body.
-const { PiRpcSession, LiveSessionManager, normalizeModel, parseModelSpecToModel, handleRpcCommand, liveManager, _setSpawnPiForTest, NAVIGATE_COMMAND } = (await import('../bin/tau.js')) as any;
+const { PiRpcSession, LiveSessionManager, normalizeModel, parseModelSpecToModel, handleRpcCommand, liveManager, _setSpawnPiForTest, NAVIGATE_COMMAND, PI_COMMAND } = (await import('../bin/tau.js')) as any;
 import type { TestContext } from 'node:test';
 
 interface BroadcastMsg {
@@ -65,24 +65,24 @@ test('turn boundaries do not report idle before the agent completes', () => {
   }
 });
 
-test('unanswered dialogs survive snapshots without a browser and notifications are not retained', () => {
+test('unanswered dialogs survive snapshots without a browser and notifications are not retained', async () => {
   const { session, manager } = makeSession();
   // A hand-built event, not the permission extension: retention is a property
   // of confirm-style requests in general, which is why notify is dropped below.
   session.handleEvent({ type: 'extension_ui_request', id: 'approval', method: 'confirm', title: 'Permission', timeout: 5000 });
   session.handleEvent({ type: 'extension_ui_request', id: 'notice', method: 'notify', message: 'hello' });
-  const first = session.snapshot();
+  const first = (await session.snapshot());
   assert.equal(first.pendingDialogs.length, 1);
   assert.equal(first.pendingDialogs[0].id, 'approval');
   assert.equal(first.pendingDialogs[0].expiresAt - first.pendingDialogs[0].createdAt, 5000);
   assert.equal('type' in first.pendingDialogs[0], false, 'the transport type tag is not a dialog field');
   assert.equal(first.pendingDialogs[0].title, 'Permission');
   assert.equal(session.metadata().pendingInteractionCount, 1);
-  assert.deepEqual(session.snapshot().pendingDialogs, first.pendingDialogs);
+  assert.deepEqual((await session.snapshot()).pendingDialogs, first.pendingDialogs);
   assert.ok(manager.broadcasts.some(b => b.type === 'interaction_state' && b.interactionRevision === first.interactionRevision));
   assert.equal(session.entries.length, 0, 'live request IDs must not enter saved history');
   session.handleExit(0, null);
-  assert.deepEqual(session.snapshot().pendingDialogs, []);
+  assert.deepEqual((await session.snapshot()).pendingDialogs, []);
 });
 
 test('dialog replies are write-only, session scoped, and the first concurrent reply wins', async () => {
@@ -98,7 +98,7 @@ test('dialog replies are write-only, session scoped, and the first concurrent re
   assert.deepEqual(writes, [{ type: 'extension_ui_response', id: 'approval', confirmed: true }]);
   finishWrite!();
   assert.equal((await first).success, true);
-  assert.equal(session.snapshot().pendingDialogs.length, 0);
+  assert.equal((await session.snapshot()).pendingDialogs.length, 0);
   await assert.rejects(session.respondToDialog({ type: 'extension_ui_response', id: 'approval', confirmed: true }), /pending/);
 });
 
@@ -119,7 +119,7 @@ test('Abort writes native cancellation first, cancels existing and new dialogs, 
   ]);
   assert.equal(session.metadata().abortState, 'stopping');
   assert.equal(session.isStreaming, true, 'requesting Abort is not completion');
-  assert.equal(session.snapshot().pendingDialogs.length, 0);
+  assert.equal((await session.snapshot()).pendingDialogs.length, 0);
   session.handleEvent({ type: 'agent_settled' });
   session.handleResponse({ type: 'response', command: 'abort', id: 'stop-1', success: true });
   assert.equal((await first).success, true);
@@ -128,22 +128,22 @@ test('Abort writes native cancellation first, cancels existing and new dialogs, 
   assert.equal(session.isStreaming, false);
 });
 
-test('dialog deadlines are not restarted and unrelated idle dialogs survive tool/turn completion', (t) => {
+test('dialog deadlines are not restarted and unrelated idle dialogs survive tool/turn completion', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   const { session } = makeSession();
   session.handleEvent({ type: 'extension_ui_request', id: 'idle', method: 'editor' });
   session.handleEvent({ type: 'agent_start' });
   session.handleEvent({ type: 'extension_ui_request', id: 'timed', method: 'select', timeout: 100 });
-  const deadline = session.snapshot().pendingDialogs.find((d: RpcCommand) => d.id === 'timed').expiresAt;
+  const deadline = (await session.snapshot()).pendingDialogs.find((d: RpcCommand) => d.id === 'timed').expiresAt;
   t.mock.timers.tick(75);
-  assert.equal(session.snapshot().pendingDialogs.find((d: RpcCommand) => d.id === 'timed').expiresAt, deadline);
+  assert.equal((await session.snapshot()).pendingDialogs.find((d: RpcCommand) => d.id === 'timed').expiresAt, deadline);
   session.handleEvent({ type: 'tool_execution_end', toolCallId: 'unrelated' });
-  assert.equal(session.snapshot().pendingDialogs.length, 2);
+  assert.equal((await session.snapshot()).pendingDialogs.length, 2);
   t.mock.timers.tick(25);
-  assert.deepEqual(session.snapshot().pendingDialogs.map((d: RpcCommand) => d.id), ['idle']);
+  assert.deepEqual((await session.snapshot()).pendingDialogs.map((d: RpcCommand) => d.id), ['idle']);
   session.handleEvent({ type: 'extension_ui_request', id: 'turn', method: 'confirm' });
   session.handleEvent({ type: 'agent_settled' });
-  assert.deepEqual(session.snapshot().pendingDialogs.map((d: RpcCommand) => d.id), ['idle']);
+  assert.deepEqual((await session.snapshot()).pendingDialogs.map((d: RpcCommand) => d.id), ['idle']);
   session.handleExit(0, null);
 });
 
@@ -152,7 +152,7 @@ test('all dialog methods validate replies and failed stdin delivery remains reco
   session.child = { stdin: { writable: true, write(_data: string, cb: (error?: Error) => void) { cb(new Error('broken pipe')); } } };
   session.handleEvent({ type: 'extension_ui_request', id: 'confirm', method: 'confirm' });
   await assert.rejects(session.respondToDialog({ id: 'confirm', confirmed: false }), /broken pipe/);
-  assert.equal(session.snapshot().pendingDialogs.length, 1);
+  assert.equal((await session.snapshot()).pendingDialogs.length, 1);
   assert.equal(session.pending.size, 0);
   session.child.stdin.write = (_data: string, cb: () => void) => cb();
   await session.respondToDialog({ id: 'confirm', confirmed: false });
@@ -162,7 +162,7 @@ test('all dialog methods validate replies and failed stdin delivery remains reco
     if (method === 'select') await assert.rejects(session.respondToDialog({ id: method, value: 'not-an-option' }), /Invalid/);
     assert.equal((await session.respondToDialog({ id: method, value: 'safe' })).success, true);
   }
-  assert.equal(session.snapshot().pendingDialogs.length, 0);
+  assert.equal((await session.snapshot()).pendingDialogs.length, 0);
 });
 
 test('a genuine Abort timeout remains stopping and a late acknowledgement recovers the session', async (t) => {
@@ -436,7 +436,7 @@ test('title is truncated at the first sentence-end punctuation inside the window
   assert.equal(session.sessionName, 'Fix the bug');
 });
 
-test('snapshot and metadata expose the current session state', () => {
+test('snapshot and metadata expose the current session state', async () => {
   const { session } = makeSession('openai/gpt-5.5:high');
   // Constructor canonicalizes the spec into a full object + level.
   assert.deepEqual(session.model, { provider: 'openai', id: 'gpt-5.5' });
@@ -448,7 +448,7 @@ test('snapshot and metadata expose the current session state', () => {
   assert.equal(meta.modelSpec, 'openai/gpt-5.5:high');
   assert.equal(meta.modelLabel, 'openai/gpt-5.5');
   assert.equal(meta.isStreaming, true);
-  const snap = session.snapshot();
+  const snap = await session.snapshot();
   assert.equal(snap.session.id, session.id);
   assert.equal(snap.isStreaming, true);
   assert.deepEqual(snap.entries, []);
@@ -555,7 +555,7 @@ test('set_thinking_level restores previous level on pi failure', async () => {
   }
 });
 
-test('constructor accepts sessionFile, entries, and sessionName and they appear in snapshot/metadata', () => {
+test('constructor accepts sessionFile, entries, and sessionName and they appear in snapshot/metadata', async () => {
   const manager = makeManager();
   const entries = [{ type: 'message', message: { role: 'user', content: 'hello' } }, { type: 'message', message: { role: 'assistant', content: 'hi' } }];
   const session = new PiRpcSession(manager, {
@@ -570,7 +570,7 @@ test('constructor accepts sessionFile, entries, and sessionName and they appear 
   assert.equal(session.entries.length, 2);
   assert.deepEqual(session.entries[0], entries[0]);
   // Snapshot must include the pre-seeded fields.
-  const snap = session.snapshot();
+  const snap = await session.snapshot();
   assert.equal(snap.sessionFile, '/tmp/resumed.jsonl');
   assert.equal(snap.sessionName, 'Resumed Chat');
   assert.equal(snap.entries.length, 2);
@@ -604,6 +604,7 @@ test('start() passes --session <file> and waits for state and tree responses', a
   child.respond(child.commands[1]);
   await starting;
   assert.equal(spawnArgs.length, 1);
+  assert.equal(spawnArgs[0].cmd, PI_COMMAND, 'startup uses the configured Pi executable');
   const args = spawnArgs[0].args;
   assert.equal(args[args.indexOf('--mode') + 1], 'rpc');
   assert.equal(args[args.indexOf('--session') + 1], sessionFile);
@@ -771,8 +772,11 @@ for (const command of ['prompt', 'steer', 'follow_up']) {
 for (const restored of [true, false]) {
   test(`late input acknowledgement refreshes the file after ${restored ? 'rollback' : 'session replacement'} without an ownership gap`, async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
-    const original = '/tmp/tau-switch-original.jsonl';
-    const temporary = '/tmp/tau-switch-temporary.jsonl';
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-late-input-'));
+    t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+    const original = path.join(directory, 'original.jsonl');
+    const temporary = path.join(directory, 'temporary.jsonl');
+    fs.writeFileSync(temporary, JSON.stringify({ type: 'session', id: 'replacement', cwd: directory }) + '\n');
     const child = new FakePi({ sessionFile: original });
     _setSpawnPiForTest(() => child.asChild());
     t.after(() => _setSpawnPiForTest(null));
@@ -800,6 +804,12 @@ for (const restored of [true, false]) {
     assert.equal(manager.findBySessionFile(original), session, 'keep ownership until the post-command refresh responds');
     child.respond(child.commands[1]);
     await flushIo();
+    if (!restored) {
+      assert.equal(child.commands[2].type, 'get_tree');
+      assert.equal(manager.findBySessionFile(original), session, 'tree confirmation still holds the original file');
+      child.respond(child.commands[2]);
+      await flushIo();
+    }
     assert.equal(session.sessionFile, child.state.sessionFile);
     assert.equal(manager.findBySessionFile(original), restored ? session : undefined);
     assert.equal(manager.findBySessionFile(child.state.sessionFile), session);
@@ -821,9 +831,10 @@ for (const failure of ['timeout', 'unsuccessful']) {
     const sent = session.send({ type: 'prompt', message: '/switch herdr' });
     session.handleResponse({ type: 'response', command: 'get_state', success: true, data: { sessionFile: '/tmp/temporary.jsonl' } });
     child.respond(child.commands[0]);
-    await sent;
+    await flushIo();
     if (failure === 'timeout') t.mock.timers.tick(5000);
     else child.respond(child.commands[1], { success: false, data: undefined, error: 'state unavailable' });
+    assert.equal((await sent).success, false);
     await flushIo();
     assert.equal(manager.findBySessionFile(original), session);
     assert.equal((await manager.resume({ sessionFile: original, cwd: os.tmpdir() })).started, false);

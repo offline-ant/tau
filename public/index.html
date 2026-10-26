@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, interactive-widget=resizes-content">
   <title>Tau</title>
   <link rel="icon" type="image/png" href="icons/tau-192.png">
   <link rel="manifest" href="manifest.json">
@@ -10,7 +10,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="Tau">
-  <meta name="theme-color" content="#f5f3ef">
+  <meta name="theme-color" content="#3390ec">
   <link rel="stylesheet" href="style.css">
   <link rel="stylesheet" href="vendor/katex/katex.min.css">
 </head>
@@ -69,30 +69,33 @@
       <!-- In-page Tau live-session tabs -->
       <div class="live-tabs" id="live-tabs">
         <div class="live-tabs-list" id="live-tabs-list"></div>
+        <button class="live-tab-add" id="take-herdr-btn" type="button" title="Take an idle Herdr conversation into the current Tau tab" aria-label="Take from Herdr…">↙</button>
         <button class="live-tab-add" id="live-tab-add" title="New Tau tab" aria-label="New Tau tab">+</button>
       </div>
 
       <!-- Launcher (project picker) -->
       <div class="launcher hidden" id="launcher"></div>
 
-      <!-- Messages Container -->
-      <div class="messages" id="messages">
-        <div class="welcome">
-          <div class="welcome-icon"><img src="icons/tau-192.png" alt="τ" class="tau-icon-welcome"></div>
-          <p>Welcome to Tau</p>
-          <p class="hint">Type a message below to start chatting with Pi, or select a session from the sidebar.</p>
-          <div class="shortcuts-hint">
-            <span>/ Focus input</span>
-            <span>Esc Abort</span>
+      <!-- Messages, with the scroll-to-bottom button pinned above the composer -->
+      <div class="messages-pane">
+        <div class="messages" id="messages">
+          <div class="welcome">
+            <div class="welcome-icon"><img src="icons/tau-192.png" alt="τ" class="tau-icon-welcome"></div>
+            <p>Welcome to Tau</p>
+            <p class="hint">Type a message below to start chatting with Pi, or select a session from the sidebar.</p>
+            <div class="shortcuts-hint">
+              <span>/ Focus input</span>
+              <span>Esc Abort</span>
+            </div>
           </div>
         </div>
-      </div>
 
-      <!-- Scroll to bottom + new message indicator -->
-      <button class="scroll-bottom-btn hidden" id="scroll-bottom-btn">
-        <span class="scroll-bottom-badge hidden" id="scroll-bottom-badge">New <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg></span>
-        <span class="scroll-bottom-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg></span>
-      </button>
+        <!-- Scroll to bottom + new message indicator -->
+        <button class="scroll-bottom-btn hidden" id="scroll-bottom-btn">
+          <span class="scroll-bottom-badge hidden" id="scroll-bottom-badge">New <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg></span>
+          <span class="scroll-bottom-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg></span>
+        </button>
+      </div>
 
       <!-- Typing indicator (hidden, kept for JS reference) -->
       <div class="typing-indicator hidden" id="typing-indicator"></div>

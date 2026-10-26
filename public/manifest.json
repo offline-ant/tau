@@ -4,8 +4,8 @@
   "description": "Standalone web server for managing multiple Pi RPC sessions in the browser",
   "start_url": "/",
   "display": "fullscreen",
-  "background_color": "#f5f3ef",
-  "theme_color": "#f5f3ef",
+  "background_color": "#ffffff",
+  "theme_color": "#3390ec",
   "orientation": "any",
   "icons": [
     {

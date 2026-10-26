@@ -140,7 +140,7 @@ export type NavigableSession = {
   isStreaming: boolean;
   entries: JsonRecord[];
   send: (command: RpcCommand, opts?: { timeoutMs?: number }) => Promise<RpcResponse>;
-  snapshot: () => JsonRecord;
+  snapshot: () => JsonRecord | Promise<JsonRecord>;
   manager: { broadcast: (data: unknown) => void; broadcastUpdated: (id: string) => void };
   /**
    * Last `extension_error` event text reported by the pi child (set by
@@ -263,7 +263,7 @@ export async function navigateTree(session: NavigableSession, entryId: string): 
     // the child is authoritative, so even when verification fails below every
     // client must be re-rendered onto whatever the child actually has.
     session.entries = pathFromRoot(byId, newLeafId) as unknown as JsonRecord[];
-    session.manager.broadcast({ type: 'live_session_snapshot', sessionId: session.id, ...session.snapshot() });
+    session.manager.broadcast({ type: 'live_session_snapshot', sessionId: session.id, ...await session.snapshot() });
     session.manager.broadcastUpdated(session.id);
     // On success the extension appended a marker at the navigation target and
     // that marker IS the child's new leaf (no reload happens, so nothing else

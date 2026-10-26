@@ -82,6 +82,8 @@ test('refresh refuses an unfinished run even after turn_end until agent_settled'
   session.handleEvent({ type: 'agent_start' });
   session.handleEvent({ type: 'turn_end' });
   await assert.rejects(manager.resume({ ...options, refresh: true }), /busy/);
+  session.handleEvent({ type: 'agent_end' });
+  await assert.rejects(manager.resume({ ...options, refresh: true }), /busy/);
   session.handleEvent({ type: 'agent_settled' });
   assert.equal((await manager.resume({ ...options, refresh: true })).refreshed, true);
 });

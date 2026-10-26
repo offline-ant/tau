@@ -2,13 +2,16 @@ export type JsonRecord = Record<string, unknown>;
 export type TauArgs = Record<string, string | boolean | undefined> & {
   open?: boolean;
   port?: string;
+  'http-port'?: string;
   host?: string;
   'projects-dir'?: string;
 };
 export type TauSettingsFile = {
   tau?: {
     port?: string | number;
+    httpPort?: string | number;
     host?: string;
+    hostnames?: string[];
     user?: string;
     pass?: string;
     authEnabled?: boolean;
@@ -19,7 +22,9 @@ export type TauSettingsFile = {
 };
 export type TauSettings = {
   port: number;
+  httpPort: number;
   host: string;
+  hostnames: string[];
   user: string;
   pass: string;
   authEnabled?: boolean;
