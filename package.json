@@ -39,7 +39,8 @@
   "type": "module",
   "main": "./bin/tau.js",
   "bin": {
-    "pi-tau-web-server": "./bin/tau.js"
+    "pi-tau-web-server": "./bin/tau.js",
+    "tau-dictate": "./bin/dictate.js"
   },
   "engines": {
     "node": ">=22.19.0"
