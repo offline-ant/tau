@@ -39,8 +39,7 @@
   "type": "module",
   "main": "./bin/tau.js",
   "bin": {
-    "pi-tau-web-server": "./bin/tau.js",
-    "tau-dictate": "./bin/dictate.js"
+    "pi-tau-web-server": "./bin/tau.js"
   },
   "engines": {
     "node": ">=22.19.0"
@@ -66,6 +65,7 @@
     "test:e2e": "bash scripts/e2e.sh"
   },
   "dependencies": {
+    "pi-sound": "file:../pi-sound",
     "ws": "^8.21.1"
   },
   "devDependencies": {

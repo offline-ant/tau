@@ -168,10 +168,8 @@ never become Pi prompts, RPC commands, temporary files, or session entries. The
 final transcript is inserted once at the textarea selection; partial text is only
 previewed, so never replace or submit the draft. Session switches cancel, and every
 exit releases microphone tracks, the audio context, and the socket. `voice.json` is
-re-read per recording (pi-ant's `/rec-setting` writes it); malformed configuration
-is an error, and there is no fallback between backends. The Claude backend mirrors
-Claude Code's private `voice_stream` protocol (`TranscriptInterim`/`TranscriptText`
-replace pending text, `TranscriptEndpoint` commits it) and only reads the native
-login: never refresh Claude tokens here. Checks: `node --test test/voice.test.ts
-test/voice-route.test.ts test/e2e/voice-input.e2e.ts`; paid live check only with
-`TAU_VOICE_LIVE=1 node --test test/voice-live.test.ts`.
+re-read per recording (Pi's `/dictate-setting` from pi-sound writes it); malformed
+configuration is an error, and there is no fallback between backends. Settings, the
+Claude login and the speech backends are pi-sound's library (`file:../pi-sound`);
+change them there, never re-implement them here. Checks: `node --test
+test/voice.test.ts test/voice-route.test.ts test/e2e/voice-input.e2e.ts`.

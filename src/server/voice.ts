@@ -7,32 +7,23 @@
  * `{"type":"final","text","limited"?}` or `{"type":"error","message"}` before
  * closing. Closing the socket cancels the recording. Audio and text never
  * reach Pi: nothing is prompted, stored, or written to session history.
+ * Settings and speech backends come from pi-sound.
  */
 
 import { WebSocket } from 'ws';
 
-import { SAMPLE_RATE, claudeTranscriber, localTranscriber, type Transcriber, type TranscriberEvents } from './voice-backends.js';
-import { claudeAccessToken, readVoiceConfig } from './voice-config.js';
+import { IDLE_MS, MAX_RECORDING_SECONDS, SAMPLE_RATE, type OpenTranscriber, type Transcriber } from 'pi-sound';
+
+export { configuredTranscriber } from 'pi-sound';
 
 export const VOICE_PATH = '/ws/voice';
-export const MAX_RECORDING_SECONDS = 300;
 export const MAX_FRAME_BYTES = 64 * 1024;
-
-export type OpenTranscriber = (events: TranscriberEvents) => { backend: string; transcriber: Transcriber };
-
-export function configuredTranscriber(agentDir: string): OpenTranscriber {
-  return (events) => {
-    const config = readVoiceConfig(agentDir);
-    if (config.backend === 'local') return { backend: 'local', transcriber: localTranscriber({ url: config.localUrl }) };
-    return { backend: 'claude', transcriber: claudeTranscriber({ token: claudeAccessToken(agentDir) }, events) };
-  };
-}
 
 export type VoiceLimits = { maxSeconds?: number; idleMs?: number };
 
 export function handleVoiceSocket(ws: WebSocket, open: OpenTranscriber, limits: VoiceLimits = {}): void {
   const maxBytes = (limits.maxSeconds ?? MAX_RECORDING_SECONDS) * SAMPLE_RATE * 2;
-  const idleMs = limits.idleMs ?? 15_000;
+  const idleMs = limits.idleMs ?? IDLE_MS;
   let transcriber: Transcriber | null = null;
   let received = 0;
   let done = false;
@@ -50,7 +41,7 @@ export function handleVoiceSocket(ws: WebSocket, open: OpenTranscriber, limits: 
   const fail = (message: string) => end({ type: 'error', message });
   const resetIdle = () => {
     clearTimeout(idle);
-    idle = setTimeout(() => fail('No audio received for 15 seconds; recording stopped.'), idleMs);
+    idle = setTimeout(() => fail(`No audio received for ${Math.round(idleMs / 1000)} seconds; recording stopped.`), idleMs);
   };
   let finishing = false;
   function finish(limited: boolean) {

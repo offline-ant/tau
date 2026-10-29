@@ -167,18 +167,14 @@ access.
   transcript is inserted once at the cursor and never sent. Switching or closing
   the tab cancels. Browsers require HTTPS (or localhost) for the microphone,
   which Tau's network listener provides (see [HTTPS](#https)).
-  The backend is read from `<PI_CODING_AGENT_DIR>/voice.json` at each recording:
-  `{"backend":"claude"}` (default; Claude Code's subscription speech endpoint,
-  using the pi-claude-agent default account's Claude login, never refreshed by
-  Tau) or `{"backend":"local","localUrl":"http://127.0.0.1:8090"}` (any
-  OpenAI-compatible `/v1/audio/transcriptions` server). English only; no fallback.
-- **Terminal dictation** — `tau-dictate` (`bin/dictate.js`) records from a
-  microphone shared as `<host>.sock` in `/tmp/pi-mic-<uid>` (`PI_MIC_DIR`
-  overrides; the newest socket that answers wins), uses the same backend, and
-  prints JSON lines (`ready`, `partial`, then one `final` or `error`). End of
-  standard input stops and transcribes; SIGTERM cancels. Emacs runs it for
-  `SPC v`; microphones are shared over SSH by the `pi-mic` script in the
-  workspace owner's dotfiles.
+  Settings and speech backends come from the sibling
+  [pi-sound](../pi-sound) package (`file:../pi-sound` dependency; compile it
+  before installing Tau). The backend is read from
+  `<PI_CODING_AGENT_DIR>/voice.json` at each recording: `claude` (default;
+  Claude Code's subscription speech endpoint, using the pi-claude-agent default
+  account's Claude login, never refreshed) or `local` (any OpenAI-compatible
+  `/v1/audio/transcriptions` server); choose it with Pi's `/dictate-setting`.
+  English only; no fallback. Terminal and Emacs dictation are pi-sound's.
 
 ### Live Session Management
 
@@ -375,6 +371,7 @@ The browser connects to Tau Web Server over WebSocket (and HTTP for history and 
 
 - [Pi](https://github.com/earendil-works/pi) must be installed (`pi` on `PATH`)
 - Node.js and npm
+- A compiled [pi-sound](../pi-sound) checkout next to this one (`npm ci --ignore-scripts && npm run compile` there); Tau depends on it as `file:../pi-sound`
 
 ### Setup
 
@@ -407,9 +404,9 @@ npm test
 
 The test suite uses Node.js built-in `node --test` and covers session-file path validation, the `PiRpcSession` state machine, `LiveSessionManager`, the `/api/rpc` shim, HTTP + WebSocket server surface (including same-origin/CORS hardening and malformed-URL hardening), and WebSocket auth gating.
 
-Dictation: `node --test test/voice.test.ts test/voice-route.test.ts test/dictate.test.ts test/e2e/voice-input.e2e.ts`
-uses fake speech backends and Chromium's fake microphone. The live Claude check is
-opt-in because it uses subscription quota: `TAU_VOICE_LIVE=1 node --test test/voice-live.test.ts`.
+Dictation: `node --test test/voice.test.ts test/voice-route.test.ts test/e2e/voice-input.e2e.ts`
+uses fake speech backends and Chromium's fake microphone. Backend and settings
+tests, including the opt-in live Claude check, live in pi-sound.
 
 Each test file points `PI_CODING_AGENT_DIR` at an isolated temp tree so real Pi settings and sessions are never touched. The `LiveSessionManager` tests replace the real `spawn` with a test stub.
 
@@ -424,8 +421,7 @@ Each test file points `PI_CODING_AGENT_DIR` at an isolated temp tree so real Pi 
 │   │   ├── sessions.ts      # PiRpcSession + LiveSessionManager
 │   │   ├── model-utils.ts   # Model parsing and formatting
 │   │   ├── config.ts        # Settings, paths, CLI args
-│   │   ├── voice*.ts        # Dictation socket, configuration, speech backends
-│   │   ├── dictate.ts       # tau-dictate terminal dictation CLI
+│   │   ├── voice.ts         # Dictation socket (backends from pi-sound)
 │   │   └── types.ts         # Shared type definitions
 │   └── public/     # Browser TypeScript source
 │       ├── app.ts, app-main.ts, state.ts, themes.ts, ...
