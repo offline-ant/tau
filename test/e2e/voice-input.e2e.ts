@@ -7,7 +7,7 @@ import { after, before, beforeEach, test } from 'node:test';
 import { chromium, type Browser, type Page } from 'playwright';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { handleVoiceSocket } from '../../bin/voice.js';
-import type { TranscriberEvents } from '../../src/server/voice-backends.ts';
+import type { TranscriberEvents } from 'pi-sound';
 
 // Dictation in real Chromium with its fake microphone, against the compiled UI
 // and Tau's real voice socket handler with a fake transcriber (no inference).
