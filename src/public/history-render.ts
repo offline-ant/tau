@@ -22,6 +22,14 @@ export type HistoryBuildResult = {
   lastUsage: UsageRecord | null;
 };
 
+export function messageImages(message: AppMessage): HistoryImage[] {
+  if (!Array.isArray(message.content)) return [];
+  return message.content.filter(block => block.type === 'image').map(block => ({
+    data: block.source?.data || block.data || '',
+    mimeType: block.source?.media_type || block.mimeType || block.media_type || 'image/png',
+  }));
+}
+
 export function buildHistoryItems(entries: SessionHistoryEntry[]): HistoryBuildResult {
   const items: HistoryItem[] = [];
   const toolCallItems = new Map<string, HistoryToolCallItem>();
@@ -41,8 +49,7 @@ export function buildHistoryItems(entries: SessionHistoryEntry[]): HistoryBuildR
     if (msg.role === 'user') {
       const content = typeof msg.content === 'string' ? msg.content
         : (msg.content || []).filter(block => block.type === 'text').map(block => block.text).join('\n');
-      const images = Array.isArray(msg.content) ? msg.content.filter(block => block.type === 'image')
-        .map(block => ({ data: block.source?.data || block.data || '', mimeType: block.source?.media_type || block.media_type || 'image/png' })) : [];
+      const images = messageImages(msg);
       if (content || images.length) items.push({ kind: 'user', content, images: images.length ? images : undefined });
     } else if (msg.role === 'assistant') {
       // Usage belongs to the message, not each visual step within it.

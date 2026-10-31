@@ -19,10 +19,11 @@ type ModelPickerOptions = {
   escapeHtml(text: string): string;
   setContextWindowSize(value: number): void;
   updateContextPill(): void;
+  focusComposer(): void;
 };
 
 export function setupModelPicker(options: ModelPickerOptions) {
-  const { getActiveLiveSessionId, isViewingActiveSession, rpcCommand, flashStatusError, escapeHtml, setContextWindowSize, updateContextPill } = options;
+  const { getActiveLiveSessionId, isViewingActiveSession, rpcCommand, flashStatusError, escapeHtml, setContextWindowSize, updateContextPill, focusComposer } = options;
 
 // ═══════════════════════════════════════
 // Model Picker
@@ -329,6 +330,7 @@ function closeModelPicker() {
   modelPickerJustSelected = false;
   modelPickerList.innerHTML = '';
   setModelPickerMessage(MODEL_PICKER_HELP, false);
+  focusComposer();
 }
 
 async function applyModelSpec(rawSpec: string) {

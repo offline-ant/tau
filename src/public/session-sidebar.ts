@@ -18,6 +18,8 @@ export type SidebarSession = {
   mtime?: number;
   live?: boolean;
   owner?: unknown;
+  /** Mux id when another frontend shares this session through pimux: opening it attaches. */
+  shared?: string | null;
 };
 
 export type SidebarProject = {
@@ -31,6 +33,7 @@ export class SessionSidebar {
   container: HTMLElement;
   onSessionSelect: (session: SidebarSession | null) => void;
   onNewSession: (cwd: string) => void;
+  onError: (message: string) => void;
   activeSessionFile: string | null;
   projects: SidebarProject[];
   sessionsByDir: Map<string, SidebarSession[]>;
@@ -43,10 +46,12 @@ export class SessionSidebar {
     container: HTMLElement,
     onSessionSelect: (session: SidebarSession | null) => void,
     onNewSession: (cwd: string) => void,
+    onError: (message: string) => void,
   ) {
     this.container = container;
     this.onSessionSelect = onSessionSelect;
     this.onNewSession = onNewSession;
+    this.onError = onError;
     this.activeSessionFile = null;
     this.projects = [];
     this.sessionsByDir = new Map();
@@ -81,6 +86,23 @@ export class SessionSidebar {
     } catch (error) {
       console.error('[Sidebar] Failed to load projects:', error);
       this.container.innerHTML = '<div class="session-loading">Failed to load sessions</div>';
+    }
+  }
+
+  /** Picks up sessions that appeared or changed, in place: no skeleton, and open lists stay open. */
+  async refresh() {
+    if (this.contextMenu || this.container.querySelector('.session-rename-input')) return;
+    try {
+      const data = await (await fetch('/api/sessions')).json();
+      const lists = await Promise.all(Array.from(this.sessionsByDir.keys(), async (dirName) => {
+        const list = await (await fetch(`/api/sessions/${encodeURIComponent(dirName)}`)).json();
+        return [dirName, list.sessions || []] as const;
+      }));
+      this.projects = data.projects || [];
+      for (const [dirName, sessions] of lists) this.sessionsByDir.set(dirName, sessions);
+      this.render();
+    } catch {
+      /* Tau went away; the reconnect refreshes again. */
     }
   }
 
@@ -216,21 +238,25 @@ export class SessionSidebar {
     input.select();
 
     const commit = async () => {
-      const newName = input.value.trim();
-      if (newName && newName !== currentName) {
+      let name = input.value.trim() || currentName;
+      if (name !== currentName) {
         try {
-          await fetch('/api/rpc', {
+          const data = await (await fetch('/api/rpc', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ type: 'set_session_name', name: newName, filePath: session.filePath }),
-          });
-          session.name = newName;
-        } catch { /* silent */ }
+            body: JSON.stringify({ type: 'set_session_name', name, filePath: session.filePath }),
+          })).json();
+          if (data.success === false) throw new Error(data.error || 'Could not rename the session');
+          session.name = name;
+        } catch (error) {
+          this.onError(error instanceof Error ? error.message : 'Could not rename the session');
+          name = currentName;
+        }
       }
       const newTitle = document.createElement('div');
       newTitle.className = 'session-title';
-      newTitle.title = newName || currentName;
-      newTitle.textContent = newName || currentName;
+      newTitle.title = name;
+      newTitle.textContent = name;
       input.replaceWith(newTitle);
     };
 
@@ -250,7 +276,11 @@ export class SessionSidebar {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ filePath: session.filePath }),
       });
-      if (!res.ok) return;
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        this.onError(data?.error || 'Could not delete the session');
+        return;
+      }
       const sessions = this.sessionsByDir.get(project.dirName);
       if (sessions) this.sessionsByDir.set(project.dirName, sessions.filter(s => s.filePath !== session.filePath));
       project.count = Math.max(0, project.count - 1);
@@ -266,6 +296,7 @@ export class SessionSidebar {
       this.render();
     } catch (e) {
       console.error('[Sidebar] Delete failed:', e);
+      this.onError('Could not delete the session');
     }
   }
 
@@ -425,9 +456,10 @@ export class SessionSidebar {
     }
   }
 
+  /** Also used inside quoted attributes, so quotes are escaped too. */
   escapeHtml(text: unknown) {
     const div = document.createElement('div');
     div.textContent = String(text ?? '');
-    return div.innerHTML;
+    return div.innerHTML.replace(/"/g, '&quot;');
   }
 }

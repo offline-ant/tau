@@ -135,9 +135,12 @@ export class FileBrowser {
 
       el.innerHTML = `
         <span class="file-icon">${icon}</span>
-        <span class="file-name" title="${item.name}">${item.name}</span>
+        <span class="file-name"></span>
         ${size ? `<span class="file-size">${size}</span>` : ''}
       `;
+      const fileName = el.querySelector<HTMLElement>('.file-name')!;
+      fileName.textContent = item.name;
+      fileName.title = item.name;
 
       // Click: navigate directory or insert file path into input
       el.addEventListener('click', () => {

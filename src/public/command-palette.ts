@@ -1,7 +1,11 @@
+import { activateRow, moveListFocus } from './keyboard.js';
+
 type CommandPaletteItem = {
   icon: string;
   label: string;
   desc: string;
+  /** Omitted commands always apply; others are left out when they cannot work in the current tab. */
+  available?(): boolean;
   action(): void;
 };
 
@@ -15,9 +19,10 @@ export function setupCommandPalette(commands: CommandPaletteItem[]) {
 
   function open() {
     commandList.innerHTML = '';
-    commands.forEach(cmd => {
+    commands.filter(cmd => cmd.available?.() ?? true).forEach(cmd => {
       const el = document.createElement('div');
       el.className = 'command-item';
+      el.tabIndex = 0;
       el.innerHTML = `
         <div class="command-icon">${cmd.icon}</div>
         <div>
@@ -29,10 +34,12 @@ export function setupCommandPalette(commands: CommandPaletteItem[]) {
         close();
         cmd.action();
       });
+      el.addEventListener('keydown', (e) => activateRow(e, el));
       commandList.appendChild(el);
     });
     commandPalette.classList.remove('hidden');
     commandPaletteOverlay.classList.remove('hidden');
+    commandList.querySelector<HTMLElement>('.command-item')?.focus();
   }
 
   function close() {
@@ -47,6 +54,7 @@ export function setupCommandPalette(commands: CommandPaletteItem[]) {
   }
 
   commandBtn.addEventListener('click', open);
+  commandList.addEventListener('keydown', (e) => moveListFocus(e, Array.from(commandList.querySelectorAll<HTMLElement>('.command-item'))));
   commandPaletteOverlay.addEventListener('click', close);
 
   return { close, closeIfOpen };

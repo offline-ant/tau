@@ -2,7 +2,7 @@
  * Dialogs - Handles extension UI dialogs
  */
 
-import { isImeComposition } from './keyboard.js';
+import { activateRow, isImeComposition, moveListFocus } from './keyboard.js';
 
 export type DialogRequest = {
   id?: string;
@@ -57,6 +57,7 @@ export class DialogHandler {
       const optionDiv = document.createElement('div');
       optionDiv.className = 'dialog-option';
       optionDiv.textContent = option;
+      optionDiv.tabIndex = 0;
       optionDiv.onclick = () => {
         this.respond(id, { value: option }, sessionId);
       };
@@ -106,7 +107,7 @@ export class DialogHandler {
     dialog.className = 'dialog';
     dialog.innerHTML = `
       <div class="dialog-title">${this.escapeHtml(title || 'Input')}</div>
-      <input type="text" class="dialog-input" id="dialog-input" placeholder="${this.escapeHtml(placeholder || '')}" />
+      <input type="text" class="dialog-input" id="dialog-input" />
       <div class="dialog-actions">
         <button id="dialog-cancel">Cancel</button>
         <button id="dialog-submit">Submit</button>
@@ -115,6 +116,7 @@ export class DialogHandler {
 
     const input = dialog.querySelector<HTMLInputElement>('#dialog-input');
     if (!input) return;
+    input.placeholder = placeholder || '';
     
     const submit = () => {
       const value = input.value.trim();
@@ -176,8 +178,9 @@ export class DialogHandler {
     
     // Create a temporary notification element
     const notification = document.createElement('div');
-    notification.className = 'error-message';
-    notification.textContent = `${notifyType === 'error' ? '⚠️' : notifyType === 'warning' ? '⚠️' : 'ℹ️'} ${message}`;
+    const failed = notifyType === 'error' || notifyType === 'warning';
+    notification.className = failed ? 'error-message' : 'system-message';
+    notification.textContent = `${failed ? '⚠️' : 'ℹ️'} ${message}`;
     
     // Add to messages container temporarily
     const messagesContainer = document.getElementById('messages');
@@ -198,6 +201,20 @@ export class DialogHandler {
     this.container.innerHTML = '';
     this.container.appendChild(dialogElement);
     this.container.classList.remove('hidden');
+
+    // A dialog owns the keyboard: Escape cancels it instead of aborting the run behind it.
+    dialogElement.addEventListener('keydown', (e: KeyboardEvent) => {
+      if (isImeComposition(e)) return;
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        this.respond(requestId, { cancelled: true }, sessionId);
+        return;
+      }
+      const options = Array.from(dialogElement.querySelectorAll<HTMLElement>('.dialog-option'));
+      if (moveListFocus(e, options)) return;
+      if (options.includes(e.target as HTMLElement)) activateRow(e, e.target as HTMLElement);
+    });
+    dialogElement.querySelector<HTMLElement>('.dialog-option, button')?.focus();
 
     // Set up timeout if specified
     if (timeout) {

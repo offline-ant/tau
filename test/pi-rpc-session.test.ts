@@ -25,6 +25,15 @@ type RpcCommand = { type: string; id?: string; message?: string; [k: string]: un
 type RpcOpts = { timeoutMs?: number };
 type FakeWrite = (data: string, cb?: (err?: Error | null) => void) => void;
 
+/** A spawned-child transport that accepts every write. */
+function stubTransport(options: { writable?: boolean; stderr?: string[] } = {}) {
+  return {
+    kind: 'spawned', pid: null, writable: options.writable ?? true,
+    write: ((_d: string, cb?: (err?: Error | null) => void) => cb && cb()) as FakeWrite,
+    close: async () => {}, abandon() {}, stderrTail: () => options.stderr ?? [],
+  };
+}
+
 function makeManager() {
   const broadcasts: BroadcastMsg[] = [];
   const updated: string[] = [];
@@ -112,9 +121,7 @@ test('assistant message_end records usage but never overwrites model identity', 
 test('handleResponse resolves a pending send command and updates state', async () => {
   const { session } = makeSession();
   // stub a child with a writable stdin that accepts the write
-  session.child = {
-    stdin: { writable: true, write: ((_data: string, cb?: (err?: Error | null) => void) => cb && cb()) as FakeWrite },
-  };
+  session.transport = stubTransport();
   const p = session.send({ type: 'get_session_stats' }, { timeoutMs: 500 });
   // find the assigned id from the pending map
   const id = [...session.pending.keys()][0];
@@ -134,13 +141,13 @@ test('handleResponse resolves a pending send command and updates state', async (
 
 test('send rejects when the child stdin is not writable', async () => {
   const { session } = makeSession();
-  session.child = { stdin: { writable: false } };
+  session.transport = stubTransport({ writable: false });
   await assert.rejects(() => session.send({ type: 'prompt', message: 'hi' }), /not running/);
 });
 
 test('send rejects when terminating', async () => {
   const { session } = makeSession();
-  session.child = { stdin: { writable: true, write: ((_d: string, cb?: (err?: Error | null) => void) => cb && cb()) as FakeWrite } };
+  session.transport = stubTransport();
   session.terminating = true;
   await assert.rejects(() => session.send({ type: 'prompt', message: 'hi' }), /not running/);
 });
@@ -149,7 +156,7 @@ test('terminate rejects pending commands and waits for actual exit after SIGKILL
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const { session } = makeSession();
   const child = new FakePi({ autoRespond: false, exitOnSignal: null });
-  session.child = child.asChild();
+  session.useChild(child.asChild());
   const check = assert.rejects(session.send({ type: 'get_session_stats' }, { timeoutMs: 100000 }), /Session terminated/);
   const term = session.terminate('closed_by_user');
   assert.equal(session.terminate('duplicate'), term, 'concurrent termination joins the exit wait');
@@ -169,7 +176,7 @@ test('terminate resolves immediately on SIGTERM exit without waiting out the gra
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const { session } = makeSession();
   const child = new FakePi();
-  session.child = child.asChild();
+  session.useChild(child.asChild());
   await session.terminate('closed_by_user');
   assert.deepEqual(child.signals, ['SIGTERM']);
   assert.equal(child.signalCode, 'SIGTERM');
@@ -179,7 +186,7 @@ test('terminate reports an uncertain outcome when neither signal produces an exi
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const { session } = makeSession();
   const child = new FakePi({ exitOnSignal: null });
-  session.child = child.asChild();
+  session.useChild(child.asChild());
   const failure = assert.rejects(session.terminate(), { childStopped: false, sessionId: session.id });
   t.mock.timers.tick(1500);
   await flushIo();
@@ -192,12 +199,11 @@ test('terminate reports an uncertain outcome when neither signal produces an exi
 test('a pending command rejected by an exit reports the child stderr that explains it', async () => {
   const manager = makeManager();
   const session = new PiRpcSession(manager, { cwd: '/tmp' });
-  session.child = { stdin: { writable: true, write: ((_d: string, cb?: (err?: Error | null) => void) => cb && cb()) as FakeWrite } };
   // A child that dies during startup says why on stderr; the exit code alone
   // made an unknown provider look like a transport failure.
-  for (let i = 0; i < 25; i++) session.stderrTail.push(`noise ${i}`);
-  if (session.stderrTail.length > 20) session.stderrTail.splice(0, session.stderrTail.length - 20);
-  session.stderrTail.push('Error: Unknown provider "claude-agent".');
+  const stderr = Array.from({ length: 19 }, (_, i) => `noise ${i}`);
+  stderr.push('Error: Unknown provider "claude-agent".');
+  session.transport = stubTransport({ stderr });
   const pending = session.send({ type: 'get_session_stats' }, { timeoutMs: 100000 });
   const check = assert.rejects(pending, /Pi process exited \(1\):[\s\S]*Unknown provider "claude-agent"/);
   session.handleExit(1, null);
@@ -207,7 +213,7 @@ test('a pending command rejected by an exit reports the child stderr that explai
 test('handleExit rejects pending and notifies the manager once', async () => {
   const manager = makeManager();
   const session = new PiRpcSession(manager, { cwd: '/tmp' });
-  session.child = { stdin: { writable: true, write: ((_d: string, cb?: (err?: Error | null) => void) => cb && cb()) as FakeWrite } };
+  session.transport = stubTransport();
   const p = session.send({ type: 'get_session_stats' }, { timeoutMs: 100000 });
   const check = assert.rejects(p, /Pi process exited/);
   session.handleExit(1, null);
@@ -337,7 +343,7 @@ test('set_thinking_level echo: session.thinkingLevel updates even when pi return
   const { session } = makeSession('openai/gpt-4o');
   liveManager.sessions.set(session.id, session);
   try {
-    session.child = { stdin: { writable: true, write: ((_d: string, cb?: (err?: Error | null) => void) => cb && cb()) as FakeWrite } };
+    session.transport = stubTransport();
     session.send = (_command: RpcCommand, _opts: RpcOpts) =>
       Promise.resolve({ type: 'response', success: true, data: {} });
     const resp = await handleRpcCommand({
@@ -355,7 +361,7 @@ test('set_thinking_level restores previous level on pi failure', async () => {
   liveManager.sessions.set(session.id, session);
   try {
     assert.equal(session.thinkingLevel, 'medium');
-    session.child = { stdin: { writable: true, write: ((_d: string, cb?: (err?: Error | null) => void) => cb && cb()) as FakeWrite } };
+    session.transport = stubTransport();
     session.send = (_command: RpcCommand, _opts: RpcOpts) =>
       Promise.resolve({ type: 'response', success: false, error: 'nope' });
     const resp = await handleRpcCommand({

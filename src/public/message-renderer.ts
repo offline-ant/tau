@@ -8,6 +8,9 @@ type UserMessage = { content?: string; images?: RenderedImage[] };
 export class MessageRenderer {
   container: HTMLElement;
   isNearBottom = true;
+  /** Streamed text not drawn yet: a delta only grows this, and the DOM follows once per frame. */
+  private pendingSteps = new Map<HTMLElement, string>();
+  private stepFrame = 0;
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -17,6 +20,7 @@ export class MessageRenderer {
   }
 
   clear() {
+    this.pendingSteps.clear();
     this.container.innerHTML = '';
   }
 
@@ -25,7 +29,7 @@ export class MessageRenderer {
       <div class="welcome">
         <div class="welcome-icon"><img src="icons/tau-192.png" alt="τ" class="tau-icon-welcome"></div>
         <p>Welcome to Tau</p>
-        <p class="hint">Type a message below to start chatting with Pi, or select a session from the sidebar.</p>
+        <p class="hint">Open an agent or a session from the sidebar, or create a Tau tab with +.</p>
         <div class="shortcuts-hint">
           <span>/ Focus input</span>
           <span>Esc Abort</span>
@@ -40,7 +44,7 @@ export class MessageRenderer {
     div.className = `message user${isHistory ? ' history' : ''}`;
     const imagesHtml = message.images?.length ? '<div class="message-images">' + message.images.map(img => {
       const src = img.data.startsWith('data:') ? img.data : `data:${img.mimeType || 'image/png'};base64,${img.data}`;
-      return `<img class="message-image" src="${src}" alt="Attached image" />`;
+      return `<img class="message-image" src="${src.replace(/"/g, '&quot;')}" alt="Attached image" />`;
     }).join('') + '</div>' : '';
     div.innerHTML = `<div class="message-content">${imagesHtml}${renderUserMarkdown(message.content || '')}</div>`;
     this.setupCopyButton(div);
@@ -67,7 +71,28 @@ export class MessageRenderer {
     return element;
   }
 
+  /** Latest text of a step, drawn or not. */
+  assistantStepText(element: HTMLElement) {
+    return this.pendingSteps.get(element) ?? element.querySelector<HTMLElement>('.assistant-step-content')?.dataset.rawText ?? '';
+  }
+
+  /**
+   * Records a streamed update and draws it on the next frame. Drawing renders
+   * the whole step, so doing it per delta makes a long reply quadratic and a
+   * phone fall ever further behind the stream.
+   */
+  queueAssistantStep(element: HTMLElement, text: string) {
+    this.pendingSteps.set(element, text);
+    if (this.stepFrame) return;
+    this.stepFrame = requestAnimationFrame(() => {
+      this.stepFrame = 0;
+      for (const [step, pending] of this.pendingSteps) this.updateAssistantStep(step, pending, true);
+      this.scrollToBottom();
+    });
+  }
+
   updateAssistantStep(element: HTMLElement, text: string, streaming = false) {
+    this.pendingSteps.delete(element);
     const content = element.querySelector<HTMLElement>('.assistant-step-content')!;
     content.dataset.rawText = text;
     content.classList.toggle('streaming', streaming);
@@ -97,6 +122,15 @@ export class MessageRenderer {
     const div = document.createElement('div');
     div.className = 'error-message';
     div.textContent = `⚠️ ${errorMessage}`;
+    this.container.appendChild(div);
+    this.scrollToBottom();
+  }
+
+  /** News about the session, not a failure. */
+  renderNotice(message: string) {
+    const div = document.createElement('div');
+    div.className = 'system-message';
+    div.textContent = message;
     this.container.appendChild(div);
     this.scrollToBottom();
   }

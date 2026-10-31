@@ -39,7 +39,8 @@ interface RpcTestSession {
   metadata: () => Record<string, unknown>;
   snapshot: () => Record<string, unknown>;
   send: (cmd: { id?: string; type?: string; [k: string]: unknown }) =>
-    Promise<{ type: string; id?: string; success: boolean; data: Record<string, unknown>; error?: string }>;
+    Promise<{ type: string; id?: string; success: boolean; data?: Record<string, unknown>; error?: string }>;
+  referencesSessionFile: (file: string) => boolean;
 }
 
 const PROJ = path.join(SESSIONS_DIR, '--tmp--proj');
@@ -88,6 +89,7 @@ function injectSession(overrides: Partial<RpcTestSession> = {}): RpcTestSession 
       contextUsage: null,
     }),
     send: async (cmd) => ({ type: 'response', id: cmd.id, success: true, data: {} }),
+    referencesSessionFile: () => false,
     ...overrides,
   };
   liveManager.sessions.set(session.id, session);
@@ -157,21 +159,37 @@ test('set_session_name rejects empty names and invalid file paths', async () => 
   assert.match(bad.error, /Invalid session file/);
 });
 
-test('set_session_name with sessionId updates the matching live session', async () => {
-  const session = injectSession();
+test('set_session_name with sessionId renames through the live Pi, which owns the file', async () => {
+  const sent: Array<{ type?: string; name?: string }> = [];
+  const session = injectSession({ send: async (cmd) => { sent.push(cmd); return { type: 'response', id: cmd.id, success: true, data: {} }; } });
+  const before = fs.readFileSync(SESSION_FILE, 'utf8');
   const resp = await handleRpcCommand({ type: 'set_session_name', sessionId: session.id, name: 'Live title' });
   assert.equal(resp.success, true);
+  assert.deepEqual(sent.map(({ type, name }) => ({ type, name })), [{ type: 'set_session_name', name: 'Live title' }]);
+  assert.equal(fs.readFileSync(SESSION_FILE, 'utf8'), before, 'Tau never appends to a file a live Pi writes');
   assert.equal(session.sessionName, 'Live title');
   assert.equal(session.titleSet, true);
 });
 
-test('set_session_name with a filePath matching a live session updates that session without a sessionId', async () => {
-  const session = injectSession();
+test('set_session_name with a filePath matching a live session renames through that session', async () => {
+  const sent: string[] = [];
+  const session = injectSession({
+    referencesSessionFile: (file: string) => file === path.resolve(SESSION_FILE),
+    send: async (cmd) => { sent.push(String(cmd.type)); return { type: 'response', id: cmd.id, success: true, data: {} }; },
+  });
   const resp = await handleRpcCommand({ type: 'set_session_name', filePath: session.sessionFile, name: 'From file' });
   assert.equal(resp.success, true);
-  // the matchingLive branch finds the live session by sessionFile and updates it
+  assert.deepEqual(sent, ['set_session_name']);
   assert.equal(session.sessionName, 'From file');
   assert.equal(session.titleSet, true);
+});
+
+test('set_session_name reports a live Pi refusing the rename', async () => {
+  const session = injectSession({ send: async (cmd) => ({ type: 'response', id: cmd.id, success: false, error: 'nope' }) });
+  const resp = await handleRpcCommand({ type: 'set_session_name', sessionId: session.id, name: 'Refused' });
+  assert.equal(resp.success, false);
+  assert.match(resp.error, /nope/);
+  assert.equal(session.sessionName, null);
 });
 
 test('set_session_name rejects when neither sessionId nor filePath is provided', async () => {
@@ -227,6 +245,13 @@ test('unknown command is rejected', async () => {
   const resp = await handleRpcCommand({ type: 'bogus', sessionId: session.id });
   assert.equal(resp.success, false);
   assert.match(resp.error, /Unknown command: bogus/);
+});
+
+test('new_session is for shared tabs: a spawned tab opens new sessions as new tabs', async () => {
+  const session = injectSession({ send: async () => assert.fail('must not reach Pi') });
+  const resp = await handleRpcCommand({ type: 'new_session', sessionId: session.id });
+  assert.equal(resp.success, false);
+  assert.match(resp.error, /new Tau tab/);
 });
 
 test('native commands are proxied to the child and success is preserved', async () => {

@@ -1174,6 +1174,16 @@ body {
   gap: 6px;
   font-size: 11px;
   color: var(--text-dim);
+  min-width: 0;
+}
+
+/* Status lines can be long (an exported path, a sent notice): they stay one
+   line, so the header never grows or squeezes the model button. */
+.status-text {
+  max-width: 38vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .status-indicator {
@@ -2349,6 +2359,7 @@ code {
 
 .input-bubble {
   flex: 1;
+  min-width: 0;
   position: relative;
   display: flex;
   align-items: stretch;
@@ -2623,6 +2634,13 @@ code {
   cursor: pointer;
   transition: all var(--duration) var(--ease);
   font-size: 13px;
+}
+
+.dialog-option:focus-visible,
+.command-item:focus-visible,
+.agent-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 .dialog-option:hover {
@@ -3450,6 +3468,9 @@ code {
     white-space: nowrap; /* "Connected • TS" must not wrap once space is tight */
   }
 
+  /* Keyboard shortcuts mean nothing on a touch screen. */
+  .shortcuts-hint { display: none; }
+
   /* Let the model input use all remaining header space on small screens
      so the full provider/model:thinking string stays visible. */
   .model-input {
@@ -3925,4 +3946,124 @@ code {
 @media (max-width: 768px) {
   .live-tabs { margin-top: 58px; padding: 0 8px; min-height: 34px; }
   .live-tab { min-width: 100px; max-width: 170px; padding: 6px 7px; }
+}
+
+/* Agent overview: shared Pi agents, the first thing to open on a phone. */
+.agents-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 36px;
+  height: 32px;
+  padding: 0 9px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border);
+  background: var(--bg-glass);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.agents-btn[data-urgency="blocked"] { color: var(--error); border-color: var(--error); }
+.agents-btn[data-urgency="done"] { color: var(--success); }
+.agents-btn[data-urgency="working"] { color: var(--accent); }
+.agents-btn[data-urgency="none"] .agents-btn-icon { opacity: .45; }
+.agents-count:empty { display: none; }
+.agents-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 72;
+  background: rgba(0, 0, 0, 0.28);
+}
+.agents-panel {
+  position: fixed;
+  z-index: 73;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(400px, 100vw);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-frosted);
+  backdrop-filter: blur(var(--blur-heavy)) saturate(1.6);
+  -webkit-backdrop-filter: blur(var(--blur-heavy)) saturate(1.6);
+  border-left: 1px solid var(--border-hover);
+  box-shadow: var(--shadow-lg);
+}
+.agents-overlay.hidden, .agents-panel.hidden { display: none; }
+.agents-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: max(12px, env(safe-area-inset-top)) 16px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.agents-header h3 { margin: 0; font-size: 17px; }
+.agents-close { width: 44px; height: 44px; font-size: 24px; }
+.agents-list { flex: 1; overflow-y: auto; padding: 4px 0 max(16px, env(safe-area-inset-bottom)); -webkit-overflow-scrolling: touch; }
+.agents-empty { padding: 24px 16px; color: var(--text-secondary); font-size: 14px; line-height: 1.5; }
+.agents-group { padding: 6px 0; border-bottom: 1px solid var(--border); }
+.agents-group-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 8px;
+  padding: 6px 16px 2px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  text-transform: none;
+}
+.agents-group-name, .agents-group-path { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agents-group-path { font-weight: 400; color: var(--text-dim); }
+.agent-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 52px;
+  padding: 6px 16px 6px calc(16px + var(--depth, 0) * 20px);
+  border: none;
+  background: none;
+  color: var(--text-primary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.agent-row:hover, .agent-row:active { background: var(--bg-glass-hover); }
+.agent-row.agent-opening { opacity: .55; }
+.agent-icon { width: 18px; flex: none; text-align: center; font-size: 16px; }
+.agent-blocked .agent-icon { color: var(--error); }
+.agent-working .agent-icon { color: var(--accent); }
+.agent-done .agent-icon { color: var(--success); }
+.agent-idle .agent-icon, .agent-starting .agent-icon { color: var(--text-dim); }
+.agent-text { display: flex; flex-direction: column; min-width: 0; }
+.agent-name { font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-worker .agent-name { font-size: 14px; }
+.agent-detail { font-size: 12.5px; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-blocked .agent-detail { color: var(--error); }
+.agent-tab {
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: var(--radius-pill);
+  background: var(--accent-subtle);
+  color: var(--accent);
+  font-size: 11px;
+  vertical-align: 1px;
+}
+.live-tab.shared .live-tab-model::before { content: '⇄ '; }
+@media (max-width: 768px) {
+  .agents-panel { width: 100vw; border-left: none; }
+  .agent-name { font-size: 16px; }
+}
+
+/* The active tab's model is in the header; on a phone tabs keep only the shared mark. */
+@media (max-width: 768px) {
+  .live-tab-model { font-size: 0; flex: none; }
+  .live-tab.shared .live-tab-model::before { font-size: 11px; }
+}
+
+/* On a phone the model button needs the room more than a long status line does. */
+@media (max-width: 768px) {
+  .status-text { max-width: 24vw; }
 }
