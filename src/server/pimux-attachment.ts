@@ -26,7 +26,9 @@ export type PimuxSnapshotRecord = JsonRecord & {
   thinkingLevel?: string;
   idle?: boolean;
   leafId?: string | null;
-  tree?: unknown[];
+  entries?: unknown[];
+  /** A change whose history Pi could not send: only the identity fields are current. */
+  historyError?: string;
   run?: { active?: boolean; compacting?: boolean; tailTruncated?: boolean };
   /** Number of replay records in this sequence. */
   replay?: number;

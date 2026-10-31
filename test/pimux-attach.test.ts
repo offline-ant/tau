@@ -65,7 +65,7 @@ function sessionFile(name: string) {
 async function sharedSession(name: string, options: JsonRecord = {}) {
   const file = sessionFile(name);
   const mux = new FakePimux(MUX_DIR!, `mux-${name}`, { sessionFile: file, cwd: PROJECT, ...options });
-  mux.tree = [{ entry: { type: 'message', id: 'u1', parentId: null, message: { role: 'user', content: 'from emacs' } }, children: [] }];
+  mux.entries = [{ type: 'message', id: 'u1', parentId: null, message: { role: 'user', content: 'from emacs' } }];
   mux.leafId = 'u1';
   await mux.listen();
   muxes.push(mux);
@@ -308,7 +308,7 @@ test('selection bootstraps a boundary: snapshot first, then replay, with open di
   const snapshot = await response.json() as JsonRecord;
   assert.equal(response.status, 200);
   const bootstrap = mux.commands.find((command) => command.type === 'pimux_bootstrap')!;
-  assert.deepEqual(bootstrap.include, ['tree']);
+  assert.deepEqual(bootstrap.include, ['entries']);
   assert.equal(snapshot.generation, mux.generation);
   assert.equal(snapshot.isStreaming, true);
   assert.deepEqual((snapshot.dialogs as JsonRecord[]).map((dialog) => dialog.id), ['d1']);
@@ -414,12 +414,50 @@ test('a gap rebuilds every view from the snapshot that follows', async () => {
   mux.broadcast({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'lost later' }] } });
   await until(() => session.entries.length === 3, 'tracked message');
   browserMessages.length = 0;
-  mux.tree = [];
+  mux.entries = [];
   mux.leafId = null;
   mux.broadcast({ type: 'pimux_gap', generation: mux.generation + 1, dropped: 7 });
   for (const socket of mux.connections) mux.snapshot(socket, 'gap');
   await until(() => browserMessages.some((message) => message.type === 'live_session_snapshot'), 'snapshot after the gap');
   assert.deepEqual(session.entries.map((entry: JsonRecord) => entry.type), ['session']);
+});
+
+test('a shared session rebuilds a deep active path from flat entries, and leaves abandoned branches out', async () => {
+  const { file, mux } = await sharedSession('deep');
+  const line = Array.from({ length: 5000 }, (_, index) => ({ type: 'message', id: `e${index}`, parentId: index ? `e${index - 1}` : null,
+    message: { role: 'user', content: `entry ${index}` } }));
+  mux.entries = [...line, { type: 'message', id: 'abandoned', parentId: 'e10', message: { role: 'user', content: 'other branch' } }];
+  mux.leafId = 'e4999';
+  const { body } = await post('/api/live-sessions/resume', { filePath: file });
+  const session = liveManager.get((body.session as JsonRecord).id as string);
+  assert.equal(session.entries.filter((entry: JsonRecord) => entry.type === 'message').length, 5000);
+  assert.equal(session.entries.some((entry: JsonRecord) => entry.id === 'abandoned'), false);
+});
+
+test('a change without history shows the new identity, no old conversation and a visible error', async () => {
+  const { file, mux } = await sharedSession('no-history');
+  const { body } = await post('/api/live-sessions/resume', { filePath: file });
+  const id = (body.session as JsonRecord).id as string;
+  const session = liveManager.get(id);
+  browserMessages.length = 0;
+  mux.entries = undefined;
+  mux.extraSnapshot = { historyError: 'Invalid string length' };
+  mux.leafId = 'elsewhere';
+  for (const socket of mux.connections) mux.snapshot(socket, 'session_changed');
+  await until(() => browserMessages.some((message) => (message.event as JsonRecord | undefined)?.notifyType === 'error'), 'history error');
+  assert.deepEqual(session.entries.map((entry: JsonRecord) => entry.type), ['session']);
+  const notice = browserMessages.find((message) => (message.event as JsonRecord | undefined)?.notifyType === 'error')!;
+  assert.match(String((notice.event as JsonRecord).message), /history could not be loaded: Invalid string length/);
+});
+
+test('a snapshot failure on attach reports the reason at once', async () => {
+  const { file, mux } = await sharedSession('failing');
+  mux.failSnapshots = 'Invalid string length';
+  const started = Date.now();
+  const { status, body } = await post('/api/live-sessions/resume', { filePath: file });
+  assert.equal(status, 503);
+  assert.match(String(body.error), /could not take a snapshot: Invalid string length/);
+  assert.ok(Date.now() - started < 5000, 'no timeout wait');
 });
 
 test('a stale pimux entry does not hide a terminal owner; a live one attaches despite force', async () => {

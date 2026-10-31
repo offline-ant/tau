@@ -17,7 +17,11 @@ export class FakePimux {
   readonly connections = new Set<net.Socket>();
   ended = 0;
   generation = 0;
-  tree: JsonRecord[] = [];
+  entries: JsonRecord[] | undefined = [];
+  /** Extra fields of the next snapshots. */
+  extraSnapshot: JsonRecord = {};
+  /** When set, every snapshot request fails with this error instead of being answered. */
+  failSnapshots: string | null = null;
   leafId: string | null = null;
   /** Records between `pimux_snapshot` and `pimux_live`. */
   replay: JsonRecord[] = [];
@@ -86,11 +90,15 @@ export class FakePimux {
   }
 
   snapshot(socket: net.Socket, reason: string, generation = ++this.generation) {
+    if (this.failSnapshots) {
+      this.write(socket, { type: 'pimux_snapshot_failed', generation, error: this.failSnapshots });
+      return;
+    }
     this.write(socket, {
       type: 'pimux_snapshot', generation, reason,
       session: { file: this.entry.session && (this.entry.session as JsonRecord).file, id: `id-${this.muxId}`, name: null, cwd: this.entry.cwd },
-      model: { provider: 'fx', id: 'one' }, thinkingLevel: 'off', idle: this.idle, leafId: this.leafId, tree: this.tree,
-      run: { active: !this.idle, compacting: false, tailTruncated: false }, replay: this.replay.length,
+      model: { provider: 'fx', id: 'one' }, thinkingLevel: 'off', idle: this.idle, leafId: this.leafId, entries: this.entries,
+      run: { active: !this.idle, compacting: false, tailTruncated: false }, replay: this.replay.length, ...this.extraSnapshot,
     });
     for (const record of this.replay) this.write(socket, record);
     this.write(socket, { type: 'pimux_live', generation });
