@@ -78,6 +78,7 @@ export type PendingDialog = JsonRecord & {
 export type AbortState = 'idle' | 'stopping' | 'timed_out' | 'failed';
 export type LiveClient = {
   readyState: number;
+  bufferedAmount: number;
   send(payload: string): void;
   close(code?: number, reason?: string): void;
   terminate(): void;

@@ -161,6 +161,9 @@ export class WebSocketClient extends EventTarget {
       case 'live_session_closed':
         this.dispatchEvent(new CustomEvent('liveSessionClosed', { detail: message }));
         break;
+      case 'pimux_agents':
+        this.dispatchEvent(new CustomEvent('agentsUpdate', { detail: message.agents }));
+        break;
       default:
         console.warn('[WS] Unknown message type:', message.type);
     }

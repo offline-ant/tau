@@ -850,9 +850,12 @@ test('resume validation accounts for an in-progress create on the same file', as
   const child = installFakeChild(t, new FakePi({ autoRespond: false }));
   const creating = liveManager.create({ cwd: PROJECTS_DIR, sessionFile: file });
   try {
+    // Resolution (no tab, no pimux) runs before the spawn.
+    for (let i = 0; i < 100 && !child.commands.length; i++) await new Promise((resolve) => setTimeout(resolve, 5));
     assert.equal(liveManager.hasStartingSession(file), true);
     assert.equal(liveManager.findBySessionFile(file), undefined);
-    assert.equal(liveManager.hasPendingResume(file), false);
+    // A create that opens a file uses resume's attach-or-spawn resolution.
+    assert.equal(liveManager.hasPendingResume(file), true);
     const response = await fetch(`${base}/api/live-sessions/resume`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ filePath: file, env: [] }),

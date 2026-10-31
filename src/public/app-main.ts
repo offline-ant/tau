@@ -21,7 +21,9 @@ import { setupVoiceInput, type VoiceInput } from './voice-input.js';
 import { setupCommandPalette } from './command-palette.js';
 import { setupSessionStatsCard, type SessionStats } from './session-stats-card.js';
 import { isImeComposition } from './keyboard.js';
-import { buildHistoryItems, type HistoryItem, type SessionHistoryEntry } from './history-render.js';
+import { buildHistoryItems, messageImages, type HistoryItem, type SessionHistoryEntry } from './history-render.js';
+import { setupAgentsPanel, type OverviewAgent } from './agents-panel.js';
+import { UnsentInputStore, type UnsentInput } from './unsent-input.js';
 
 import type { AppEvent, AppMessage, AssistantStep, ExtensionUIRequest, InteractionState, LiveInstance, LiveSession, MessageContentBlock, ModelRecord, PendingDialog, PendingFilePath, PendingImage, QueuedCommand, RpcCommand, UsageRecord } from './app-types.js';
 
@@ -35,6 +37,9 @@ type LiveSessionSnapshotData = {
   entries?: SessionHistoryEntry[];
   pendingDialogs?: PendingDialog[];
   interactionRevision?: number;
+  /** Attached tabs: the pimux boundary this snapshot describes, and its open dialogs. */
+  generation?: number;
+  dialogs?: AppEvent[];
 };
 
 type RpcEventDetail = { sessionId?: string; event?: AppEvent };
@@ -67,6 +72,7 @@ const sidebar = new SessionSidebar(
   document.getElementById('session-list')!,
   handleSessionSelect,
   (cwd) => openNewLiveSessionModal(cwd),
+  (message) => flashStatusError(message, 6000),
 );
 sidebar.onRendered = () => updateLiveSessionIndicators();
 
@@ -97,12 +103,13 @@ function restoreStatusIndicator() {
     open && state.isStreaming ? 'streaming' : (open ? 'connected' : 'disconnected')
   }`;
 }
-// Set a transient statusText message and schedule its restore. Cancels any
+// Set a transient statusText message and, with `restoreMs`, schedule the
+// return to the real connection state. Cancels any
 // previously scheduled restore so overlapping messages cannot race. A new
 // status message also supersedes any active error flash: it cancels the
 // flash's restore and returns the dot to its real state so the `error`
 // class cannot linger with no timer to clear it.
-function setStatusMessage(text: string, restoreText: string | null = null, restoreMs = 3000) {
+function setStatusMessage(text: string, restoreMs: number | null = null) {
   if (statusFlashTimer !== null) {
     clearTimeout(statusFlashTimer);
     statusFlashTimer = null;
@@ -110,7 +117,7 @@ function setStatusMessage(text: string, restoreText: string | null = null, resto
   }
   clearTimeout(statusRestoreTimer ?? undefined);
   statusText.textContent = text;
-  if (restoreText !== null) {
+  if (restoreMs !== null) {
     statusRestoreTimer = setTimeout(() => {
       statusRestoreTimer = null;
       statusText.textContent = currentStatusText();
@@ -205,6 +212,10 @@ const sessionLink = new SessionLink(location.hash);
 let resumeQueuedInput = true;
 let pendingExtensionUIRequests: ExtensionUIRequest[] = []; // background notifications only
 const interactionStates = new Map<string, InteractionState>();
+// Native Pi dialogs use Tau's revisioned registry. Attached Pi dialogs use
+// mux membership instead: only a newer snapshot or dialog_closed removes one.
+const sharedDialogs = new Map<string, Map<string, AppEvent>>();
+const sharedDialogGenerations = new Map<string, number>();
 const operationRevisions = new Map<string, number>();
 const sessionStateRevisions = new Map<string, number>();
 const abortRequests = new Map<string, Promise<void>>();
@@ -221,7 +232,18 @@ type QueuedDispatch = {
   retryTimer?: ReturnType<typeof setTimeout>;
 };
 const queuedPrompts = new Map<string, QueuedDispatch>();
-dialogHandler.onIdle = () => processQueuedExtensionUIRequest();
+const DIALOG_METHODS = new Set(['select', 'confirm', 'input', 'editor']);
+/** Extension UI for a terminal's chrome; Tau has no place for it, and it asks nothing of the user. */
+const DISPLAY_UI_METHODS = new Set(['setStatus', 'setWidget', 'setTitle', 'set_editor_text']);
+let reattachMuxId: string | null = null; // The shared agent on screen when Tau went away
+const piQueues = new Map<string, { steering: string[]; followUp: string[] }>(); // Prompts Pi holds, by Tau tab
+const sidebarFiles = new Set<string>(); // Session files whose first turn the sidebar has been refreshed for
+let sidebarRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+let agentSessionFiles = '';
+dialogHandler.onIdle = () => {
+  processQueuedExtensionUIRequest();
+  focusComposer();
+};
 
 // File browser
 const fileSidebar = document.getElementById('file-sidebar')!;
@@ -380,6 +402,8 @@ wsClient.addEventListener('connected', () => {
 
 wsClient.addEventListener('disconnected', () => {
   updateConnectionStatus('disconnected');
+  // Their acknowledgements went to this socket and can never arrive.
+  unsentInput.keepInFlight();
   if (takeRequest) {
     takeRequest = null;
     updateLiveSessionInputState();
@@ -396,6 +420,14 @@ wsClient.addEventListener('rpcEvent', (e: Event) => {
   const detail = (e as CustomEvent<RpcEventDetail>).detail || {};
   const event = (detail.event || detail) as AppEvent;
   const sessionId = detail.sessionId;
+  // pimux closes a shared dialog however it ended, in every browser.
+  if (sessionId && event.type === 'pimux_dialog_closed') {
+    closeSharedDialog(sessionId, String(event.id));
+    return;
+  }
+  if (sessionId && event.type === 'pimux_session_changed' && sessionId === activeLiveSessionId && viewingActiveSession) {
+    setStatusMessage('The shared session moved to another conversation', 4000);
+  }
   if (takeRequest?.sessionId === sessionId && sessionId === activeLiveSessionId && viewingActiveSession) {
     // A handled command can still report failure through the extension UI.
     // Keep that structured error in the status bar through snapshot redraws.
@@ -411,6 +443,7 @@ wsClient.addEventListener('rpcEvent', (e: Event) => {
     updateLiveSessionInputState();
     if (event.success !== true) flashStatusError(String(event.error || 'Session takeover failed.'));
   }
+  if (event.type === 'response' && typeof event.id === 'string') settlePrompt(event.id, event.success !== false, event.error);
   if (sessionId) {
     sessionStateRevisions.set(sessionId, (sessionStateRevisions.get(sessionId) || 0) + 1);
     const session = liveSessions.find(s => s.id === sessionId);
@@ -438,17 +471,30 @@ wsClient.addEventListener('rpcEvent', (e: Event) => {
         treeViewController.notifyStreamingChanged(sessionId, !!session.isStreaming);
       }
       if (event.type === 'session_name' && event.name) session.sessionName = event.name;
-      if ((event.message as AppMessage)?.role === 'assistant' && (event.message as AppMessage)?.usage) {
-        session.contextUsage = { ...(session.contextUsage || {}), usage: (event.message as AppMessage).usage };
+      if (event.type === 'queue_update') {
+        piQueues.set(sessionId, { steering: (event.steering as string[]) ?? [], followUp: (event.followUp as string[]) ?? [] });
+        if (sessionId === activeLiveSessionId) renderQueuedMessages();
       }
+      // A first prompt is what writes a new session's file.
+      if (event.type === 'agent_end' && session.sessionFile && !sidebarFiles.has(session.sessionFile)) {
+        sidebarFiles.add(session.sessionFile);
+        scheduleSidebarRefresh();
+      }
+      if ((event.message as AppMessage)?.role === 'assistant' && (event.message as AppMessage)?.usage) session.contextUsage = { ...(session.contextUsage || {}), usage: (event.message as AppMessage).usage };
       renderLiveTabs();
     }
     if (sessionId !== activeLiveSessionId || !viewingActiveSession) {
-      if (event.type === 'extension_ui_request') queueExtensionUIRequest(event, sessionId);
+      if (event.type === 'extension_ui_request' && !DISPLAY_UI_METHODS.has(String(event.method))) queueExtensionUIRequest(event, sessionId);
       return;
     }
   }
   handleRPCEvent(event, sessionId);
+});
+
+// Tau answers the sender on its socket even when no Pi ever saw the command.
+wsClient.addEventListener('rpcResponse', (e: Event) => {
+  const { id, success, error } = (e as CustomEvent<{ id?: unknown; success?: boolean; error?: string }>).detail;
+  if (typeof id === 'string') settlePrompt(id, success !== false, error);
 });
 
 wsClient.addEventListener('serverError', (e: Event) => {
@@ -456,11 +502,22 @@ wsClient.addEventListener('serverError', (e: Event) => {
 });
 
 wsClient.addEventListener('stateUpdate', (e: Event) => {
-  const detail = (e as CustomEvent<{ liveSessions?: LiveSession[] }>).detail;
+  const detail = (e as CustomEvent<{ liveSessions?: LiveSession[]; agents?: OverviewAgent[] }>).detail;
   const wasViewingLive = viewingActiveSession;
   const launcherVisible = launcherPanel.isVisible();
+  const firstState = !hasReceivedInitialServerState;
   hasReceivedInitialServerState = true;
+  // A restarted Tau has no tabs: the shared agents behind them may well run on.
+  const remaining = new Set((detail.liveSessions || []).map(session => session.id));
+  for (const session of liveSessions.filter(item => !remaining.has(item.id))) {
+    if (session.id === activeLiveSessionId && session.attached) reattachMuxId ??= session.attached.muxId;
+    keepUnsentInput(session);
+  }
   setLiveSessions(detail.liveSessions || []);
+  agentsPanel.update(detail.agents || []);
+  if (!firstState) scheduleSidebarRefresh();
+  // With nothing open yet, the shared agents are what a phone comes to see.
+  if (firstState && !liveSessions.length && agentsPanel.count() && !/[#&]session=/.test(location.hash)) agentsPanel.show();
   if (applyPendingSessionLink()) {
     hasRestoredInitialLiveSession = true;
     return;
@@ -480,11 +537,20 @@ wsClient.addEventListener('stateUpdate', (e: Event) => {
     }
     updateLiveSessionInputState();
     updateLiveSessionIndicators();
+    restoreUnsentInput();
+  }
+  // Tau came back: the agent on screen when it stopped is the one to return to.
+  if (!firstState && reattachMuxId) {
+    const muxId = reattachMuxId;
+    reattachMuxId = null;
+    if (detail.agents?.some(agent => agent.muxId === muxId)) void agentsPanel.open(muxId);
+    else agentsPanel.show();
   }
 });
 
 wsClient.addEventListener('liveSessionCreated', (e: Event) => {
   upsertLiveSession((e as CustomEvent<LiveSession>).detail);
+  scheduleSidebarRefresh();
 });
 
 wsClient.addEventListener('liveSessionUpdated', (e: Event) => {
@@ -494,7 +560,8 @@ wsClient.addEventListener('liveSessionUpdated', (e: Event) => {
   // Native Abort acknowledgement can establish idle without agent_settled.
   // Never let an acknowledgement for an older operation stop a newer one:
   // the server's isStreaming metadata already accounts for that race.
-  const acknowledgedStop = previousAbortState && previousAbortState !== 'idle' && detail.abortState === 'idle';
+  const acknowledgedStop = (previousAbortState && previousAbortState !== 'idle' && detail.abortState === 'idle') ||
+    (!!detail.attached && localAbortStates.has(detail.id) && detail.isStreaming === false);
   if (acknowledgedStop) {
     localAbortStates.delete(detail.id);
     settledWhileStopping.delete(detail.id);
@@ -512,7 +579,30 @@ wsClient.addEventListener('liveSessionUpdated', (e: Event) => {
 });
 
 wsClient.addEventListener('liveSessionClosed', (e: Event) => {
-  handleLiveSessionClosed((e as CustomEvent<{ sessionId: string }>).detail.sessionId);
+  const detail = (e as CustomEvent<{ sessionId: string; reason?: string; message?: string; notice?: boolean }>).detail;
+  const session = liveSessions.find(s => s.id === detail.sessionId);
+  const muxId = session?.attached?.muxId;
+  if (session && muxId) {
+    // Closing tabs selects the next one, so only the first of a shutdown is the one on screen.
+    if (detail.reason === 'server_shutdown' && session.id === activeLiveSessionId) reattachMuxId ??= muxId;
+    if (detail.reason === 'pimux_disconnected' || detail.reason === 'server_shutdown') keepUnsentInput(session);
+    else if (detail.reason?.startsWith('pimux_exit')) {
+      // That agent is gone: what was on its way stays readable in the composer.
+      keepUnsentInput(session);
+      putInComposer(unsentInput.take(muxId));
+    } else unsentInput.forget(muxId);
+  }
+  handleLiveSessionClosed(detail.sessionId, detail.message, detail.notice);
+  scheduleSidebarRefresh();
+});
+
+wsClient.addEventListener('agentsUpdate', (e: Event) => {
+  const agents = (e as CustomEvent<OverviewAgent[]>).detail || [];
+  agentsPanel.update(agents);
+  // Agents start and change sessions elsewhere too.
+  const files = agents.map(agent => agent.sessionFile).sort().join('\n');
+  if (files !== agentSessionFiles) scheduleSidebarRefresh();
+  agentSessionFiles = files;
 });
 
 wsClient.addEventListener('interactionState', (e: Event) => {
@@ -522,11 +612,57 @@ wsClient.addEventListener('interactionState', (e: Event) => {
 // Receive a full live-session state snapshot.
 // Passive fanout updates only the live conversation currently being viewed.
 // Explicit selection loads its own snapshot after setting viewingActiveSession.
+// A shared tab's snapshots also carry its open dialogs, which apply to any tab.
 wsClient.addEventListener('liveSessionSnapshot', (e: Event) => {
   const snapshot = (e as CustomEvent<LiveSessionSnapshotData>).detail;
+  if (snapshot.sessionId && Array.isArray(snapshot.dialogs)) reconcileSharedDialogs(snapshot.sessionId, snapshot.dialogs, snapshot.generation);
   if (!viewingActiveSession || snapshot.sessionId !== activeLiveSessionId) return;
+  const rendered = appliedGenerations.get(snapshot.sessionId);
+  if (typeof snapshot.generation === 'number' && rendered !== undefined && rendered >= snapshot.generation) return;
   applyLiveSessionSnapshot(snapshot);
+  if (typeof snapshot.generation === 'number') appliedGenerations.set(snapshot.sessionId, snapshot.generation);
+  processQueuedExtensionUIRequest(snapshot.sessionId);
 });
+
+/**
+ * pimux generation of the last shared-tab snapshot this view rendered. The
+ * server publishes a snapshot and then its replayed in-flight work over the
+ * WebSocket before it answers the HTTP snapshot request, so an HTTP answer
+ * that is not newer would erase that replay.
+ */
+const appliedGenerations = new Map<string, number>();
+
+/** A shared tab's open dialogs at a pimux boundary replace those this browser holds for it. */
+function reconcileSharedDialogs(sessionId: string, dialogs: AppEvent[], generation?: number) {
+  if (!liveSessions.find(session => session.id === sessionId)?.attached) return;
+  const previous = sharedDialogGenerations.get(sessionId);
+  // An HTTP answer for a boundary already received over the socket cannot
+  // reopen a dialog closed (or erase one opened) by the subsequent replay.
+  if (generation !== undefined && previous !== undefined && generation <= previous) return;
+  if (generation !== undefined) sharedDialogGenerations.set(sessionId, generation);
+  const open = new Map(dialogs.filter(dialog => DIALOG_METHODS.has(String(dialog.method)) && typeof dialog.id === 'string')
+    .map(dialog => [String(dialog.id), dialog]));
+  sharedDialogs.set(sessionId, open);
+  const current = dialogHandler.currentRequest;
+  if (current?.sessionId === sessionId && !open.has(String(current.id))) dialogHandler.clearCurrentDialog();
+  renderLiveTabs();
+  processQueuedExtensionUIRequest();
+  // The snapshot caller applies metadata before updating input/dispatch. A
+  // boundary that closes a dialog may simultaneously establish a busy run.
+}
+
+/** Another frontend answered it, or Pi stopped waiting: no browser may still offer it. */
+function closeSharedDialog(sessionId: string, id: string) {
+  if (!liveSessions.find(session => session.id === sessionId)?.attached) return;
+  sharedDialogs.get(sessionId)?.delete(id);
+  const current = dialogHandler.currentRequest;
+  if (current?.sessionId === sessionId && String(current.id) === id) {
+    dialogHandler.clearCurrentDialog();
+    processQueuedExtensionUIRequest();
+  }
+  renderLiveTabs();
+  if (viewingActiveSession && activeLiveSessionId === sessionId) updateUI();
+}
 
 // A link is one navigation request, not a preference reapplied on reconnect.
 // Missing targets are rejected after the current server state, never kept as
@@ -581,8 +717,21 @@ function setLiveSessions(sessions: LiveSession[]) {
   updateLiveSessionIndicators();
 }
 
-function handleLiveSessionClosed(closedId: string) {
+/** No tab is shown any more: the header must not keep describing the last one. */
+function clearActiveSessionHeader() {
+  modelPickerController.setModelState('', 'off');
+  sessionTotalCost = 0;
+  lastInputTokens = 0;
+  lastUsage = null;
+  updateContextPill();
+}
+
+function handleLiveSessionClosed(closedId: string, message?: string, notice = false) {
   if (!closedId) return;
+  appliedGenerations.delete(closedId);
+  sharedDialogs.delete(closedId);
+  sharedDialogGenerations.delete(closedId);
+  piQueues.delete(closedId);
   liveSessions = liveSessions.filter(s => s.id !== closedId);
   messageQueue = messageQueue.filter(cmd => cmd.sessionId !== closedId);
   pendingExtensionUIRequests = pendingExtensionUIRequests.filter(req => req.sessionId !== closedId);
@@ -610,12 +759,23 @@ function handleLiveSessionClosed(closedId: string) {
     state.reset();
     showTypingIndicator(false);
     if (wasViewingActive) {
-      clearConversation();
-      const next = getMostRecentLiveSession();
-      if (next) selectLiveSession(next.id);
+      if (!message) clearConversation();
+      const next = message ? null : getMostRecentLiveSession();
+      if (message) {
+        // A shared Pi exited or its connection was lost: say why, below the
+        // conversation, which stays readable.
+        viewingActiveSession = false;
+        assistantBlocks.setWorking(false);
+        if (notice) messageRenderer.renderNotice(message);
+        else messageRenderer.renderError(message);
+        clearActiveSessionHeader();
+        updateLiveSessionInputState();
+        updateUI();
+      } else if (next) selectLiveSession(next.id);
       else {
         viewingActiveSession = false;
         messageRenderer.renderWelcome();
+        clearActiveSessionHeader();
         updateLiveSessionInputState();
         updateUI();
       }
@@ -636,8 +796,13 @@ function upsertLiveSession(session: LiveSession) {
   let shouldRenderTabs = false;
   if (idx >= 0) {
     const before = liveTabSignature(liveSessions[idx]);
+    const movedFile = liveSessions[idx].sessionFile !== session.sessionFile;
     liveSessions[idx] = { ...liveSessions[idx], ...session };
     shouldRenderTabs = before !== liveTabSignature(liveSessions[idx]);
+    if (movedFile) {
+      if (session.id === activeLiveSessionId && viewingActiveSession) sidebar.setActive(session.sessionFile);
+      scheduleSidebarRefresh();
+    }
   } else {
     liveSessions.push(session);
     shouldRenderTabs = true;
@@ -662,14 +827,19 @@ function compactModelLabel(session: LiveSession) {
   return String(raw).replace(/^.*\//, '').replace(/^claude-/, '').replace(/-\d{8}$/, '');
 }
 
+function liveTabTitle(session: LiveSession) {
+  return session.sessionName || session.attached?.name || basename(session.cwd || '');
+}
+
 function liveTabSignature(session: LiveSession) {
   return [
-    session.sessionName || basename(session.cwd || ''),
+    liveTabTitle(session),
     compactModelLabel(session),
     session.cwd || '',
     session.modelSpec || '',
     session.isStreaming ? 'streaming' : 'idle',
     pendingInteractionCount(session.id),
+    session.attached ? 'shared' : '',
   ].join('\u001f');
 }
 
@@ -691,16 +861,17 @@ function renderLiveTabs() {
     }
     seen.add(session.id);
     tab.classList.toggle('active', session.id === activeLiveSessionId);
-    tab.title = `${session.cwd || ''}${session.modelSpec ? ` • ${session.modelSpec}` : ''}`;
+    tab.classList.toggle('shared', !!session.attached);
+    tab.title = `${session.cwd || ''}${session.modelSpec ? ` • ${session.modelSpec}` : ''}${session.attached ? ` • shared with ${session.attached.host || 'another frontend'}` : ''}`;
     const signature = liveTabSignature(session);
     if (tab.dataset.signature !== signature) {
       tab.dataset.signature = signature;
       tab.innerHTML = `
         ${session.isStreaming ? '<span class="live-tab-streaming-dot"></span>' : ''}
         ${pendingInteractionCount(session.id) ? `<span class="live-tab-ui-dot" title="Waiting for approval" aria-label="${pendingInteractionCount(session.id)} pending approvals">${pendingInteractionCount(session.id)}</span>` : ''}
-        <span class="live-tab-title">${escapeHtml(session.sessionName || basename(session.cwd || ''))}</span>
+        <span class="live-tab-title">${escapeHtml(liveTabTitle(session))}</span>
         <span class="live-tab-model">${escapeHtml(compactModelLabel(session))}</span>
-        <span class="live-tab-close" title="Close Tau tab">×</span>
+        <span class="live-tab-close" title="${session.attached ? 'Detach (the agent keeps running)' : 'Close Tau tab'}">×</span>
       `;
       tab.querySelector('.live-tab-close')?.addEventListener('click', (ev) => {
         ev.stopPropagation();
@@ -733,6 +904,16 @@ function restoreActiveLiveSession() {
   }
 }
 
+/** Sidebar lists come from disk: picks up sessions that appeared or moved, once a burst of changes settles. */
+function scheduleSidebarRefresh() {
+  if (sidebarRefreshTimer !== null) clearTimeout(sidebarRefreshTimer);
+  sidebarRefreshTimer = setTimeout(() => {
+    sidebarRefreshTimer = null;
+    // A reconnect refreshes it anyway.
+    if (wsClient.ws?.readyState === WebSocket.OPEN) void sidebar.refresh().then(updateLiveSessionIndicators);
+  }, 400);
+}
+
 async function selectLiveSession(id: string, resumeQueue = true) {
   sessionLink.cancel();
   voiceInput?.cancel();
@@ -748,6 +929,7 @@ async function selectLiveSession(id: string, resumeQueue = true) {
   renderLiveTabs();
   renderQueuedMessages();
   applyActiveSessionMetadata(session);
+  restoreUnsentInput();
   currentMessageSteps.clear();
   pendingAssistantError = null;
   retryStatusElement = null;
@@ -755,15 +937,24 @@ async function selectLiveSession(id: string, resumeQueue = true) {
   state.setStreaming(!!session.isStreaming);
   clearConversation();
   const requestedAtRevision = sessionStateRevisions.get(id) || 0;
+  // A shared tab's snapshot request makes the server publish a fresh pimux
+  // boundary over the WebSocket; only a WebSocket snapshot rendered in this
+  // view can make the HTTP answer redundant.
+  appliedGenerations.delete(id);
   try {
     const res = await fetch(`/api/live-sessions/${encodeURIComponent(id)}/snapshot`);
     const data = await res.json();
     if (id !== activeLiveSessionId || !viewingActiveSession) return;
     if (!res.ok || data.error) {
-      handleLiveSessionClosed(id);
+      // A shared tab whose snapshot failed is still attached; only a missing tab is gone.
+      if (res.status === 404) handleLiveSessionClosed(id);
       throw new Error(data.error || 'Live session not found');
     }
-    applyLiveSessionSnapshot({ ...data, sessionId: id }, requestedAtRevision);
+    const rendered = appliedGenerations.get(id);
+    if (typeof data.generation !== 'number' || rendered === undefined || rendered < data.generation) {
+      applyLiveSessionSnapshot({ ...data, sessionId: id }, requestedAtRevision);
+      if (typeof data.generation === 'number') appliedGenerations.set(id, data.generation);
+    }
   } catch (e) {
     if (id !== activeLiveSessionId || !viewingActiveSession) return;
     messageRenderer.renderError((e instanceof Error ? e.message : '') || 'Failed to load live session snapshot');
@@ -788,7 +979,10 @@ async function closeLiveSession(id: string) {
   const session = liveSessions.find(s => s.id === id);
   if (!session) return;
   const hasQueuedMessages = messageQueue.some(cmd => cmd.sessionId === id);
-  if (session.isStreaming || hasQueuedMessages) {
+  if (session.attached) {
+    // Detaching stops nothing: the agent keeps running where it was started.
+    if (hasQueuedMessages && !confirm('This shared tab has queued unsent messages. Detach and discard them?')) return;
+  } else if (session.isStreaming || hasQueuedMessages) {
     const reason = session.isStreaming && hasQueuedMessages
       ? 'This Tau tab is streaming and has queued unsent messages. Close it, terminate the Pi session, and discard the queue?'
       : session.isStreaming
@@ -897,6 +1091,7 @@ newLiveSessionForm?.addEventListener('submit', async (e) => {
     closeNewLiveSessionModal();
     newLiveSessionModel.value = '';
     await selectLiveSession(data.session.id);
+    focusComposer();
   } catch (err) {
     messageRenderer.renderError((err instanceof Error ? err.message : '') || 'Failed to create Tau tab');
   } finally {
@@ -1019,7 +1214,10 @@ function handleRPCEvent(event: AppEvent, sessionId: string | null = null) {
       handleCompactionEnd(event);
       break;
     case 'extension_ui_request':
-      handleExtensionUIRequest(event, sessionId);
+      if (sessionId && DIALOG_METHODS.has(String(event.method))) {
+        queueExtensionUIRequest(event, sessionId);
+        processQueuedExtensionUIRequest(sessionId);
+      } else handleExtensionUIRequest(event, sessionId);
       break;
     case 'extension_error':
       messageRenderer.renderError(`Extension error: ${event.error}`);
@@ -1113,7 +1311,8 @@ function handleMessageStart(message: AppMessage) {
     // The prompt is already drawn locally when sent.
     if (!lastSentMessage || getMessageText(message) !== lastSentMessage) {
       const content = getMessageText(message);
-      if (content) messageRenderer.renderUserMessage({ content });
+      const images = messageImages(message);
+      if (content || images.length) messageRenderer.renderUserMessage({ content, images });
     }
     lastSentMessage = null;
   }
@@ -1143,8 +1342,11 @@ function updateMessageStep(index: number, step: AssistantStep, streaming: boolea
     // message_end supplies blocks missed when this browser joined mid-message.
     appendLiveActivity(element, step.type, nextMessageStep(index));
     currentMessageSteps.set(index, element);
+    if (streaming) messageRenderer.scrollToBottom();
+  } else if (streaming) {
+    messageRenderer.queueAssistantStep(element, step.text);
   } else {
-    messageRenderer.updateAssistantStep(element, step.text, streaming);
+    messageRenderer.updateAssistantStep(element, step.text);
   }
 }
 
@@ -1158,12 +1360,12 @@ function handleMessageUpdate(event: AppEvent) {
   if (type !== 'thinking_start' && type !== 'thinking_delta' && type !== 'text_start' && type !== 'text_delta') return;
   const kind = type.startsWith('thinking') ? 'thinking' : 'text';
   const block = update.partial?.content?.[index];
-  const previous = currentMessageSteps.get(index)?.querySelector<HTMLElement>('.assistant-step-content')?.dataset.rawText || '';
+  const element = currentMessageSteps.get(index);
+  const previous = element ? messageRenderer.assistantStepText(element) : '';
   const text = block && typeof block !== 'string'
     ? (kind === 'thinking' ? block.thinking : block.text) || ''
     : previous + (update.delta || '');
   updateMessageStep(index, { type: kind, text }, true);
-  messageRenderer.scrollToBottom();
 }
 
 function appendLiveActivity(element: HTMLElement, label: string, before: HTMLElement | null = null) {
@@ -1248,11 +1450,13 @@ function handleToolExecutionEnd(event: AppEvent) {
 }
 
 function pendingInteractionCount(sessionId: string) {
-  return liveSessions.find(session => session.id === sessionId)?.pendingInteractionCount || 0;
+  const session = liveSessions.find(session => session.id === sessionId);
+  return session?.attached ? sharedDialogs.get(sessionId)?.size || 0 : session?.pendingInteractionCount || 0;
 }
 
 function reconcileInteractionState(next: InteractionState) {
-  if (!liveSessions.some(session => session.id === next.sessionId)) return;
+  const session = liveSessions.find(session => session.id === next.sessionId);
+  if (!session || session.attached) return;
   const current = interactionStates.get(next.sessionId);
   // HTTP snapshots and WebSocket updates can cross in flight. In particular,
   // an older snapshot must never recreate a request another client answered.
@@ -1268,8 +1472,17 @@ function reconcileInteractionState(next: InteractionState) {
 }
 
 function queueExtensionUIRequest(event: AppEvent, sessionId: string) {
-  // Response-bearing requests arrive only through the full server registry.
-  // Preserve the existing background-tab behavior for transient notifications.
+  if (liveSessions.find(session => session.id === sessionId)?.attached && DIALOG_METHODS.has(String(event.method))) {
+    if (typeof event.id !== 'string') return;
+    let dialogs = sharedDialogs.get(sessionId);
+    if (!dialogs) sharedDialogs.set(sessionId, dialogs = new Map());
+    dialogs.set(event.id, event);
+    renderLiveTabs();
+    if (viewingActiveSession && activeLiveSessionId === sessionId) updateUI();
+    return;
+  }
+  // Native response-bearing requests arrive only through Tau's full registry.
+  // Preserve background-tab transient notifications for both transports.
   if (event.method !== 'notify') return;
   if (!pendingExtensionUIRequests.some(req => req.sessionId === sessionId && req.event.id === event.id)) {
     pendingExtensionUIRequests.push({ sessionId, event });
@@ -1282,7 +1495,9 @@ function processQueuedExtensionUIRequest(sessionId = activeLiveSessionId) {
   pendingExtensionUIRequests = pendingExtensionUIRequests.filter(request => request.sessionId !== sessionId);
   for (const { event } of notifications) handleExtensionUIRequest(event, sessionId);
   if (dialogHandler.currentRequest) return;
-  const request = interactionStates.get(sessionId)?.pendingDialogs.find(request => request.expiresAt === undefined || request.expiresAt > Date.now());
+  const shared = liveSessions.find(session => session.id === sessionId)?.attached;
+  const request = shared ? sharedDialogs.get(sessionId)?.values().next().value
+    : interactionStates.get(sessionId)?.pendingDialogs.find(request => request.expiresAt === undefined || request.expiresAt > Date.now());
   if (request) handleExtensionUIRequest(request, sessionId);
 }
 
@@ -1294,7 +1509,17 @@ function suspendCurrentDialogForTabSwitch(nextSessionId: string) {
 }
 
 function handleExtensionUIRequest(event: AppEvent, sessionId: string | null = null) {
+  // One dialog shows at a time. Its membership stays with its authoritative
+  // registry even while visible, or while the transport accepts an answer.
+  const current = dialogHandler.currentRequest;
+  if (sessionId && current && DIALOG_METHODS.has(String(event.method))) {
+    if (current.sessionId !== sessionId || current.id !== event.id) queueExtensionUIRequest(event, sessionId);
+    return;
+  }
   const request = (sessionId ? { ...event, sessionId } : event) as DialogRequest;
+  // A shared request stays a member until mux closes it or replaces its
+  // snapshot. Native requests still use Tau's original absolute expiry.
+  if (sessionId && liveSessions.find(session => session.id === sessionId)?.attached) delete request.expiresAt;
   switch (event.method) {
     case 'select':
       dialogHandler.showSelect(request);
@@ -1312,7 +1537,7 @@ function handleExtensionUIRequest(event: AppEvent, sessionId: string | null = nu
       dialogHandler.showNotification(request);
       break;
     default:
-      console.warn('[App] Unknown extension UI method:', event.method);
+      if (!DISPLAY_UI_METHODS.has(String(event.method))) console.warn('[App] Unknown extension UI method:', event.method);
   }
 }
 
@@ -1531,6 +1756,58 @@ function renderAttachmentPreviews() {
 // ═══════════════════════════════════════
 
 let messageQueue: QueuedCommand[] = [];
+const unsentInput = new UnsentInputStore();
+
+function putInComposer(input: UnsentInput | null) {
+  if (!input) return;
+  messageInput.value = [input.text, messageInput.value].filter(Boolean).join('\n\n');
+  pendingImages.push(...input.images);
+  renderAttachmentPreviews();
+  setStatusMessage('Your unsent message is back in the input', 4000);
+}
+
+/** The active shared tab's agent may have input waiting from a connection that ended. */
+function restoreUnsentInput() {
+  if (!viewingActiveSession) return;
+  const muxId = liveSessions.find(s => s.id === activeLiveSessionId)?.attached?.muxId;
+  if (muxId) putInComposer(unsentInput.take(muxId));
+}
+
+/** A shared tab ended while its agent may run on: its draft belongs to that agent, not to the next tab shown. */
+function keepUnsentInput(session: LiveSession) {
+  const muxId = session.attached?.muxId;
+  if (!muxId) return;
+  unsentInput.keepInFlight(muxId);
+  // Instructions still held locally were never handed to Pi. Keep those too,
+  // under this agent rather than the next tab selected after disconnect.
+  for (const command of messageQueue.filter(command => command.sessionId === session.id)) {
+    unsentInput.keep(muxId, { text: command.message || '', images: command.images || [] });
+  }
+  messageQueue = messageQueue.filter(command => command.sessionId !== session.id);
+  const dispatch = queuedPrompts.get(session.id);
+  if (dispatch && !dispatch.accepted && !dispatch.started) {
+    // The HTTP acknowledgement may have been lost: restore for review only,
+    // just like socket input whose receipt disappeared. Never replay it.
+    unsentInput.keep(muxId, { text: dispatch.command.message || '', images: dispatch.command.images || [] });
+  }
+  if (session.id !== activeLiveSessionId) return;
+  const text = messageInput.value.trim();
+  if (!text && !pendingImages.length) return;
+  unsentInput.keep(muxId, { text, images: pendingImages });
+  messageInput.value = '';
+  pendingImages = [];
+  renderAttachmentPreviews();
+}
+
+function settlePrompt(id: string, delivered: boolean, error?: unknown) {
+  if (!unsentInput.settle(id, delivered)) return;
+  flashStatusError(String(error || 'Pi did not get your message.'), 5000);
+  restoreUnsentInput();
+}
+
+function activeTabIsShared() {
+  return !!liveSessions.find(s => s.id === activeLiveSessionId)?.attached;
+}
 
 function sendMessage() {
   if (takeRequest?.sessionId === activeLiveSessionId) {
@@ -1539,11 +1816,21 @@ function sendMessage() {
   }
   const message = messageInput.value.trim();
   if (!message && pendingImages.length === 0) return;
+  if (wsClient.ws?.readyState !== WebSocket.OPEN) {
+    // Keep the draft: a send now would be dropped, for instance while a phone
+    // reconnects after the server restarted.
+    flashStatusError('Reconnecting; your message is still here, send it again in a moment.');
+    if (wsClient.ws?.readyState !== WebSocket.CONNECTING) wsClient.forceReconnect();
+    return;
+  }
 
   messageInput.value = '';
   messageInput.style.height = 'auto';
 
-  const cmd: QueuedCommand = { type: 'prompt', message: message || '(see attached image)' };
+  // Another frontend sharing this Pi can start a run at any moment; Pi then
+  // needs to know how to queue the prompt. It ignores this when idle.
+  const cmd: QueuedCommand = { type: 'prompt', message: message || '(see attached image)', streamingBehavior: 'followUp' };
+  const images = pendingImages;
 
   if (pendingImages.length > 0) {
     cmd.images = pendingImages.map(img => {
@@ -1565,6 +1852,15 @@ function sendMessage() {
   cmd.sessionId = activeLiveSessionId;
   resumeQueuedInput = true;
 
+  if (state.isStreaming && activeTabIsShared() && !sessionHasPendingWork(activeLiveSessionId)) {
+    // The run may belong to another frontend: Pi takes this now and every
+    // frontend, this one included, draws it when Pi delivers it.
+    cmd.streamingBehavior = 'steer';
+    setStatusMessage('Sent; Pi reads it at its next step', 3000);
+    sendPrompt(cmd, { text: message, images });
+    return;
+  }
+
   if (state.isStreaming || sessionHasPendingWork(activeLiveSessionId)) {
     // Queue it for the current Tau tab only; do not let tab switches retarget it.
     messageQueue.push(cmd);
@@ -1576,7 +1872,17 @@ function sendMessage() {
   lastSentMessage = message;
   assistantBlocks.boundary();
   messageRenderer.renderUserMessage({ content: message, images: cmd.images });
-  wsClient.send(cmd);
+  sendPrompt(cmd, { text: message, images });
+}
+
+/** Track only input actually handed to Tau, not a still-local queued draft. */
+function sendPrompt(command: QueuedCommand, input: UnsentInput) {
+  const muxId = liveSessions.find(session => session.id === command.sessionId)?.attached?.muxId;
+  if (muxId) {
+    command.id = `tau_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    unsentInput.track(command.id, muxId, input);
+  }
+  wsClient.send(command);
 }
 
 const queuedMessagesEl = document.getElementById('queued-messages')!;
@@ -1591,11 +1897,19 @@ function renderQueuedMessages() {
     el.title = 'The acknowledgement was lost. This instruction may have run. Waiting for confirmed execution or completion before sending more.';
     queuedMessagesEl.appendChild(el);
   }
-  if (messageQueue.length === 0 && !uncertain?.uncertain) {
-    queuedMessagesEl.classList.add('hidden');
-    return;
+  // What Pi itself is holding, from whichever frontend it came.
+  const piQueue = (activeLiveSessionId && piQueues.get(activeLiveSessionId)) || { steering: [], followUp: [] };
+  for (const [label, messages] of [['Steering', piQueue.steering], ['Follow-up', piQueue.followUp]] as const) {
+    for (const message of messages) {
+      const el = document.createElement('div');
+      el.className = 'queued-msg';
+      el.innerHTML = `
+      <span class="queued-msg-label">${label}</span>
+      <span class="queued-msg-text">${escapeHtml(message)}</span>
+    `;
+      queuedMessagesEl.appendChild(el);
+    }
   }
-  queuedMessagesEl.classList.remove('hidden');
   messageQueue.forEach((cmd, i) => {
     if (cmd.sessionId !== activeLiveSessionId) return;
     const el = document.createElement('div');
@@ -1619,6 +1933,8 @@ function renderQueuedMessages() {
     queuedMessagesEl.appendChild(el);
   });
   queuedMessagesEl.classList.toggle('hidden', queuedMessagesEl.children.length === 0);
+  // The panel takes room from the conversation: its latest line stays in view.
+  if (!isScrolledUp) messageRenderer.scrollToBottom();
 }
 
 function escapeHtml(text: string) {
@@ -1751,8 +2067,17 @@ function abortActiveSession() {
       });
       const data = await response.json();
       if (!response.ok || !data.success) throw new Error(data.error || 'Pi did not acknowledge the stop');
-      localAbortStates.delete(sessionId);
       const session = liveSessions.find(session => session.id === sessionId);
+      // An attached Pi acknowledges the command through mux, not through the
+      // native stop-state registry. Acceptance cannot establish operation idle
+      // or discard its dialogs; wait for settled/authoritative idle metadata.
+      if (session?.attached) {
+        if ((operationRevisions.get(sessionId) || 0) !== revision || session.isStreaming === false) {
+          localAbortStates.delete(sessionId);
+        }
+        return;
+      }
+      localAbortStates.delete(sessionId);
       // A queued instruction may already have started after agent_settled.
       // This HTTP response belongs to the operation we originally stopped.
       if (session && (operationRevisions.get(sessionId) || 0) === revision) {
@@ -1787,6 +2112,10 @@ async function takeFromHerdr() {
     flashStatusError('Select a live Tau tab first. The Herdr conversation will replace it here.');
     return;
   }
+  if (session.attached) {
+    flashStatusError('This tab is shared with the frontend that started it; take the Herdr conversation into a Tau tab of its own.', 8000);
+    return;
+  }
   if (takeRequest || state.isStreaming || session.isStreaming || messageQueue.some(cmd => cmd.sessionId === session.id)
     || sessionHasPendingWork(session.id) || dialogHandler.currentRequest?.sessionId === session.id) {
     flashStatusError('Finish the current work, queued messages and dialogs before taking a session.');
@@ -1819,8 +2148,9 @@ async function takeFromHerdr() {
 
 // Command Palette
 const commandPaletteController = setupCommandPalette([
-  { icon: '↙', label: 'Take from Herdr…', desc: 'Take an idle Herdr conversation into this Tau tab', action: () => { void takeFromHerdr(); } },
-  { icon: '🌳', label: 'Session tree', desc: 'Jump to any earlier point in the session tree', action: () => { void treeViewController.open(); } },
+  { icon: '↙', label: 'Take from Herdr…', desc: 'Take an idle Herdr conversation into this Tau tab', available: () => !activeTabIsShared(), action: () => { void takeFromHerdr(); } },
+  { icon: '✨', label: 'New session', desc: 'Start over in this shared agent; every frontend moves with it', available: activeTabCanStartOver, action: () => { void newSharedSession(); } },
+  { icon: '🌳', label: 'Session tree', desc: 'Jump to any earlier point in the session tree', available: () => !activeTabIsShared(), action: () => { void treeViewController.open(); } },
   { icon: '🗜️', label: 'Compact', desc: 'Compact context to save tokens', action: () => rpcCommand({ type: 'compact' }, 'Compacting...') },
   { icon: '📋', label: 'Export HTML', desc: 'Export session as HTML file', action: () => rpcExportHtml() },
   { icon: '📊', label: 'Session Stats', desc: 'Show session statistics', action: () => showSessionStats() },
@@ -1836,7 +2166,7 @@ async function rpcCommand(cmd: RpcCommand, statusMsg = '') {
     const needsLiveSession = !cmd.sessionId && !cmd.filePath && !backendLocalCommands.has(cmd.type);
     if (needsLiveSession && (!viewingActiveSession || !activeLiveSessionId)) {
       const error = 'Select a live Tau tab first.';
-      setStatusMessage(error, wsClient.ws?.readyState === WebSocket.OPEN ? 'Connected' : 'Disconnected', 3000);
+      setStatusMessage(error, 3000);
       return { type: 'response', command: cmd.type, success: false, error };
     }
     if (!cmd.sessionId && viewingActiveSession && activeLiveSessionId) cmd = { ...cmd, sessionId: activeLiveSessionId };
@@ -1848,20 +2178,33 @@ async function rpcCommand(cmd: RpcCommand, statusMsg = '') {
     });
     const data = await resp.json();
     if (data.success) {
-      setStatusMessage('Done', 'Connected', 2000);
+      setStatusMessage('Done', 2000);
     } else {
-      setStatusMessage(data.error || 'Failed', 'Connected', 3000);
+      setStatusMessage(data.error || 'Failed', 3000);
     }
     return data;
   } catch (e) {
-    setStatusMessage('Error', 'Connected', 3000);
+    setStatusMessage('Error', 3000);
   }
+}
+
+/** Only a shared root agent starts over in place: a Tau tab opens new sessions as new tabs, and workers stay on their file. */
+function activeTabCanStartOver() {
+  const session = liveSessions.find(s => s.id === activeLiveSessionId);
+  return !!session?.attached && session.attached.placement !== 'worker';
+}
+
+async function newSharedSession() {
+  const session = liveSessions.find(s => s.id === activeLiveSessionId);
+  if (session?.isStreaming && !confirm('This agent is working. A new session stops that work, in every frontend. Start over?')) return;
+  const data = await rpcCommand({ type: 'new_session' }, 'Starting a new session...');
+  if (data?.success && data.data?.cancelled) flashStatusError('This agent refused a new session; workers stay on their session file.', 8000);
 }
 
 async function rpcExportHtml() {
   const data = await rpcCommand({ type: 'export_html' }, 'Exporting...');
   if (data?.success && data.data?.path) {
-    setStatusMessage(`Exported: ${data.data.path}`, 'Connected', 4000);
+    setStatusMessage(`Exported: ${data.data.path}`, 4000);
   }
 }
 
@@ -1881,6 +2224,45 @@ async function showSessionStats() {
   }
 }
 
+/** After opening something on purpose. A phone keeps its keyboard down, and an open dialog keeps the focus. */
+function focusComposer() {
+  if (!isMobile() && !dialogHandler.currentRequest) messageInput.focus();
+}
+
+/** What the conversation area shows now, to notice that the user moved on. */
+function currentView() {
+  return JSON.stringify([activeLiveSessionId, viewingActiveSession, sidebar.activeSessionFile, launcherPanel.isVisible()]);
+}
+
+// Agent overview: tapping a shared agent attaches a Tau tab to it, or selects
+// the tab already attached.
+const agentsPanel = setupAgentsPanel({
+  button: document.getElementById('agents-btn')!,
+  focusComposer,
+  async open(agent) {
+    if (agent.tabId && liveSessions.some(s => s.id === agent.tabId)) {
+      await selectLiveSession(agent.tabId);
+      return true;
+    }
+    const view = currentView();
+    try {
+      const res = await fetch('/api/live-sessions/attach', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ muxId: agent.muxId }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error || !data.session) throw new Error(data.error || 'Could not open the agent');
+      upsertLiveSession(data.session);
+      // Attaching can take seconds; whatever the user opened meanwhile stays.
+      if (currentView() !== view) return false;
+      await selectLiveSession(data.session.id);
+      return true;
+    } catch (error) {
+      flashStatusError(error instanceof Error ? error.message : 'Could not open the agent', 8000);
+      return false;
+    }
+  },
+});
+
 // Model Picker
 const modelPickerController = setupModelPicker({
   getActiveLiveSessionId: () => activeLiveSessionId,
@@ -1890,6 +2272,7 @@ const modelPickerController = setupModelPicker({
   escapeHtml,
   setContextWindowSize(value) { contextWindowSize = value; },
   updateContextPill,
+  focusComposer,
 });
 
 // Session tree view (modal opened from the header git-branch button, or the
@@ -1916,13 +2299,23 @@ document.addEventListener('keydown', (e) => {
   // Escape — Abort streaming, or close sidebar on mobile
   if (e.key === 'Escape') {
     // Close palettes/panels first
-    if (modelPickerController.closeIfOpen()) return;
-    if (treeViewController.closeIfOpen()) return;
+    let closed = modelPickerController.closeIfOpen() || treeViewController.closeIfOpen() || commandPaletteController.closeIfOpen();
+    if (agentsPanel.isVisible()) {
+      agentsPanel.hide();
+      closed = true;
+    }
+    if (!newLiveSessionModal?.classList.contains('hidden')) {
+      closeNewLiveSessionModal();
+      closed = true;
+    }
     if (!settingsPanel.classList.contains('hidden')) {
       closeSettings();
+      closed = true;
+    }
+    if (closed) {
+      focusComposer();
       return;
     }
-    if (commandPaletteController.closeIfOpen()) return;
 
     if (viewingActiveSession && activeLiveSessionId && (state.isStreaming || sessionHasPendingWork(activeLiveSessionId))) {
       abortActiveSession();
@@ -2227,6 +2620,7 @@ function applyLiveSessionSnapshot(data: LiveSessionSnapshotData, requestedAtRevi
   console.log('[LiveSession] Received state snapshot:', data.entries?.length, 'entries');
   const sessionId = data.sessionId || activeLiveSessionId;
   if (!sessionId || !liveSessions.some(session => session.id === sessionId)) return;
+  if (Array.isArray(data.dialogs)) reconcileSharedDialogs(sessionId, data.dialogs, data.generation);
   const interactionRevision = interactionStates.get(sessionId)?.interactionRevision;
   const staleInteractions = interactionRevision !== undefined && data.interactionRevision !== undefined && data.interactionRevision < interactionRevision;
   const staleMetadata = staleInteractions || (requestedAtRevision !== undefined && requestedAtRevision !== (sessionStateRevisions.get(sessionId) || 0));
@@ -2247,6 +2641,9 @@ function applyLiveSessionSnapshot(data: LiveSessionSnapshotData, requestedAtRevi
     }
     activeLiveSessionFile = data.sessionFile || data.session?.sessionFile || null;
     sidebar.setActive(activeLiveSessionFile);
+    if (liveSessions.find(session => session.id === sessionId)?.attached && data.isStreaming === false) {
+      localAbortStates.delete(sessionId);
+    }
     state.setStreaming(!!data.isStreaming);
     showTypingIndicator(!!data.isStreaming);
   }
@@ -2345,9 +2742,12 @@ function updateLiveSessionInputState() {
     inputArea?.classList.add('no-active-live-session');
   }
   takeHerdrBtn.setAttribute('aria-busy', String(takeRequest !== null));
+  // Taking replaces a Tau tab's own conversation; a shared tab has none to give up.
+  takeHerdrBtn.classList.toggle('hidden', !hasLiveSession || activeTabIsShared());
   document.getElementById('command-btn')!.disabled = !hasLiveSession;
   modelPickerController.setEnabled(hasLiveSession);
-  treeViewController.setVisible(hasLiveSession);
+  // Tree navigation needs Tau's extension, which a shared Pi does not load.
+  treeViewController.setVisible(hasLiveSession && !activeTabIsShared());
 }
 
 // ═══════════════════════════════════════
@@ -2611,7 +3011,8 @@ function updateUI() {
 
   if (isStreaming || hasPendingInteraction || stopping) {
     abortBtn.classList.remove('hidden');
-    sendBtn.classList.add('hidden');
+    // A shared tab can steer, and on a phone this button is how.
+    sendBtn.classList.toggle('hidden', !activeTabIsShared() || !!hasPendingInteraction || !!stopping);
   } else {
     abortBtn.classList.add('hidden');
     sendBtn.classList.remove('hidden');

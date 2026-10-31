@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { buildHistoryItems, type SessionHistoryEntry } from '../src/public/history-render.ts';
+import { buildHistoryItems, messageImages, type SessionHistoryEntry } from '../src/public/history-render.ts';
 import type { AppMessage } from '../src/public/app-types.ts';
 
 function msg(message: AppMessage): SessionHistoryEntry {
@@ -14,6 +14,20 @@ test('user text and images preserve their order and supported image shapes', () 
     { type: 'image', source: { data: 'abc123', media_type: 'image/jpeg' } },
   ] })]);
   assert.deepEqual(items, [{ kind: 'user', content: 'line one\nline two', images: [{ data: 'abc123', mimeType: 'image/jpeg' }] }]);
+});
+
+test('shared live images and saved images use the same MIME-aware extraction', () => {
+  for (const image of [
+    { type: 'image', data: 'jpeg-data', mimeType: 'image/jpeg' },
+    { type: 'image', data: 'jpeg-data', media_type: 'image/jpeg' },
+    { type: 'image', source: { data: 'jpeg-data', media_type: 'image/jpeg' } },
+  ]) {
+    const message = { role: 'user', content: [image] };
+    const images = [{ data: 'jpeg-data', mimeType: 'image/jpeg' }];
+    assert.deepEqual(messageImages(message), images);
+    assert.deepEqual(buildHistoryItems([msg(message)]).items, [{ kind: 'user', content: '', images }]);
+  }
+  assert.deepEqual(messageImages({ role: 'user', content: 'plain text' }), []);
 });
 
 test('empty user messages are omitted but image-only messages remain', () => {

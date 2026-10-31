@@ -144,6 +144,55 @@ Focused checks: `npm run typecheck`, then `tsc -p tsconfig.server.json` and
  test/orchestration.test.ts test/http-routes.test.ts test/session-refresh.test.ts
  test/tree-navigate.test.ts test/input-synchronization.test.ts`.
 
+## Shared sessions (pimux)
+
+A Pi started through pimux belongs to the frontend that started it. An attached
+tab never signals it (`piPid` is display data at most), and detaching or losing
+the socket is not proof that Pi stopped, so a lost socket must never permit a
+spawn: the discovery entry decides. Opening a file has one resolution in
+`LiveSessionManager.resume`, which create also uses, because a route with its own
+check was how a second writer appeared. An unreachable mux whose wrapper or Pi
+lives fails closed. Stale means both are dead. Every entry naming a file counts,
+so a leftover entry cannot hide a live one, and that includes `starting` entries,
+which publish the file before Pi spawns: opening waits briefly for them, then
+refuses. Session-opening `args` stay rejected so the file is always visible to that
+resolution.
+
+History and in-flight work share one pimux boundary. Never combine a `get_tree`
+or `get_messages` read with replayed events: they can duplicate or lose the
+message crossing the boundary. Snapshots are published at `pimux_live`, then
+the replay; dialogs travel in the snapshot's `dialogs`, not as replayed events, so
+browsers can replace the set they hold, including for unselected tabs. The server
+answers the HTTP snapshot after that broadcast, and a browser must not apply an
+answer whose `generation` it already rendered: that would erase the replay.
+A snapshot sequence cut short (gap, newer snapshot, failure, exit, more records than
+announced) is discarded whole; only one reaching its own `pimux_live` is published.
+Dialogs close on `pimux_dialog_closed`. Input acknowledgements do not run
+`synchronizeInput` on attached tabs; pimux announces every session change itself.
+A file with a live writer is renamed through that Pi and never appended to or
+deleted here. A delta only grows `pendingSteps`; the DOM follows once per frame, so
+long replies stay linear. `sendMessage` keeps the draft while the socket is down.
+A tab id does not survive Tau or its socket, so input that did not reach a shared
+agent (`unsent-input.ts`) is kept by mux id and returns to the composer when a tab on
+that agent opens. It is never sent by itself: the prompt may have arrived.
+Checks: `node --test test/pimux-attach.test.ts test/e2e/pimux-share.e2e.ts` after
+compiling server and public TS; with Emacs, `TAU_EMACS_E2E=1 node --test
+test/e2e/emacs-share.e2e.ts`.
+
+## Browser connections
+
+`liveManager.sendTo` is the only way to send to a browser after its first record: one
+that stopped reading is terminated at `MAX_CLIENT_BACKLOG_BYTES` and recovers through
+a snapshot on reconnect, so Tau never buffers for it without bound. Status text comes
+from `connectionStatusText()`, never a literal: HTTP can succeed while the WebSocket
+that carries events is down.
+
+`src/public/sw.ts` lists every module by hand (`test/service-worker.test.ts` checks
+it). Bump `CACHE_NAME` with each deployed change to `src/public`.
+
+Only the exact normalized `/api/health` skips authentication (`isPublicRequest`).
+Compare request paths after URL normalization, never by raw prefix.
+
 ## Assistant activity blocks
 
 Consecutive assistant thinking, text and tool calls share one visual bubble in

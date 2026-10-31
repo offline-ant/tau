@@ -185,6 +185,7 @@ access.
 - Browser reload or reconnect restores live Tau tabs from the backend
 - Multiple browser clients see the same live session list
 - Historical sessions remain read-only
+- **Agents** — the header button (its count shows blocked agents) lists every Pi shared through pimux, such as Emacs Pilish sessions: grouped by directory, workers under their parent, blocked first, then working, done, idle. Tapping one attaches a tab; see [Shared agents](#shared-agents-pimux).
 - **Take from Herdr…** — use the arrow beside the Tau tabs or the command palette to select an idle Herdr conversation and load it into the current Tau tab. Requires pi-ant's `/take` command and an idle tab with no queued messages or pending dialogs. The existing RPC picker handles selection; drafts, attachments, and other tabs' queues stay untouched.
 - **Session tree and branching** — inspect the active session's full tree and jump to any earlier entry, mirroring Pi TUI's `/tree` behavior; choose a user message to restore it to the composer and create a new branch
 - **Live-tab links** — `/#session=<URL-encoded live-tab id>` selects an existing
@@ -288,7 +289,7 @@ Tau Web Server supports HTTP Basic Auth. This fork ships **default credentials `
 }
 ```
 
-Both HTTP and WebSocket connections are gated when enabled. `/api/health` remains open for monitoring.
+Both HTTP and WebSocket connections are gated when enabled. Only the exact path `/api/health` remains open for monitoring.
 
 After the first successful Basic login, the server sets a signed `HttpOnly` session cookie and accepts it in place of the Authorization header. This keeps mobile browsers (notably iOS Safari and the installed PWA, which evict cached Basic credentials whenever you switch apps) from re-prompting for the password every time you return to the app. The cookie is scoped to the browser session — killing the browser ends it and the Basic prompt appears again — and the token inside it expires after 12 hours of inactivity, renewing itself while the app is in use. Changing the password invalidates every outstanding cookie on all devices, and deleting the auto-generated `cookieSecret` from `~/.pi/agent/settings.json` force-logs-out all devices at once.
 
@@ -327,6 +328,9 @@ Three pieces make that work:
   concurrent server does not overwrite the first one's record; target it with
   `PI_ORCHESTRATION_ENDPOINT`. Children tau spawns inherit
   `PI_ORCHESTRATION_HOST=web` and that endpoint directly.
+- **Shared sessions.** A file a pimux wrapper shares opens by attaching, never
+  by spawning, and takes precedence over the registry below. See
+  [Shared agents](#shared-agents-pimux).
 - **Ownership.** Workers on a *terminal* host register themselves in
   `$TMPDIR/pi-orchestration-targets`. Tau reads that registry, marks those
   sessions `owner` in `GET /api/sessions`, and answers `POST
@@ -364,6 +368,59 @@ automatic transfer mechanism.
 Tau has no terminal, so it hosts Pi sessions only: `panel-start` and other shell
 work stay on a terminal host.
 
+## Shared agents (pimux)
+
+[pimux](https://github.com/offline-ant/pi-ant/tree/main/orchestration/pimux)
+wraps one `pi --mode rpc` so the frontend that started it (Emacs Pilish) and
+others on a private Unix socket share that process. Its README is the protocol
+contract. Tau is a secondary client: a tab's transport is either a spawned child
+or such a socket (`src/server/transport.ts`).
+
+- **Finding them.** The server watches the discovery directory (`$PIMUX_DIR`, else
+  `/tmp/pi-mux-<uid>`). `GET /api/agents` and the WebSocket `pimux_agents` record
+  publish the overview. An agent is `done` after it finishes work until it is opened
+  here; an agent open in a tab is never `done`.
+- **Attaching.** `POST /api/live-sessions/attach {"muxId"}` attaches or returns the
+  tab already attached. Create and resume share one resolution for a session file:
+  an existing tab, else a live pimux (attach), else spawn. A pimux still starting
+  gets five seconds to listen. One that cannot be reached while its wrapper or Pi
+  lives answers `409` and spawns nothing. `args` that
+  open a session (`--session`, `--continue`, `--fork`, ...) are rejected; use
+  `sessionFile`.
+- **Staying in step.** Every browser selection or reconnect requests a pimux
+  snapshot. Tau publishes `live_session_snapshot` with the open dialogs and the
+  boundary's `generation`, then the replayed in-flight work as ordinary events, so a
+  reload mid-reply continues exactly. The HTTP snapshot answer carries the same
+  `generation`; a browser skips it when it already rendered that one.
+- **Closing.** Closing an attached tab, or stopping Tau, only disconnects: Tau never
+  signals that Pi. A lost connection closes the tab with a message and permits no
+  spawn. When Pi ends, the conversation stays readable with a note below it: closed in
+  its frontend, a finished worker, or a failure with Pi's stderr tail. A restarted Tau
+  has no tabs; each browser reattaches to the agent it was showing, with its draft.
+- **Names.** A tab shows the agent's own name (its session name, else the name in
+  the discovery entry) and is never titled from a prompt: the owning frontend names it.
+- **Input.** Sending while Pi works steers it at once (`streamingBehavior: "steer"`), and
+  every frontend draws the message when Pi delivers it. The palette's **New session**
+  sends `new_session`, which moves every frontend, and asks first while the agent works;
+  workers do not offer it. What Pi holds (`queue_update`) shows above the composer in
+  every browser. Spawned tabs keep their browser queue and open new sessions as tabs.
+  Input that did not reach the agent
+  when a connection ended returns to the composer once a tab on that agent opens, and is
+  never sent by itself. Dialogs that open together show in turn.
+- **Not on attached tabs.** Tree navigation (`navigate_tree`, Tau's extension is not
+  loaded in that Pi) and `refresh` are rejected by the server. Take from Herdr is
+  refused: the tab is owned by the frontend that started it. The palette and header
+  leave out what the current tab cannot do.
+- **Files with a live writer.** `set_session_name` goes through that Pi, also for a
+  shared file without a tab. Deleting a stored session with a live writer (a tab, a
+  pimux or a terminal owner) answers `409`; a leftover entry of an agent that is gone
+  does not count.
+- `/switch tau` in a shared Pi attaches through the same route and leaves that Pi
+  untouched.
+
+Tau's own tabs are not started through pimux, so they appear only in Tau. RPC `bash`
+(`!`) records are forwarded but not rendered yet.
+
 ## How it works
 
 ```
@@ -398,6 +455,17 @@ servers and fake Pi children. Every test closes its browser page when it ends.
 Dictation checks: `node --test test/voice.test.ts test/voice-route.test.ts
 test/e2e/voice-input.e2e.ts`. These use fake speech backends and Chromium's fake
 microphone. Backend/settings and opt-in live checks belong to pi-sound.
+
+Shared agents: `node --test test/pimux-attach.test.ts` uses a fake pimux socket;
+`node --test test/e2e/pimux-share.e2e.ts` runs real pimux (`PIMUX_BIN`, default
+`../pi-ant/orchestration/pimux/bin/pimux`), real Pi on faux providers with a private
+agent directory, and a phone-sized Chromium.
+`TAU_EMACS_E2E=1 node --test test/e2e/emacs-share.e2e.ts` is the three-way check: a
+disposable daemon on the real Emacs configuration (`TAU_EMACS_CONFIG`, default
+`~/.emacs.d`) with real Pilish and pi-deck, a real `do` worker, a terminal frame in a
+private tmux, private-port Tau and the phone-sized Chromium. Faux providers only; it
+takes about two minutes and needs tmux.
+
 
 ## License
 

@@ -2,9 +2,10 @@
 /*
  * Tau standalone server.
  *
- * Serves the Tau web UI and manages backend-owned `pi --mode rpc` child
- * sessions. Browser connections are views only; explicit live-session DELETE or
- * server shutdown terminates child Pi processes.
+ * Serves the Tau web UI, manages backend-owned `pi --mode rpc` child sessions
+ * and attaches tabs to Pi processes other frontends share through pimux.
+ * Browser connections are views only; explicit live-session DELETE or server
+ * shutdown terminates child Pi processes and only detaches shared ones.
  */
 
 import http from 'node:http';
@@ -25,7 +26,9 @@ import { ARGS, AUTH_CONFIGURED, HOST, HTTP_PORT, MIME_TYPES, PI_AGENT_DIR, PI_CO
 import { SESSION_COOKIE_NAME, SESSION_REFRESH_THRESHOLD_SECONDS, buildSessionCookie, issueSessionToken, parseCookies, verifySessionToken } from './auth.js';
 import { completeDirectories } from './path-completion.js';
 import { getAvailableModels, modelLabel, normalizeModel, parseModelSpecToModel, parsePiListModels, _clearModelListCacheForTest, _setExecFileForTest } from './model-utils.js';
-import { LiveSessionManager, PiRpcSession, SessionLifecycleError, isGenericSessionName, liveManager, makeId, _setSpawnPiForTest } from './sessions.js';
+import { LiveSessionManager, PiRpcSession, SessionLifecycleError, SessionOpenError, assertNoSessionArgs, isGenericSessionName, liveManager, makeId, _setSpawnPiForTest } from './sessions.js';
+import { pimuxCommand, pimuxEntryForFile, pimuxFiles, pimuxSharing, processAlive } from './pimux.js';
+import { AgentOverview } from './agents.js';
 import { readSessionHeader } from './session-header.js';
 import { buildEndpoint, orchestrationEndpoint, publishEndpoint, unpublishEndpoint } from './orchestration.js';
 import { sessionOwner, sessionOwners } from './session-owners.js';
@@ -61,6 +64,21 @@ function checkAuth(req: IncomingMessage): AuthResult {
     if (verdict.valid) return { ok: true, via: 'cookie', expiresAt: verdict.expiresAt };
   }
   return { ok: false, via: 'none' };
+}
+
+/**
+ * The one route open without credentials, compared after URL normalization:
+ * `/api/health/../agents` routes to `/api/agents`, so a raw prefix check
+ * would let it past authentication.
+ */
+function isPublicRequest(req: IncomingMessage): boolean {
+  const url = req.url || '';
+  if (!url.startsWith('/')) return false;
+  try {
+    return new URL(`http://localhost${url}`).pathname === '/api/health';
+  } catch {
+    return false;
+  }
 }
 
 function isHttpsRequest(req: IncomingMessage): boolean {
@@ -116,6 +134,9 @@ function json(res: ServerResponse, status: number, data: unknown, extraHeaders: 
 }
 
 function sendLifecycleError(res: ServerResponse, error: unknown) {
+  if (error instanceof SessionOpenError) {
+    return json(res, error.status, { error: error.message, ...(error.muxId ? { muxId: error.muxId } : {}) });
+  }
   if (error instanceof SessionLifecycleError) {
     return json(res, error.childStopped ? 400 : 503, {
       error: error.message, sessionId: error.sessionId, childStopped: error.childStopped,
@@ -166,6 +187,7 @@ function parseSpawnOverrides(body: RpcCommand): { args?: string[]; env?: Record<
   const overrides: { args?: string[]; env?: Record<string, string>; sessionFile?: string } = {};
   if (body.args !== undefined) {
     if (!Array.isArray(body.args) || body.args.some((arg) => typeof arg !== 'string')) throw new Error('args must be an array of strings');
+    assertNoSessionArgs(body.args as string[]);
     overrides.args = body.args as string[];
   }
   if (body.env !== undefined) {
@@ -183,6 +205,30 @@ function parseSpawnOverrides(body: RpcCommand): { args?: string[]; env?: Record<
   // but never a path outside Pi's session storage.
   if (body.sessionFile !== undefined) overrides.sessionFile = resolveSessionFile(String(body.sessionFile));
   return overrides;
+}
+
+/**
+ * Another Pi process (a terminal orchestration target) is appending to this
+ * file; opening it would make Tau a second writer. A pimux-shared file is not
+ * refused here: opening it attaches.
+ */
+function terminalOwnerRefusal(file: string, force: boolean) {
+  const shared = pimuxEntryForFile(file);
+  if (force || (shared && (processAlive(shared.pid) || processAlive(shared.piPid)))) return null;
+  const owner = sessionOwner(file);
+  return owner ? { error: `Session is running as ${owner.name} on ${owner.host}. Follow it read-only, or resume with force to take it over.`, owner } : null;
+}
+
+/** Why deleting this stored session would destroy a conversation some Pi is still writing, or null. */
+async function liveFileRefusal(file: string) {
+  if (liveManager.findBySessionFile(file) || liveManager.hasStartingSession(file) || liveManager.hasPendingResume(file) || liveManager.hasTerminatingResume(file)) {
+    return 'This session is open in a Tau tab; close the tab before deleting it.';
+  }
+  // A leftover entry of an agent that is gone owns nothing.
+  if (await pimuxSharing(file)) return 'This session is running in another frontend; stop it there before deleting it.';
+  const owner = sessionOwner(file);
+  if (owner) return `Session is running as ${owner.name} on ${owner.host}; stop it before deleting it.`;
+  return null;
 }
 
 function appendSessionName(filePath: string, name: string) {
@@ -263,21 +309,36 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
     const name = (command.name || '').trim();
     if (!name) return error('Name cannot be empty');
     const session = command.sessionId ? liveManager.get(command.sessionId) : null;
+    if (command.sessionId && !session) return error('Live session not found');
     let resolvedFile = null;
-    const targetFile = command.filePath || session?.sessionFile;
-    if (targetFile) {
-      try { resolvedFile = resolveSessionFile(targetFile); } catch (e) { return error(errorMessage(e)); }
+    if (command.filePath) {
+      try { resolvedFile = resolveSessionFile(command.filePath); } catch (e) { return error(errorMessage(e)); }
     }
-    const matchingLive = resolvedFile
-      ? Array.from(liveManager.sessions.values()).find((s) => s.sessionFile && path.resolve(s.sessionFile) === resolvedFile)
-      : null;
-    if (session?.refreshing || matchingLive?.refreshing) return error('Session refresh is in progress; wait a moment and send again');
-    if (resolvedFile) {
-      try { appendSessionName(resolvedFile, name); } catch (e) { return error(errorMessage(e)); }
+    const live = session || (resolvedFile ? liveManager.findBySessionFile(resolvedFile) : null);
+    if (live) {
+      // A live Pi writes its own file: rename through it, so its state and
+      // every frontend sharing it agree, and the file has one writer.
+      if (live.refreshing) return error('Session refresh is in progress; wait a moment and send again');
+      try {
+        const resp = await live.send({ type: 'set_session_name', name }, { timeoutMs: 10000 });
+        if (resp.success === false) return error(String(resp.error || 'Pi refused the rename'));
+      } catch (e) { return error(errorMessage(e)); }
+      updateLiveSessionName(live, name);
+      return success({ name });
     }
-    if (session) updateLiveSessionName(session, name);
-    else if (matchingLive) updateLiveSessionName(matchingLive, name);
-    else if (!resolvedFile) return error('sessionId or filePath required');
+    if (!resolvedFile) return error('sessionId or filePath required');
+    const shared = await pimuxSharing(resolvedFile);
+    if (shared?.reachability === 'unreachable') return error('This session is shared by another frontend that does not accept connections right now; rename it there.');
+    if (shared) {
+      try {
+        const resp = await pimuxCommand(shared.entry, { type: 'set_session_name', name }, 10000);
+        return resp.success === true ? success({ name }) : error(String(resp.error || 'Pi refused the rename'));
+      } catch (e) { return error(errorMessage(e)); }
+    }
+    const owner = sessionOwner(resolvedFile);
+    if (owner) return error(`Session is running as ${owner.name} on ${owner.host}; rename it there.`);
+    if (liveManager.hasStartingSession(resolvedFile) || liveManager.hasPendingResume(resolvedFile)) return error('Session is opening; wait a moment and send again');
+    try { appendSessionName(resolvedFile, name); } catch (e) { return error(errorMessage(e)); }
     return success({ name });
   }
 
@@ -287,6 +348,8 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
   // /tau-tree-navigate extension command in-process — see src/server/tree.ts).
   if (cmd === 'navigate_tree') {
     if (!session) return error('Live session not found');
+    // Tau's tree extension is not loaded in a Pi another frontend started.
+    if (session.attachment) return error('Session tree navigation is not available in a shared session; use the frontend that started it.');
     const entryId = typeof command.entryId === 'string' ? command.entryId.trim() : '';
     if (!entryId) return error('entryId required');
     try {
@@ -338,7 +401,9 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
   if (cmd === 'live_session_snapshot_request') return { type: 'live_session_snapshot', sessionId: session.id, ...await session.snapshot() };
   if (cmd === 'set_auto_compaction') return success({ enabled: !!command.enabled });
 
-  const native = new Set(['prompt', 'steer', 'follow_up', 'abort', 'compact', 'set_model', 'cycle_model', 'set_thinking_level', 'cycle_thinking_level', 'get_session_stats', 'get_tree', 'get_entries', 'extension_ui_response']);
+  // A spawned tab opens new sessions as new tabs; only a shared Pi moves with its frontends.
+  if (cmd === 'new_session' && !session.attachment) return error('Open a new Tau tab for a new session.');
+  const native = new Set(['new_session', 'prompt', 'steer', 'follow_up', 'abort', 'compact', 'set_model', 'cycle_model', 'set_thinking_level', 'cycle_thinking_level', 'get_session_stats', 'get_tree', 'get_entries', 'extension_ui_response']);
   if (!native.has(cmd ?? '')) return error(`Unknown command: ${cmd}`);
 
   // While navigate_tree is moving the child's leaf (pi's stdin loop does not
@@ -382,7 +447,7 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
 function serveStaticFile(req: IncomingMessage, res: ServerResponse) {
   let urlPath = req.url || '/';
   const auth = checkAuth(req);
-  if (authEnabled && !urlPath.startsWith('/api/health') && !auth.ok) return sendAuthRequired(res, req);
+  if (authEnabled && !auth.ok && !isPublicRequest(req)) return sendAuthRequired(res, req);
   maybeSetSessionCookie(req, res, auth);
   if (urlPath.startsWith('/api/')) return handleApiRoute(req, res, urlPath);
   urlPath = urlPath.split('?')[0];
@@ -448,9 +513,11 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
       try {
         overrides = parseSpawnOverrides(body);
       } catch (e) { return json(res, 400, { error: errorMessage(e) }); }
+      const refusal = overrides.sessionFile ? terminalOwnerRefusal(overrides.sessionFile, body.force === true) : null;
+      if (refusal) return json(res, 409, refusal);
       try {
         const session = await liveManager.create({ cwd: body.cwd, model: body.model || '', ...overrides });
-        json(res, 200, { session: session.metadata() });
+        json(res, 200, { session: session.metadata(), ...(session.attachment ? { attached: true } : {}) });
       } catch (e) { sendLifecycleError(res, e); }
     }).catch((e) => json(res, 400, { error: errorMessage(e) }));
     return;
@@ -468,7 +535,8 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
           && !liveManager.hasStartingSession(requestedFile)
           && !liveManager.hasPendingResume(requestedFile)
           && !liveManager.hasTerminatingResume(requestedFile)
-          && !sessionOwner(requestedFile),
+          && !sessionOwner(requestedFile)
+          && !pimuxEntryForFile(requestedFile),
       });
       let resolvedFile: string;
       let overrides: { args?: string[]; env?: Record<string, string> };
@@ -479,16 +547,11 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
         if (body.refresh !== undefined && typeof body.refresh !== 'boolean') throw new Error('refresh must be a boolean');
       } catch (e) { return rejectBeforeSpawn(errorMessage(e)); }
       const existing = liveManager.findBySessionFile(resolvedFile);
-      if (existing && body.refresh !== true && !existing.terminating && !liveManager.hasTerminatingResume(resolvedFile) && !liveManager.hasPendingResume(resolvedFile)) return json(res, 200, { session: existing.metadata(), reused: true, started: false });
-      // Another Pi process is appending to this file. Resuming would make this
-      // server a second writer on the same conversation.
-      const owner = sessionOwner(resolvedFile);
-      if (owner && body.force !== true) {
-        return json(res, 409, {
-          error: `Session is running as ${owner.name} on ${owner.host}. Follow it read-only, or resume with force to take it over.`,
-          owner,
-        });
+      if (existing && body.refresh !== true && !existing.terminating && !liveManager.hasTerminatingResume(resolvedFile) && !liveManager.hasPendingResume(resolvedFile)) {
+        return json(res, 200, { session: existing.metadata(), reused: true, started: false, ...(existing.attachment ? { attached: true } : {}) });
       }
+      const refusal = terminalOwnerRefusal(resolvedFile, body.force === true);
+      if (refusal) return json(res, 409, refusal);
       let cwd: string | null = normalizeSessionCwd(body.cwd);
       if (!cwd) cwd = readSessionHeaderCwd(resolvedFile);
       try {
@@ -500,11 +563,23 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
       const sessionName = deriveSessionNameFromEntries(entries);
       try {
         const { session, started, refreshed } = await liveManager.resume({ sessionFile: resolvedFile, cwd, model: body.model || '', entries, sessionName, refresh: body.refresh === true, ...overrides });
-        json(res, 200, { session: session.metadata(), started, ...(!started ? { reused: true } : {}), ...(refreshed ? { refreshed: true } : {}) });
+        json(res, 200, { session: session.metadata(), started, ...(!started ? { reused: true } : {}), ...(refreshed ? { refreshed: true } : {}), ...(session.attachment ? { attached: true } : {}) });
       } catch (e) { sendLifecycleError(res, e); }
     }).catch((e) => json(res, 400, { error: errorMessage(e) }));
     return;
   }
+  // Attach to a pimux-shared Pi by its id (the agent overview, /switch tau).
+  if (cleanPath === '/api/live-sessions/attach' && req.method === 'POST') {
+    readBody(req).then(async (body) => {
+      if (typeof body.muxId !== 'string' || !body.muxId) return json(res, 400, { error: 'muxId required' });
+      try {
+        const { session, started } = await liveManager.attachById(body.muxId);
+        json(res, 200, { session: session.metadata(), attached: true, started, ...(!started ? { reused: true } : {}) });
+      } catch (e) { sendLifecycleError(res, e); }
+    }).catch((e) => json(res, 400, { error: errorMessage(e) }));
+    return;
+  }
+  if (cleanPath === '/api/agents' && req.method === 'GET') return json(res, 200, { agents: agentOverview.list() });
   const liveMatch = cleanPath.match(/^\/api\/live-sessions\/([^/]+)(?:\/snapshot)?$/);
   if (liveMatch) {
     let id;
@@ -517,6 +592,8 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
     if (!session) return json(res, 404, { error: 'Live session not found' });
     const isSnapshotRoute = cleanPath.endsWith('/snapshot');
     if (isSnapshotRoute && req.method === 'GET') {
+      // Selecting an attached tab is opening that agent: it is no longer done.
+      if (session.attachment) agentOverview.markSeen(session.attachment.muxId);
       session.snapshot().then(
         (snapshot) => json(res, 200, snapshot),
         (error: unknown) => json(res, 503, { error: errorMessage(error) }),
@@ -577,9 +654,11 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
     return;
   }
   if (cleanPath === '/api/sessions/delete' && req.method === 'POST') {
-    readBody(req).then((body) => {
+    readBody(req).then(async (body) => {
       if (!body.filePath || typeof body.filePath !== 'string') return json(res, 400, { error: 'filePath required' });
       const sessionFile = resolveSessionFile(body.filePath);
+      const refusal = await liveFileRefusal(sessionFile);
+      if (refusal) return json(res, 409, { error: refusal });
       fs.unlinkSync(sessionFile);
       json(res, 200, { success: true });
     }).catch((e) => json(res, 400, { error: errorMessage(e) }));
@@ -591,6 +670,10 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
   if (sessionMatch && req.method === 'GET') return serveSessionFile(res, sessionMatch[1], sessionMatch[2], parsed.searchParams.get('since'));
 
   json(res, 404, { error: 'Not found' });
+}
+
+function canonicalFile(file: string) {
+  try { return fs.realpathSync(file); } catch { return path.resolve(file); }
 }
 
 function liveFilesSet() {
@@ -712,13 +795,16 @@ function serveProjectSessions(res: ServerResponse, dirName: string) {
     if (!fs.existsSync(projectDir) || !fs.statSync(projectDir).isDirectory()) return json(res, 404, { error: 'Project not found' });
     const liveFiles = liveFilesSet();
     const owners = sessionOwners();
+    const sharedFiles = pimuxFiles();
     const sessions = fs.readdirSync(projectDir)
       .filter((file: string) => file.endsWith('.jsonl'))
       .map((file: string) => {
         const filePath = path.join(projectDir, file);
+        // A pimux-shared session opens by attaching, never as a read-only follow.
+        const shared = sharedFiles.get(canonicalFile(filePath)) ?? null;
         return {
           ...readSessionSummary(filePath), file, dir: dirName, filePath,
-          live: liveFiles.has(filePath), owner: owners.get(filePath) ?? null,
+          live: liveFiles.has(filePath), owner: shared ? null : owners.get(filePath) ?? null, shared,
         };
       })
       .sort((a, b) => b.mtime - a.mtime);
@@ -945,6 +1031,11 @@ function computeUrls(port: number) {
 const server = http.createServer(serveStaticFile);
 let httpsServer: https.Server | null = null;
 const wss = new WebSocketServer({ noServer: true });
+const agentOverview = new AgentOverview({
+  tabFor: (muxId) => liveManager.findByMuxId(muxId)?.id ?? null,
+  onChange: (agents) => liveManager.broadcast({ type: 'pimux_agents', agents }),
+});
+liveManager.onAttachmentsChanged = () => agentOverview.refresh();
 const voiceWss = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_BYTES });
 
 function handleUpgrade(request: IncomingMessage, socket: Socket, head: Buffer) {
@@ -968,14 +1059,14 @@ wss.on('connection', (ws: TauWs) => {
   liveManager.addClient(ws);
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
-  ws.send(JSON.stringify({ type: 'state', liveSessions: liveManager.list() }));
+  ws.send(JSON.stringify({ type: 'state', liveSessions: liveManager.list(), agents: agentOverview.list() }));
   ws.on('message', async (data: Buffer) => {
     try {
       const command = JSON.parse(data.toString());
       const resp = await handleRpcCommand(command);
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(resp));
+      liveManager.sendTo(ws, JSON.stringify(resp));
     } catch (e) {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'error', message: errorMessage(e) }));
+      liveManager.sendTo(ws, JSON.stringify({ type: 'error', message: errorMessage(e) }));
     }
   });
   ws.on('close', () => liveManager.removeClient(ws));
@@ -1015,6 +1106,7 @@ async function listen() {
   const secure = await listenOn(httpsServer, PORT, HOST);
   computeUrls(secure.port);
   publishEndpoint(local.port, secure.port, secure.address);
+  agentOverview.start();
   console.log(`[Tau] Server running on ${lanUrl}${tailscaleUrl ? `  •  Tailscale: ${tailscaleUrl}` : ''}`);
   console.log(`[Tau] Local orchestration (loopback HTTP): http://127.0.0.1:${local.port}`);
   console.log(`[Tau] TLS certificate authority (trust it once on other devices): ${tls.caFile}`);
@@ -1029,6 +1121,7 @@ async function shutdown(signal: string) {
   shuttingDown = true;
   console.log(`\n[Tau] Shutting down (${signal}); terminating ${liveManager.sessions.size} Pi session(s)...`);
   try { wss.close(); } catch {}
+  agentOverview.stop();
   try { voiceWss.close(); } catch {}
   unpublishEndpoint();
   let exitCode = 0;
@@ -1047,7 +1140,7 @@ function startCli() {
   process.on('exit', () => {
     unpublishEndpoint();
     for (const session of liveManager.sessions.values()) {
-      try { session.child?.kill('SIGTERM'); } catch {}
+      session.transport?.abandon();
     }
   });
   process.on('uncaughtException', (err) => { console.error(err); shutdown('uncaughtException'); });
@@ -1125,6 +1218,7 @@ export {
   _setCredentialsForTest,
   _issueSessionTokenForTest,
   _setSpawnPiForTest,
+  agentOverview,
   _setExecFileForTest,
   _clearModelListCacheForTest,
 };

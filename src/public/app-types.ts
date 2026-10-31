@@ -46,6 +46,8 @@ export type LiveSession = {
   createdAt?: string;
   lastActiveAt?: string;
   contextUsage?: UsageRecord;
+  /** Set when this tab is attached to a Pi another frontend started through pimux; closing only detaches. */
+  attached?: { muxId: string; host: string | null; placement: string; name: string | null } | null;
 };
 
 export type LiveInstance = {
@@ -69,6 +71,7 @@ export type MessageContentBlock = {
   thinking?: string;
   source?: { data?: string; media_type?: string };
   data?: string;
+  mimeType?: string;
   media_type?: string;
   id?: string;
   name?: string;
@@ -124,6 +127,6 @@ export type AppEvent = {
 
 export type PendingImage = { data: string; mimeType: string };
 export type PendingFilePath = { path: string; name: string; ext: string; sessionId?: string | null };
-export type QueuedCommand = { type: string; message?: string; images?: PendingImage[]; sessionId?: string; error?: string };
+export type QueuedCommand = { type: string; id?: string; message?: string; images?: PendingImage[]; sessionId?: string; error?: string; streamingBehavior?: 'followUp' | 'steer' };
 export type ExtensionUIRequest = { sessionId: string; event: AppEvent };
 export type RpcCommand = { type: string; sessionId?: string; filePath?: string; [key: string]: unknown };

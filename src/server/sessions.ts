@@ -10,6 +10,9 @@ import { readSessionHeader } from './session-header.js';
 import { orchestrationEndpoint } from './orchestration.js';
 import { modelLabel, normalizeModel, parseModelSpecToModel } from './model-utils.js';
 import { NAVIGATE_COMMAND, flattenTree, isTreeNavigationInProgress, pathFromRoot, type SessionTreeNodeLike } from './tree.js';
+import { PimuxTransport, SpawnTransport, type PiTransport, type TransportEnd, type TransportHandlers } from './transport.js';
+import { PimuxAttachment, type AppliedSnapshot } from './pimux-attachment.js';
+import { pimuxDisplayName, pimuxEntryById, pimuxSharing, probePimux, type PimuxEntry, type PimuxSharing } from './pimux.js';
 
 type DialogEntry = { request: PendingDialog; timer?: ReturnType<typeof setTimeout>; duringTurn: boolean; responding?: boolean };
 
@@ -49,9 +52,12 @@ export function makeId() {
 // pi loads extension .ts files directly.
 const TAU_TREE_EXTENSION = path.resolve(import.meta.dirname, '..', 'src', 'pi-extension', 'tau-tree.ts');
 
-/** Bound on retained child stderr; startup diagnostics are short. */
-const STDERR_TAIL_LINES = 20;
 const INPUT_COMMANDS = new Set(['prompt', 'steer', 'follow_up']);
+
+/** Inherited identities a new Tau tab must not take over from the shell that started the server. */
+const INHERITED_IDENTITY = ['PI_NESTED', 'PI_ORCHESTRATION_TARGET', 'PI_ORCHESTRATION_CONTROL',
+  'PI_ORCHESTRATION_HOST', 'PI_ORCHESTRATION_ENDPOINT', 'PI_ORCHESTRATION_PLACEMENT', 'PI_ORCHESTRATION_PARENT',
+  'HERDR_ENV', 'HERDR_WORKSPACE_ID', 'HERDR_TAB_ID', 'HERDR_PANE_ID', 'TMUX', 'TMUX_PANE'];
 
 export function isGenericSessionName(name: unknown) {
   const normalized = String(name || '').trim().toLowerCase();
@@ -69,12 +75,31 @@ export class SessionLifecycleError extends Error {
   }
 }
 
+/** Opening a session was refused or failed without spawning anything; `status` is the HTTP answer. */
+export class SessionOpenError extends Error {
+  readonly status: number;
+  readonly muxId?: string;
+  constructor(message: string, status: number, muxId?: string) {
+    super(message);
+    this.status = status;
+    this.muxId = muxId;
+  }
+}
+
+/** Identity of the frontend that owns an attached tab's Pi, for display. */
+export type AttachedOwner = { muxId: string; host: string | null; placement: string; name: string | null };
+
 export class PiRpcSession {
   manager: LiveSessionManager;
   id: string;
   cwd: string;
   modelSpec: string;
-  child: ChildProcess | null;
+  transport: PiTransport | null;
+  /** What browsers hear when this attached tab closes: the user's choice, unless Tau itself stops. */
+  detachReason: 'detached' | 'server_shutdown' = 'detached';
+  /** Set for a tab attached to a pimux-shared Pi; null for a spawned child. */
+  attachment: PimuxAttachment | null;
+  attachedOwner: AttachedOwner | null;
   pid: number | null;
   createdAt: string;
   lastActiveAt: string;
@@ -100,11 +125,10 @@ export class PiRpcSession {
   // Timeouts stop waiting, not execution. Keep mutating commands busy until
   // their actual acknowledgement so refresh cannot cancel an unknown operation.
   private activeCommands = new Set<string>();
+  /** Joins browsers selecting an attached tab at once into one pimux snapshot. */
+  private bootstrapping: Promise<void> | null = null;
   refreshing = false;
   private runActive = false;
-  stdoutBuffer: string;
-  /** Recent child stderr, so an exit can say why instead of only reporting its code. */
-  stderrTail: string[];
   terminating: boolean;
   exitCode: number | null;
   exited = false;
@@ -123,12 +147,19 @@ export class PiRpcSession {
   private operationRevision = 0;
   private abortOperationRevision = 0;
 
-  constructor(manager: LiveSessionManager, opts: { id?: string; cwd: string; modelSpec?: string; sessionFile?: string | null; entries?: JsonRecord[]; sessionName?: string | null } & SessionSpawnOverrides) {
+  constructor(manager: LiveSessionManager, opts: { id?: string; cwd: string; modelSpec?: string; sessionFile?: string | null; entries?: JsonRecord[]; sessionName?: string | null; pimux?: PimuxEntry } & SessionSpawnOverrides) {
     this.manager = manager;
     this.id = opts.id || makeId();
     this.cwd = opts.cwd;
     this.modelSpec = opts.modelSpec || '';
-    this.child = null;
+    this.transport = null;
+    this.attachment = opts.pimux
+      ? new PimuxAttachment(opts.pimux.muxId, opts.pimux.socket, (applied) => this.applyPimuxSnapshot(applied))
+      : null;
+    this.attachedOwner = opts.pimux ? {
+      muxId: opts.pimux.muxId, host: opts.pimux.orchestration?.host ?? null, placement: opts.pimux.placement || 'root',
+      name: pimuxDisplayName(opts.pimux),
+    } : null;
     this.pid = null;
     this.createdAt = new Date().toISOString();
     this.lastActiveAt = this.createdAt;
@@ -144,8 +175,6 @@ export class PiRpcSession {
     if (opts.entries && opts.entries.length) this.entries = opts.entries;
     this.contextUsage = null;
     this.pending = new Map();
-    this.stdoutBuffer = '';
-    this.stderrTail = [];
     this.terminating = false;
     this.exitCode = null;
     this.titleSet = false;
@@ -169,12 +198,17 @@ export class PiRpcSession {
       createdAt: this.createdAt,
       lastActiveAt: this.lastActiveAt,
       contextUsage: this.contextUsage,
-      pendingInteractionCount: this.pendingDialogs.size,
+      pendingInteractionCount: this.attachment?.dialogs.size ?? this.pendingDialogs.size,
       abortState: this.abortState,
+      attached: this.attachedOwner,
     };
   }
 
   async snapshot() {
+    if (this.attachment) {
+      await this.bootstrap();
+      return this.currentSnapshot();
+    }
     try {
       await this.inputSynchronization;
     } catch {
@@ -198,6 +232,9 @@ export class PiRpcSession {
       sessionFile: this.sessionFile,
       sessionName: this.sessionName,
       contextUsage: this.contextUsage,
+      // Attached tabs: the pimux boundary this state describes, and the dialogs
+      // open at it. Browsers skip an HTTP snapshot older than one they applied.
+      ...(this.attachment ? { generation: this.attachment.appliedGeneration, dialogs: [...this.attachment.dialogs.values()] } : {}),
     };
   }
 
@@ -255,7 +292,41 @@ export class PiRpcSession {
     if (this.abortState !== 'idle') this.cancelPendingDialogs();
   }
 
+  /**
+   * Asks pimux for a new snapshot sequence and waits until it is published.
+   * Tau's own connection outlives browser reconnects, so every browser
+   * selection runs one; concurrent selections share it.
+   */
+  private bootstrap(): Promise<void> {
+    if (this.bootstrapping) return this.bootstrapping;
+    const attachment = this.attachment!;
+    this.bootstrapping = (async () => {
+      const response = await this.sendCommand({ type: 'pimux_bootstrap', include: ['tree'] }, { timeoutMs: 30000 });
+      const generation = (response.data as { generation?: unknown } | undefined)?.generation;
+      if (response.success !== true || typeof generation !== 'number') {
+        throw new Error(`pimux refused the snapshot request: ${String(response.error || 'no generation')}`);
+      }
+      await attachment.waitFor(generation);
+    })().finally(() => { this.bootstrapping = null; });
+    return this.bootstrapping;
+  }
+
+  private transportHandlers(): TransportHandlers {
+    return {
+      line: (line) => this.handleLine(line),
+      error: (error) => this.rejectPending(error),
+      end: (end) => this.handleTransportEnd(end),
+    };
+  }
+
+  /** Adopts a spawned child as this tab's transport. */
+  useChild(child: ChildProcess) {
+    this.transport = new SpawnTransport(child, this.transportHandlers(), this.id);
+    this.pid = child.pid || null;
+  }
+
   async start() {
+    if (this.attachment) return this.startAttached();
     const expectedFile = this.sessionFile;
     try {
       if (!fs.existsSync(this.cwd) || !fs.statSync(this.cwd).isDirectory()) {
@@ -272,35 +343,13 @@ export class PiRpcSession {
       // The server may have been launched inside a terminal Pi. A new Tau tab
       // is not that pane or its managed worker; explicit spawn overrides below
       // can still provide a new worker identity.
-      for (const key of ['PI_NESTED', 'PI_ORCHESTRATION_TARGET', 'PI_ORCHESTRATION_CONTROL',
-        'PI_ORCHESTRATION_HOST', 'PI_ORCHESTRATION_ENDPOINT', 'HERDR_ENV',
-        'HERDR_WORKSPACE_ID', 'HERDR_TAB_ID', 'HERDR_PANE_ID', 'TMUX', 'TMUX_PANE']) delete env[key];
-      const child = spawnFn(PI_COMMAND, args, {
+      for (const key of INHERITED_IDENTITY) delete env[key];
+      this.useChild(spawnFn(PI_COMMAND, args, {
         cwd: this.cwd,
         env: { ...env, TAU_DISABLED: '1', PI_ORCHESTRATION_HOST: 'web',
           ...(endpoint ? { PI_ORCHESTRATION_ENDPOINT: endpoint } : {}), ...this.extraEnv },
         stdio: ['pipe', 'pipe', 'pipe'],
-      });
-      this.child = child;
-      this.pid = child.pid || null;
-      child.stdin!.on('error', (error: Error) => this.rejectPending(error));
-      child.stdout!.setEncoding('utf8');
-      child.stdout!.on('data', (chunk: string) => this.handleStdout(chunk));
-      child.stderr!.setEncoding('utf8');
-      child.stderr!.on('data', (chunk: string) => {
-        for (const line of chunk.split(/\r?\n/).filter(Boolean)) {
-          console.error(`[Pi ${this.id}] ${line}`);
-          this.stderrTail.push(line);
-          if (this.stderrTail.length > STDERR_TAIL_LINES) this.stderrTail.shift();
-        }
-      });
-      child.on('error', (err: Error) => {
-        // A failed spawn has no child to reap. A later kill/write error does
-        // not prove process exit, so keep ownership until an actual exit.
-        if (!child.pid) this.handleExit(null, null, err);
-        else this.rejectPending(err);
-      });
-      child.on('exit', (code: number | null, signal: NodeJS.Signals | null) => this.handleExit(code, signal));
+      }));
       const state = await this.send({ type: 'get_state' }, { timeoutMs: 30000 });
       if (state.success !== true) throw new Error(`Pi startup state failed: ${state.error || 'unsuccessful response'}`);
       const data = state.data as PiRpcPayload | undefined;
@@ -328,7 +377,25 @@ export class PiRpcSession {
     }
   }
 
+  /** Connects as a pimux secondary; ready once the attach snapshot is published. */
+  private async startAttached() {
+    const attachment = this.attachment!;
+    try {
+      this.transport = await PimuxTransport.connect(attachment.socket, this.transportHandlers());
+      await attachment.waitFor(0, 30000);
+      if (this.exited) throw new Error('the connection closed during attach');
+      this.send({ type: 'get_session_stats' }, { timeoutMs: 5000 }).catch(() => {});
+    } catch (error) {
+      this.terminating = true;
+      this.transport?.abandon();
+      throw new SessionOpenError(`Could not attach to the shared Pi session: ${error instanceof Error ? error.message : String(error)}`, 503, attachment.muxId);
+    }
+  }
+
   async refresh(sessionFile: string) {
+    // An attached tab follows Pi live through pimux; reloading its file would
+    // replace the runtime under the frontend that owns it.
+    if (this.attachment) throw new SessionOpenError('This tab is shared with the frontend that started it and is always current; it cannot be refreshed.', 409, this.attachment.muxId);
     const expectedFile = path.resolve(sessionFile);
     if (this.refreshing || this.isStreaming || this.runActive || this.pending.size || this.activeCommands.size || this.inputSessionFiles.size || isTreeNavigationInProgress(this.id)) {
       throw new Error('Session is busy; finish its active commands before refreshing');
@@ -381,14 +448,14 @@ export class PiRpcSession {
   }
 
   private sendCommand(command: RpcCommand, opts: { timeoutMs?: number } = {}) {
-    const child = this.child;
-    if (!child || !child.stdin!.writable || this.terminating || this.exited) {
+    const transport = this.transport;
+    if (!transport || !transport.writable || this.terminating || this.exited) {
       return Promise.reject(new Error('Pi RPC session is not running'));
     }
     const id = command.id || `cmd_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     const outbound = { ...command, id };
     if (command.type && !command.type.startsWith('get_') && command.type !== 'extension_ui_response') this.activeCommands.add(id);
-    if (INPUT_COMMANDS.has(command.type ?? '') && this.sessionFile) {
+    if (!this.attachment && INPUT_COMMANDS.has(command.type ?? '') && this.sessionFile) {
       this.inputSessionFiles.set(id, path.resolve(this.sessionFile));
     }
     delete outbound.sessionId;
@@ -400,7 +467,7 @@ export class PiRpcSession {
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer, command: outbound.type });
       try {
-        child.stdin!.write(JSON.stringify(outbound) + '\n', (err: Error | null | undefined) => {
+        transport.write(JSON.stringify(outbound) + '\n', (err: Error | null | undefined) => {
           if (err) {
             clearTimeout(timer);
             this.pending.delete(id);
@@ -417,11 +484,11 @@ export class PiRpcSession {
 
   /** Pi never acknowledges UI replies. Success means stdin delivery only. */
   private writeDialogResponse(command: RpcCommand) {
-    const child = this.child;
-    if (!child?.stdin?.writable || this.terminating) return Promise.reject(new Error('Pi RPC session is not running'));
+    const transport = this.transport;
+    if (!transport?.writable || this.terminating) return Promise.reject(new Error('Pi RPC session is not running'));
     return new Promise<void>((resolve, reject) => {
       try {
-        child.stdin!.write(JSON.stringify(command) + '\n', (err) => err ? reject(err) : resolve());
+        transport.write(JSON.stringify(command) + '\n', (err) => err ? reject(err) : resolve());
       } catch (error) { reject(error); }
     });
   }
@@ -429,33 +496,41 @@ export class PiRpcSession {
   async respondToDialog(command: RpcCommand): Promise<RpcResponse> {
     const id = command.id;
     const pending = id ? this.pendingDialogs.get(id) : undefined;
-    if (!id || !pending) throw new Error('No pending dialog with that ID in this session');
+    const request = this.attachment ? (id ? this.attachment.dialogs.get(id) : undefined) : pending?.request;
+    if (!id || !request) throw new Error('No pending dialog with that ID in this session');
     if (command.sessionId && command.sessionId !== this.id) throw new Error('Dialog belongs to another session');
-    if (pending.responding) throw new Error('Dialog response is already being delivered');
-    if (pending.request.expiresAt && pending.request.expiresAt <= Date.now()) {
-      this.removeDialog(id, 'timeout');
+    if (pending?.responding) throw new Error('Dialog response is already being delivered');
+    if (typeof request.expiresAt === 'number' && request.expiresAt <= Date.now()) {
+      if (!this.attachment) this.removeDialog(id, 'timeout');
       throw new Error('Dialog has expired');
     }
     const outbound: RpcCommand = { type: 'extension_ui_response', id };
     if (command.cancelled === true || this.abortState !== 'idle') outbound.cancelled = true;
-    else if (pending.request.method === 'confirm' && typeof command.confirmed === 'boolean') outbound.confirmed = command.confirmed;
-    else if (pending.request.method !== 'confirm' && typeof command.value === 'string') {
-      if (pending.request.method === 'select' && (!Array.isArray(pending.request.options) || !pending.request.options.includes(command.value))) throw new Error('Invalid dialog selection');
+    else if (request.method === 'confirm' && typeof command.confirmed === 'boolean') outbound.confirmed = command.confirmed;
+    else if (request.method !== 'confirm' && typeof command.value === 'string') {
+      if (request.method === 'select' && (!Array.isArray(request.options) || !request.options.includes(command.value))) throw new Error('Invalid dialog selection');
       outbound.value = command.value;
     } else throw new Error('Invalid dialog response');
-    pending.responding = true; // Claim synchronously before yielding to another browser.
+    if (pending) pending.responding = true; // The mux claims shared answers globally.
     try {
       await this.writeDialogResponse(outbound);
-      if (this.pendingDialogs.get(id) === pending) this.removeDialog(id, outbound.cancelled === true ? 'cancelled' : 'answered');
+      // Shared membership changes only on an authoritative mux closure/snapshot.
+      if (!this.attachment && pending && this.pendingDialogs.get(id) === pending) this.removeDialog(id, outbound.cancelled === true ? 'cancelled' : 'answered');
       return { type: 'response', command: 'extension_ui_response', id, success: true, data: { delivered: true } };
     } catch (error) {
-      pending.responding = false;
+      if (pending) pending.responding = false;
       this.diagnostic('delivery_failed', id);
       throw error;
     }
   }
 
   private cancelPendingDialogs() {
+    if (this.attachment) {
+      for (const id of this.attachment.dialogs.keys()) {
+        void this.respondToDialog({ type: 'extension_ui_response', id, cancelled: true }).catch(() => this.diagnostic('cancellation_delivery_failed', id));
+      }
+      return;
+    }
     for (const [id, pending] of this.pendingDialogs) {
       if (!pending.responding) {
         void this.respondToDialog({ type: 'extension_ui_response', id, cancelled: true }).catch(() => {
@@ -507,18 +582,13 @@ export class PiRpcSession {
     return this.abortPromise.then(resp => ({ ...resp, ...(command.id ? { id: command.id } : {}) }));
   }
 
-  handleStdout(chunk: string) {
-    this.stdoutBuffer += chunk;
-    const lines = this.stdoutBuffer.split(/\r?\n/);
-    this.stdoutBuffer = lines.pop() || '';
-    for (const line of lines) this.handleLine(line);
-  }
-
   handleLine(line: string) {
     const trimmed = line.trim();
     if (!trimmed) return;
     let msg;
     try { msg = JSON.parse(trimmed); } catch { console.log(`[Pi ${this.id}] ${trimmed}`); return; }
+    if (typeof msg !== 'object' || msg === null) return;
+    if (this.attachment?.handle(msg)) return;
     if (msg.type === 'response') {
       this.handleResponse(msg);
       return;
@@ -527,7 +597,9 @@ export class PiRpcSession {
   }
 
   handleResponse(resp: PiRpcMessage) {
-    if (INPUT_COMMANDS.has(resp.command ?? '') && !this.terminating && !this.exited) {
+    // pimux announces session replacement itself, with a snapshot; only a
+    // spawned child needs its state confirmed after input.
+    if (!this.attachment && INPUT_COMMANDS.has(resp.command ?? '') && !this.terminating && !this.exited) {
       // Observe even late acknowledgements after the HTTP caller timed out. A
       // timeout is not completion and must not release the original file.
       const synchronization = this.inputSynchronization.catch(() => {}).then(() => this.synchronizeInput(resp.data?.disposition === 'handled', resp.id));
@@ -556,6 +628,8 @@ export class PiRpcSession {
       }
     }
     if (resp.command === 'abort' && resp.success === true) this.completeAbort(resp.id);
+    // Answers to Tau's own pimux requests concern this server, not browsers.
+    if (String(resp.command ?? '').startsWith('pimux_')) return;
     this.updateStateFromResponse(resp);
     this.manager.broadcast({ type: 'event', sessionId: this.id, event: resp });
   }
@@ -604,6 +678,35 @@ export class PiRpcSession {
     this.entries = [...(header ? [header] : []), ...pathFromRoot(flat, tree.leafId)];
   }
 
+  /**
+   * Publishes one pimux boundary: the state, then the replayed in-flight work
+   * as ordinary events, so every browser shows the same conversation.
+   */
+  private applyPimuxSnapshot({ snapshot, replay }: AppliedSnapshot) {
+    const session = snapshot.session;
+    if (session) {
+      this.sessionFile = session.file;
+      if (session.cwd) this.cwd = session.cwd;
+      this.sessionName = session.name && !isGenericSessionName(session.name) ? session.name : null;
+    }
+    this.model = normalizeModel(snapshot.model);
+    this.thinkingLevel = snapshot.thinkingLevel || 'off';
+    if (Array.isArray(snapshot.tree)) {
+      let header: JsonRecord | undefined;
+      try { if (this.sessionFile && fs.existsSync(this.sessionFile)) header = readSessionHeader(this.sessionFile); } catch {}
+      const flat = flattenTree(snapshot.tree as SessionTreeNodeLike[]);
+      this.entries = [...(header ? [header] : []), ...pathFromRoot(flat, snapshot.leafId ?? null)];
+    }
+    this.runActive = !!snapshot.run?.active;
+    this.isStreaming = this.runActive || snapshot.idle === false;
+    this.userMessages = [];
+    this.titleSet = !!this.sessionName;
+    for (const record of replay) this.applyEventState(record);
+    this.manager.broadcast({ type: 'live_session_snapshot', sessionId: this.id, ...this.currentSnapshot() });
+    for (const record of replay) this.manager.broadcast({ type: 'event', sessionId: this.id, event: record });
+    this.manager.broadcastUpdated(this.id);
+  }
+
   referencesSessionFile(resolvedFile: string) {
     return (this.sessionFile !== null && path.resolve(this.sessionFile) === resolvedFile)
       || Array.from(this.inputSessionFiles.values()).includes(resolvedFile);
@@ -629,15 +732,22 @@ export class PiRpcSession {
 
   handleEvent(event: PiRpcMessage) {
     this.touch(false);
+    if (!this.applyEventState(event)) return;
+    this.manager.broadcast({ type: 'event', sessionId: this.id, event });
+    this.manager.broadcastUpdated(this.id);
+  }
+
+  /** Updates tab state from one event; false when the event must not reach browsers. */
+  private applyEventState(event: PiRpcMessage): boolean {
     const type = event.type;
-    if (type === 'extension_ui_request' && ['confirm', 'select', 'input', 'editor'].includes(String(event.method))) {
+    if (!this.attachment && type === 'extension_ui_request' && ['confirm', 'select', 'input', 'editor'].includes(String(event.method))) {
       this.retainDialog(event);
-      return;
+      return false;
     }
     // Only agent_settled confirms completion after retries/compaction and
     // queued continuations; neither turn_end nor agent_end establishes idle.
     if (type === 'agent_settled') {
-      this.clearDialogs('operation_completed', true);
+      if (!this.attachment) this.clearDialogs('operation_completed', true);
       if (!this.abortPromise) this.abortState = 'idle';
       this.isStreaming = false;
     }
@@ -658,8 +768,23 @@ export class PiRpcSession {
     if (event.contextUsage) this.contextUsage = event.contextUsage;
     if (event.sessionFile) this.sessionFile = event.sessionFile;
     if (type === 'session_name' && event.name) {
-      if (!this.setSessionName(event.name)) return;
+      if (!this.setSessionName(event.name)) return false;
       event.name = this.sessionName || event.name;
+    }
+    // Native Pi events: another frontend may change these on a shared Pi.
+    if (type === 'thinking_level_changed' && typeof event.level === 'string') this.thinkingLevel = event.level;
+    if (type === 'session_info_changed') {
+      this.sessionName = typeof event.name === 'string' && !isGenericSessionName(event.name) ? event.name.trim() : null;
+      this.titleSet = !!this.sessionName;
+    }
+    if (type === 'pimux_model_changed') this.model = normalizeModel(event.model);
+    if (type === 'pimux_session_changed') {
+      // The snapshot that follows at once replaces the history.
+      if (typeof event.cwd === 'string') this.cwd = event.cwd;
+      this.sessionName = typeof event.sessionName === 'string' && !isGenericSessionName(event.sessionName) ? event.sessionName : null;
+      this.titleSet = !!this.sessionName;
+      this.userMessages = [];
+      this.contextUsage = null;
     }
 
     if ((type === 'message_start' || type === 'message_end') && event.message) {
@@ -676,9 +801,7 @@ export class PiRpcSession {
     if (type === 'message_end' && event.message?.role === 'assistant') {
       if (event.message.usage) this.contextUsage = { ...(this.contextUsage || {}), usage: event.message.usage };
     }
-
-    this.manager.broadcast({ type: 'event', sessionId: this.id, event });
-    this.manager.broadcastUpdated(this.id);
+    return true;
   }
 
   trackMessage(message: PiMessage, eventType: string) {
@@ -706,7 +829,8 @@ export class PiRpcSession {
   }
 
   maybeTitle() {
-    if (this.titleSet || (this.sessionName && !isGenericSessionName(this.sessionName)) || this.userMessages.length < 1) return;
+    // A shared agent's name comes from the frontend that owns it.
+    if (this.attachment || this.titleSet || (this.sessionName && !isGenericSessionName(this.sessionName)) || this.userMessages.length < 1) return;
     const msg = this.userMessages.find((m) => m.trim().length > 8) || this.userMessages[0];
     if (!msg) return;
     let title = msg.replace(/^(ok |okay |so |actually |hey |please |can you |could you |i want(ed)? to |i wanna |let'?s )/i, '').replace(/\n.*/s, '').trim();
@@ -732,37 +856,18 @@ export class PiRpcSession {
     this.pending.clear();
   }
 
-  private waitForExit(timeoutMs: number): Promise<boolean> {
-    const child = this.child;
-    if (!child || this.exited || child.exitCode != null || child.signalCode != null) return Promise.resolve(true);
-    return new Promise((resolve) => {
-      const finish = (exited: boolean) => {
-        clearTimeout(timer);
-        child.off('exit', onExit);
-        child.off('error', onError);
-        resolve(exited);
-      };
-      const onExit = () => finish(true);
-      const onError = () => { if (!child.pid) finish(true); };
-      const timer = setTimeout(() => finish(false), timeoutMs);
-      child.once('exit', onExit);
-      child.on('error', onError);
-    });
-  }
-
+  /** Spawned: stop the child and confirm its exit. Attached: disconnect; the Pi keeps running. */
   terminate(reason = 'closed'): Promise<void> {
     if (this.termination) return this.termination;
     this.terminating = true;
     this.clearDialogs('terminated');
+    if (reason === 'server_shutdown') this.detachReason = reason;
     this.rejectPending(new Error(`Session terminated: ${reason}`));
+    const transport = this.transport;
     this.termination = (async () => {
-      if (!this.child || this.exited || this.child.exitCode != null || this.child.signalCode != null) return;
-      const gracefulExit = this.waitForExit(1500);
-      try { this.child.kill('SIGTERM'); } catch { /* Escalate if exit is not observed. */ }
-      if (await gracefulExit) return;
-      const forcedExit = this.waitForExit(5000);
-      try { this.child.kill('SIGKILL'); } catch { /* The bounded exit wait determines safety. */ }
-      if (!await forcedExit) throw new SessionLifecycleError('Pi child exit could not be confirmed; do not reopen its session file', this.id, false);
+      if (!transport || this.exited) return;
+      try { await transport.close(); }
+      catch (error) { throw new SessionLifecycleError(error instanceof Error ? error.message : String(error), this.id, false); }
     })().finally(() => { this.termination = null; });
     return this.termination;
   }
@@ -774,21 +879,65 @@ export class PiRpcSession {
    * transport failure.
    */
   exitError(code: number | null, signal: string | null) {
-    const reason = this.stderrTail.join('\n').trim();
+    const reason = (this.transport?.stderrTail() ?? []).join('\n').trim();
     return new Error(`Pi process exited (${signal || code})${reason ? `:\n${reason}` : ''}`);
   }
 
-  handleExit(code: number | null, signal: string | null, err?: { message?: string }) {
+  /** What a browser shows when a shared Pi ends in order: news, not an error code. Null for a failure. */
+  private attachedExitNotice(code: number | null, signal: string | null) {
+    const orderly = code === 0 || code === 129 || code === 143 || signal === 'SIGTERM' || signal === 'SIGHUP';
+    if (!orderly) return null;
+    if (this.attachedOwner?.placement === 'worker') return 'This worker finished. Its result went to its parent.';
+    return `This agent was closed${this.attachedOwner?.host ? ` in ${this.attachedOwner.host}` : ''}.`;
+  }
+
+  private handleTransportEnd(end: TransportEnd) {
+    if (!this.attachment) return this.handleExit(end.code, end.signal, end.error);
+    const exit = this.attachment.exit;
+    if (exit) return this.handleExit(exit.code, exit.signal, undefined, exit.stderrTail);
+    // A disconnect says nothing about the Pi: it may still be running, and its
+    // file stays owned by the frontend that started it.
+    this.handleExit(null, null, new Error('Lost the connection to the shared Pi session; it may still be running.'));
+  }
+
+  handleExit(code: number | null, signal: string | null, err?: { message?: string }, stderrTail?: string) {
     if (this.exited) return;
     this.exited = true;
     this.inputSessionFiles.clear();
     this.activeCommands.clear();
     this.exitCode = code;
     this.clearDialogs('process_exit');
-    this.rejectPending(err || this.exitError(code, signal));
+    const error = err ? err : stderrTail !== undefined
+      ? new Error(`Pi process exited (${signal || code})${stderrTail.trim() ? `:\n${stderrTail.trim()}` : ''}`)
+      : this.exitError(code, signal);
+    this.attachment?.close(error instanceof Error ? error : new Error(String(error.message)));
+    this.rejectPending(error);
+    if (this.attachment) {
+      // Detaching on purpose is not news; an exit or lost connection is.
+      const reason = this.terminating ? this.detachReason : this.attachment.exit ? `pimux_exit:${signal || code}` : 'pimux_disconnected';
+      const notice = this.attachment.exit ? this.attachedExitNotice(code, signal) : null;
+      this.manager.removeExited(this.id, reason, this.terminating ? undefined : notice ?? error.message, !!notice);
+      return;
+    }
     this.manager.removeExited(this.id, err?.message || `process_exit:${signal || code}`);
   }
 }
+
+/** Session-opening `pi` flags: the file must come from `sessionFile`, so attach-or-spawn resolution sees it. */
+const SESSION_OPENING_ARGS = new Set(['--session', '--session-id', '--fork', '--continue', '-c', '--resume', '-r']);
+export function assertNoSessionArgs(args: string[] | undefined) {
+  for (const arg of args ?? []) {
+    const flag = arg.startsWith('--') ? arg.split('=')[0] : arg;
+    if (SESSION_OPENING_ARGS.has(flag)) throw new Error(`args must not open a session (${flag}); pass sessionFile instead`);
+  }
+}
+
+/**
+ * A browser this far behind has stopped reading. Well above the largest
+ * snapshot, so a phone on a slow link can still load a long conversation.
+ */
+const MAX_CLIENT_BACKLOG_BYTES = 64 * 1024 * 1024;
+const PIMUX_RETRY_MS = 50;
 
 export class LiveSessionManager {
   sessions: Map<string, PiRpcSession>;
@@ -796,6 +945,12 @@ export class LiveSessionManager {
   pendingResumes: Map<string, Promise<{ session: PiRpcSession; refreshed: boolean }>>;
   terminatingResumes: Map<string, Promise<void>>;
   private startingSessions = new Set<PiRpcSession>();
+  private pendingAttaches = new Map<string, Promise<PiRpcSession>>();
+  /** Called whenever an attached tab opens or closes, so the agent overview can show it. */
+  onAttachmentsChanged: () => void = () => {};
+  maxClientBacklogBytes = MAX_CLIENT_BACKLOG_BYTES;
+  /** How long opening a shared session waits for a pimux still starting. */
+  pimuxStartWaitMs = 5000;
 
   constructor() {
     this.sessions = new Map();
@@ -805,11 +960,23 @@ export class LiveSessionManager {
   }
   addClient(ws: LiveClient) { this.clients.add(ws); }
   removeClient(ws: LiveClient) { this.clients.delete(ws); }
+  /**
+   * Drops a browser that stopped reading instead of buffering for it without
+   * bound. It reconnects and reloads its tab from a snapshot, so what it missed
+   * costs nothing.
+   */
+  sendTo(client: LiveClient, payload: string) {
+    if (client.readyState !== WebSocket.OPEN) return;
+    if (client.bufferedAmount > this.maxClientBacklogBytes) {
+      client.terminate();
+      this.removeClient(client);
+      return;
+    }
+    client.send(payload);
+  }
   broadcast(data: unknown) {
     const payload = JSON.stringify(data);
-    for (const client of this.clients) {
-      if (client.readyState === WebSocket.OPEN) client.send(payload);
-    }
+    for (const client of this.clients) this.sendTo(client, payload);
   }
   broadcastUpdated(id: string) {
     const s = this.sessions.get(id);
@@ -821,18 +988,27 @@ export class LiveSessionManager {
     const resolved = path.resolve(sessionFile);
     return Array.from(this.sessions.values()).find((session) => session.referencesSessionFile(resolved));
   }
+  findByMuxId(muxId: string) {
+    return Array.from(this.sessions.values()).find((session) => session.attachment?.muxId === muxId && !session.terminating);
+  }
   hasStartingSession(sessionFile: string) {
     const resolved = path.resolve(sessionFile);
     return Array.from(this.startingSessions).some((session) => session.sessionFile && path.resolve(session.sessionFile) === resolved);
   }
   hasPendingResume(sessionFile: string) { return this.pendingResumes.has(path.resolve(sessionFile)); }
   hasTerminatingResume(sessionFile: string) { return this.terminatingResumes.has(path.resolve(sessionFile)); }
+  /**
+   * A new tab. With a session file this is the same attach-or-spawn
+   * resolution as resume, so no path opens a second writer on a file.
+   */
   async create({ cwd, model, sessionFile, args, env }: { cwd?: string; model?: string; sessionFile?: string } & SessionSpawnOverrides) {
+    assertNoSessionArgs(args);
     const resolved = path.resolve(expandHome(cwd || process.cwd()));
-    const session = new PiRpcSession(this, {
-      cwd: resolved, modelSpec: (model || '').trim(),
-      ...(sessionFile ? { sessionFile: path.resolve(expandHome(sessionFile)) } : {}), args, env,
-    });
+    if (sessionFile) {
+      const { session } = await this.resume({ sessionFile: path.resolve(expandHome(sessionFile)), cwd: resolved, model, args, env });
+      return session;
+    }
+    const session = new PiRpcSession(this, { cwd: resolved, modelSpec: (model || '').trim(), args, env });
     return this.startSession(session);
   }
   private async startSession(session: PiRpcSession) {
@@ -854,8 +1030,57 @@ export class LiveSessionManager {
     this.broadcast({ type: 'live_session_created', session: session.metadata() });
     return session;
   }
+  /** Attaches a tab to a pimux-shared Pi, or returns the tab already attached to it. */
+  async attach(entry: PimuxEntry): Promise<{ session: PiRpcSession; started: boolean }> {
+    const existing = this.findByMuxId(entry.muxId);
+    if (existing) return { session: existing, started: false };
+    const pending = this.pendingAttaches.get(entry.muxId);
+    if (pending) return { session: await pending, started: false };
+    const attaching = (async () => {
+      const session = new PiRpcSession(this, { cwd: entry.cwd, sessionFile: entry.session?.file ?? null, sessionName: entry.session?.name ?? null, pimux: entry });
+      await session.start();
+      this.sessions.set(session.id, session);
+      this.broadcast({ type: 'live_session_created', session: session.metadata() });
+      this.onAttachmentsChanged();
+      return session;
+    })().finally(() => this.pendingAttaches.delete(entry.muxId));
+    this.pendingAttaches.set(entry.muxId, attaching);
+    return { session: await attaching, started: true };
+  }
+  /** Attach by pimux id, as the agent overview does. */
+  async attachById(muxId: string) {
+    const existing = this.findByMuxId(muxId);
+    if (existing) return { session: existing, started: false };
+    const entry = await this.whenReachable(async () => {
+      const found = pimuxEntryById(muxId);
+      if (!found) return null;
+      const reachability = await probePimux(found);
+      return reachability === 'stale' ? null : { entry: found, reachability };
+    }, 'The shared Pi session does not accept connections yet; try again in a moment');
+    if (!entry) throw new SessionOpenError('That shared Pi session is no longer running', 404, muxId);
+    return this.attach(entry);
+  }
+  /**
+   * The pimux sharing `file`, if any. A pimux that cannot be reached while its
+   * wrapper or Pi lives fails closed: that Pi may still be writing the file.
+   */
+  private pimuxFor(file: string): Promise<PimuxEntry | null> {
+    return this.whenReachable(() => pimuxSharing(file), 'This session is shared by another frontend that does not accept connections right now; it was not opened here.');
+  }
+  /** Follows `look` while its pimux is starting, so a tab opened at that moment attaches instead of failing. */
+  private async whenReachable(look: () => Promise<PimuxSharing | null>, refusal: string): Promise<PimuxEntry | null> {
+    const deadline = Date.now() + this.pimuxStartWaitMs;
+    for (;;) {
+      const sharing = await look();
+      if (!sharing) return null;
+      if (sharing.reachability === 'reachable') return sharing.entry;
+      if (sharing.entry.status !== 'starting' || Date.now() >= deadline) throw new SessionOpenError(refusal, 409, sharing.entry.muxId);
+      await new Promise((resolve) => setTimeout(resolve, PIMUX_RETRY_MS));
+    }
+  }
   async resume(options: { sessionFile: string; cwd: string; model?: string; entries?: JsonRecord[]; sessionName?: string | null; refresh?: boolean } & SessionSpawnOverrides): Promise<{ session: PiRpcSession; started: boolean; refreshed: boolean }> {
     const { sessionFile, cwd, model, entries, sessionName, args, env, refresh } = options;
+    assertNoSessionArgs(args);
     const resolved = path.resolve(sessionFile);
     const pending = this.pendingResumes.get(resolved);
     if (pending) {
@@ -876,6 +1101,13 @@ export class LiveSessionManager {
           if (refresh) await existing.refresh(resolved);
           return { session: existing, refreshed: !!refresh };
         }
+        const shared = await this.pimuxFor(resolved);
+        if (shared) {
+          if (refresh) throw new SessionOpenError('This session is shared with the frontend that started it and is always current; open it without refresh.', 409, shared.muxId);
+          const attached = await this.attach(shared);
+          started = attached.started;
+          return { session: attached.session, refreshed: false };
+        }
         const session = new PiRpcSession(this, { cwd, modelSpec: (model || '').trim(), sessionFile: resolved, entries, sessionName, args, env });
         const readySession = await this.startSession(session);
         started = true;
@@ -890,9 +1122,9 @@ export class LiveSessionManager {
   async delete(id: string, reason = 'closed_by_user') {
     const session = this.sessions.get(id);
     if (!session) return false;
-    const resolvedFile = session.sessionFile ? path.resolve(session.sessionFile) : null;
+    const resolvedFile = session.sessionFile && !session.attachment ? path.resolve(session.sessionFile) : null;
     const termination = session.terminate(reason).then(() => {
-      this.removeExited(id, reason);
+      this.removeExited(id, session.attachment ? session.detachReason : reason);
     }).finally(() => {
       if (resolvedFile && this.terminatingResumes.get(resolvedFile) === termination) this.terminatingResumes.delete(resolvedFile);
     });
@@ -900,10 +1132,13 @@ export class LiveSessionManager {
     await termination;
     return true;
   }
-  removeExited(id: string, reason: string) {
-    if (!this.sessions.has(id)) return;
+  /** `notice` marks `message` as news rather than a failure. */
+  removeExited(id: string, reason: string, message?: string, notice = false) {
+    const session = this.sessions.get(id);
+    if (!session) return;
     this.sessions.delete(id);
-    this.broadcast({ type: 'live_session_closed', sessionId: id, reason });
+    this.broadcast({ type: 'live_session_closed', sessionId: id, reason, ...(message ? { message, notice } : {}) });
+    if (session.attachment) this.onAttachmentsChanged();
   }
   async shutdown() {
     const results = await Promise.allSettled(Array.from(this.sessions.keys(), (id) => this.delete(id, 'server_shutdown')));
