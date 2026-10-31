@@ -28,7 +28,7 @@ function makeFakeChild(args: string[]) {
   const sessionFile = args[args.indexOf('--session') + 1];
   const entries = fs.readFileSync(sessionFile, 'utf8').trim().split('\n')
     .map((line) => JSON.parse(line) as TreeEntry).filter((entry) => entry.type !== 'session');
-  return new FakePi({ sessionFile, tree: entries.map((entry) => ({ entry })), leafId: entries.at(-1)?.id ?? null }).asChild();
+  return new FakePi({ sessionFile, entries, leafId: entries.at(-1)?.id ?? null }).asChild();
 }
 
 // Each round is one user bubble and one assistant block. Every fifth block

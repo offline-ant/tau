@@ -44,7 +44,7 @@ test('handled cross-file and same-file replacements publish completion only afte
   const root = entry('root', null, 'Question');
   const selected = entry('selected', 'root', 'Selected answer');
   const abandoned = entry('abandoned', 'root', 'Abandoned answer');
-  child.tree = [{ entry: root, children: [{ entry: selected }, { entry: abandoned }] }];
+  child.entries = [root, selected, abandoned];
   child.leafId = selected.id;
   child.state = { ...child.state, sessionFile: destination, model: { provider: 'example', id: 'new/model' }, thinkingLevel: 'high', sessionName: null };
   let completed = false;
@@ -155,7 +155,7 @@ test('failed history rebuilds retain ownership and retry on later snapshots inst
   assert.equal(observerBroadcasts.some(value => value.type === 'live_session_snapshot'), false, 'failed synchronization never publishes replacement history');
 
   const recovered = entry('recovered', null, 'Recovered current conversation');
-  child.tree = [{ entry: recovered }];
+  child.entries = [recovered];
   child.leafId = recovered.id;
   const current = await session.snapshot();
   assert.equal(current.sessionFile, destination);
@@ -199,7 +199,7 @@ test('fresh unwritten tabs accept handled commands without a file header and a l
 
   fs.writeFileSync(destination, JSON.stringify(header) + '\n');
   const answer = entry('answer', null, 'Replacement recovered');
-  child.tree = [{ entry: answer }];
+  child.entries = [answer];
   child.leafId = answer.id;
   child.autoRespond = true;
   assert.equal((await session.send({ type: 'prompt', message: '/browser status' })).success, true);

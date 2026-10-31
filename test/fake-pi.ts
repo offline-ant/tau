@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import type { ChildProcess } from 'node:child_process';
 import type { JsonRecord, RpcCommand, RpcResponse } from '../src/server/types.ts';
-import type { SessionTreeNodeLike } from '../src/server/tree.ts';
+import type { TreeEntry } from '../src/server/tree.ts';
 
 /** Offline RPC child with explicit readiness and process-exit controls. */
 export class FakePi extends EventEmitter {
@@ -17,20 +17,20 @@ export class FakePi extends EventEmitter {
   autoRespond: boolean;
   exitOnSignal: NodeJS.Signals | null;
   state: JsonRecord;
-  tree: SessionTreeNodeLike[];
+  entries: TreeEntry[];
   leafId: string | null;
 
   constructor(options: {
     sessionFile?: string;
     state?: JsonRecord;
-    tree?: SessionTreeNodeLike[];
+    entries?: TreeEntry[];
     leafId?: string | null;
     autoRespond?: boolean;
     exitOnSignal?: NodeJS.Signals | null;
   } = {}) {
     super();
     this.state = { sessionFile: options.sessionFile ?? '/tmp/fake-pi.jsonl', ...options.state };
-    this.tree = options.tree ?? [];
+    this.entries = options.entries ?? [];
     this.leafId = options.leafId ?? null;
     this.autoRespond = options.autoRespond ?? true;
     this.exitOnSignal = options.exitOnSignal === undefined ? 'SIGTERM' : options.exitOnSignal;
@@ -47,7 +47,7 @@ export class FakePi extends EventEmitter {
 
   respond(command: RpcCommand, response: RpcResponse = {}): void {
     const data = command.type === 'get_state' ? this.state
-      : command.type === 'get_tree' ? { tree: this.tree, leafId: this.leafId } : {};
+      : command.type === 'get_entries' ? { entries: this.entries, leafId: this.leafId } : {};
     this.stdout.write(JSON.stringify({ type: 'response', command: command.type, id: command.id, success: true, data, ...response }) + '\n');
   }
 

@@ -201,7 +201,7 @@ test('resume() forwards args/env and uses the active branch while preserving hea
   const kept = { id: 'kept', parentId: 'root', type: 'message', message: { role: 'assistant', content: 'kept answer' } };
   const discarded = { id: 'discarded', parentId: 'root', type: 'message', message: { role: 'assistant', content: 'other branch' } };
   const header = { type: 'session', id: 'session-id', cwd };
-  const child = new FakePi({ sessionFile, tree: [{ entry: root, children: [{ entry: kept }, { entry: discarded }] }], leafId: 'kept' });
+  const child = new FakePi({ sessionFile, entries: [root, kept, discarded], leafId: 'kept' });
   const calls: Array<{ args: string[]; options: JsonRecord }> = [];
   _setSpawnPiForTest((_command: string, args: string[], options: JsonRecord) => {
     calls.push({ args, options });

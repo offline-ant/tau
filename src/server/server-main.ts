@@ -33,7 +33,7 @@ import { buildEndpoint, orchestrationEndpoint, publishEndpoint, unpublishEndpoin
 import { sessionOwner, sessionOwners } from './session-owners.js';
 import { ensureTlsCertificate } from './tls.js';
 import { MAX_FRAME_BYTES, VOICE_PATH, configuredTranscriber, handleVoiceSocket } from './voice.js';
-import { NAVIGATE_COMMAND, NAVIGATION_MARKER_TYPE, flattenTree, isTreeNavigationInProgress, leafDescendsFrom, navigateTree, pathFromRoot, selectNavigationTarget } from './tree.js';
+import { NAVIGATE_COMMAND, NAVIGATION_MARKER_TYPE, entriesById, isTreeNavigationInProgress, leafDescendsFrom, navigateTree, pathFromRoot, selectNavigationTarget } from './tree.js';
 
 type TauWs = WsType & { isAlive?: boolean };
 
@@ -1172,7 +1172,7 @@ export {
   handleRpcCommand,
   NAVIGATE_COMMAND,
   NAVIGATION_MARKER_TYPE,
-  flattenTree,
+  entriesById,
   isTreeNavigationInProgress,
   leafDescendsFrom,
   navigateTree,

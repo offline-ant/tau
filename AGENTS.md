@@ -43,7 +43,7 @@ the model input box, append `:level` to the full string:
 ## Session startup and transfer safety
 
 Create/resume return only after a successful child `get_state`; existing files
-also require matching `sessionFile` and an active `get_tree` path. Initial history
+also require matching `sessionFile` and an active `get_entries` path. Initial history
 must not concatenate abandoned branches. Resume's optional `args`/`env` use the
 same validation as create and apply only to newly spawned children. Resume's
 `started` response distinguishes the request that spawned the child from an
@@ -106,7 +106,7 @@ which publish the file before Pi spawns: opening waits briefly for them, then
 refuses. Session-opening `args` stay rejected so the file is always visible to that
 resolution.
 
-History and in-flight work share one pimux boundary. Never combine a `get_tree`
+History and in-flight work share one pimux boundary. Never combine a `get_entries`
 or `get_messages` read with replayed events: they can duplicate or lose the
 message crossing the boundary. Snapshots are published at `pimux_live`, then
 the replay; dialogs travel in the snapshot's `dialogs`, not as replayed events, so

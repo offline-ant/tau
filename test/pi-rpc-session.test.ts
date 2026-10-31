@@ -418,7 +418,7 @@ test('start() passes --session <file> and waits for state and tree responses', a
   child.respond(child.commands[0]);
   await flushIo();
   assert.equal(completed, false);
-  assert.deepEqual(child.commands.map((command) => command.type), ['get_state', 'get_tree']);
+  assert.deepEqual(child.commands.map((command) => command.type), ['get_state', 'get_entries']);
   child.autoRespond = true;
   child.respond(child.commands[1]);
   await starting;
@@ -427,7 +427,7 @@ test('start() passes --session <file> and waits for state and tree responses', a
   assert.equal(args[args.indexOf('--mode') + 1], 'rpc');
   assert.equal(args[args.indexOf('--session') + 1], sessionFile);
   assert.equal(args[args.indexOf('--model') + 1], 'openai/gpt-4o');
-  assert.deepEqual(child.commands.map((command) => command.type), ['get_state', 'get_tree', 'get_session_stats']);
+  assert.deepEqual(child.commands.map((command) => command.type), ['get_state', 'get_entries', 'get_session_stats']);
 });
 
 test('startup only succeeds after get_state reports the current model', async (t: TestContext) => {
@@ -481,7 +481,7 @@ test('startup rejects a different session file and confirms cleanup', async (t: 
     return true;
   });
   assert.deepEqual(child.signals, ['SIGTERM']);
-  assert.equal(child.commands.some((command) => command.type === 'get_tree'), false);
+  assert.equal(child.commands.some((command) => command.type === 'get_entries'), false);
   assert.equal(mgr.sessions.size, 0);
 });
 
@@ -541,7 +541,7 @@ test('a failed startup tree check is not accepted as a ready resumed session', a
   await flushIo();
   child.respond(child.commands[0]);
   await flushIo();
-  assert.equal(child.commands[1].type, 'get_tree');
+  assert.equal(child.commands[1].type, 'get_entries');
   child.respond(child.commands[1], { success: false, error: 'tree unavailable' });
   await failing;
   assert.deepEqual(child.signals, ['SIGTERM']);
@@ -623,7 +623,7 @@ for (const restored of [true, false]) {
     child.respond(child.commands[1]);
     await flushIo();
     if (!restored) {
-      assert.equal(child.commands[2].type, 'get_tree');
+      assert.equal(child.commands[2].type, 'get_entries');
       assert.equal(manager.findBySessionFile(original), session, 'tree confirmation still holds the original file');
       child.respond(child.commands[2]);
       await flushIo();

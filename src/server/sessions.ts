@@ -9,7 +9,7 @@ import { expandHome } from './config.js';
 import { readSessionHeader } from './session-header.js';
 import { orchestrationEndpoint } from './orchestration.js';
 import { modelLabel, normalizeModel, parseModelSpecToModel } from './model-utils.js';
-import { NAVIGATE_COMMAND, flattenTree, isTreeNavigationInProgress, pathFromRoot, type SessionTreeNodeLike } from './tree.js';
+import { NAVIGATE_COMMAND, entriesById, isTreeNavigationInProgress, pathFromRoot, type TreeEntry } from './tree.js';
 import { PimuxTransport, SpawnTransport, type PiTransport, type TransportEnd, type TransportHandlers } from './transport.js';
 import { PimuxAttachment, type AppliedSnapshot } from './pimux-attachment.js';
 import { pimuxDisplayName, pimuxEntryById, pimuxSharing, probePimux, type PimuxEntry, type PimuxSharing } from './pimux.js';
@@ -234,7 +234,7 @@ export class PiRpcSession {
     if (this.bootstrapping) return this.bootstrapping;
     const attachment = this.attachment!;
     this.bootstrapping = (async () => {
-      const response = await this.sendCommand({ type: 'pimux_bootstrap', include: ['tree'] }, { timeoutMs: 30000 });
+      const response = await this.sendCommand({ type: 'pimux_bootstrap', include: ['entries'] }, { timeoutMs: 30000 });
       const generation = (response.data as { generation?: unknown } | undefined)?.generation;
       if (response.success !== true || typeof generation !== 'number') {
         throw new Error(`pimux refused the snapshot request: ${String(response.error || 'no generation')}`);
@@ -498,14 +498,14 @@ export class PiRpcSession {
   }
 
   private async loadActiveHistory(header?: JsonRecord) {
-    const response = await this.sendCommand({ type: 'get_tree' }, { timeoutMs: 30000 });
-    const tree = response.data as { tree?: SessionTreeNodeLike[]; leafId?: string | null } | undefined;
-    if (response.success !== true || !Array.isArray(tree?.tree) || !(tree.leafId === null || typeof tree.leafId === 'string')) {
-      throw new Error(`Session history refresh failed: ${response.error || 'invalid tree response'}`);
+    const response = await this.sendCommand({ type: 'get_entries' }, { timeoutMs: 30000 });
+    const data = response.data as { entries?: TreeEntry[]; leafId?: string | null } | undefined;
+    if (response.success !== true || !Array.isArray(data?.entries) || !(data.leafId === null || typeof data.leafId === 'string')) {
+      throw new Error(`Session history refresh failed: ${response.error || 'invalid entries response'}`);
     }
-    const flat = flattenTree(tree.tree);
-    if (tree.leafId !== null && !flat.has(tree.leafId)) throw new Error('Session history refresh omitted the active leaf');
-    this.entries = [...(header ? [header] : []), ...pathFromRoot(flat, tree.leafId)];
+    const byId = entriesById(data.entries);
+    if (data.leafId !== null && !byId.has(data.leafId)) throw new Error('Session history refresh omitted the active leaf');
+    this.entries = [...(header ? [header] : []), ...pathFromRoot(byId, data.leafId)];
   }
 
   /**
@@ -521,11 +521,12 @@ export class PiRpcSession {
     }
     this.model = normalizeModel(snapshot.model);
     this.thinkingLevel = snapshot.thinkingLevel || 'off';
-    if (Array.isArray(snapshot.tree)) {
+    if (Array.isArray(snapshot.entries) || snapshot.historyError) {
       let header: JsonRecord | undefined;
       try { if (this.sessionFile && fs.existsSync(this.sessionFile)) header = readSessionHeader(this.sessionFile); } catch {}
-      const flat = flattenTree(snapshot.tree as SessionTreeNodeLike[]);
-      this.entries = [...(header ? [header] : []), ...pathFromRoot(flat, snapshot.leafId ?? null)];
+      // Without history, the old conversation must not pass for the one Pi moved to.
+      const path = pathFromRoot(entriesById(snapshot.entries as TreeEntry[] | undefined), snapshot.leafId ?? null);
+      this.entries = [...(header ? [header] : []), ...path];
     }
     this.runActive = !!snapshot.run?.active;
     this.isStreaming = this.runActive || snapshot.idle === false;
@@ -533,6 +534,10 @@ export class PiRpcSession {
     this.titleSet = !!this.sessionName;
     for (const record of replay) this.applyEventState(record);
     this.manager.broadcast({ type: 'live_session_snapshot', sessionId: this.id, ...this.currentSnapshot() });
+    if (snapshot.historyError) this.manager.broadcast({ type: 'event', sessionId: this.id, event: {
+      type: 'extension_ui_request', method: 'notify', notifyType: 'error',
+      message: `The shared session changed, but its history could not be loaded: ${snapshot.historyError}`,
+    } });
     for (const record of replay) this.manager.broadcast({ type: 'event', sessionId: this.id, event: record });
     this.manager.broadcastUpdated(this.id);
   }

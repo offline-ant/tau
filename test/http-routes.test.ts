@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { FakePi } from './fake-pi.ts';
-import type { SessionTreeNodeLike, TreeEntry } from '../src/server/tree.ts';
+import type { TreeEntry } from '../src/server/tree.ts';
 
 // Loopback host so computeUrls() sets a localhost lanUrl; isolate settings.
 process.env.TAU_HOST = '127.0.0.1';
@@ -82,7 +82,7 @@ function installFakeChild(t: TestContext, child = new FakePi()) {
       child.state.sessionFile = file;
       const entries = fs.readFileSync(file, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as TreeEntry)
         .filter((entry) => entry.type !== 'session' && typeof entry.id === 'string');
-      child.tree = entries.map((entry): SessionTreeNodeLike => ({ entry }));
+      child.entries = entries;
       child.leafId = entries.at(-1)?.id ?? null;
     }
     return child.asChild();
@@ -950,7 +950,7 @@ test('resume refresh keeps the tab and reloads its confirmed active history; ord
   assert.equal(created.refreshed, undefined);
   assert.equal(child.commands.some((command) => command.type === 'switch_session'), false);
   const entry = { id: 'new-entry', parentId: null, type: 'message', message: { role: 'user', content: 'latest from terminal' } };
-  child.tree = [{ entry }];
+  child.entries = [entry];
   child.leafId = entry.id;
   const reused = await jsonBody(await request());
   assert.equal(reused.started, false);

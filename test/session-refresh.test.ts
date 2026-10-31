@@ -36,7 +36,7 @@ test('refresh reloads the same child, its active branch and authoritative metada
   const root = { type: 'message', id: 'root', parentId: null, message: { role: 'user', content: 'latest question' } };
   const answer = { type: 'message', id: 'answer', parentId: 'root', message: { role: 'assistant', content: 'latest answer' } };
   const other = { type: 'message', id: 'other', parentId: 'root', message: { role: 'assistant', content: 'abandoned' } };
-  child.tree = [{ entry: root, children: [{ entry: answer }, { entry: other }] }];
+  child.entries = [root, answer, other];
   child.leafId = 'answer';
   child.state.model = { provider: 'example', id: 'fresh-model' };
   child.state.thinkingLevel = 'high';
@@ -49,7 +49,7 @@ test('refresh reloads the same child, its active branch and authoritative metada
   assert.equal(result.refreshed, true);
   assert.equal(spawned(), 1);
   assert.equal(manager.sessions.size, 1);
-  assert.deepEqual(child.commands.slice(start).map((command) => command.type), ['get_state', 'switch_session', 'get_state', 'get_tree']);
+  assert.deepEqual(child.commands.slice(start).map((command) => command.type), ['get_state', 'switch_session', 'get_state', 'get_entries']);
   assert.equal(child.commands[start + 1].sessionPath, options.sessionFile);
   assert.deepEqual(session.entries, [header, root, answer]);
   assert.deepEqual(session.model, { provider: 'example', id: 'fresh-model' });
@@ -157,7 +157,7 @@ for (const failure of ['cancelled', 'unsuccessful', 'wrong-file', 'invalid-tree'
         if (failure === 'unsuccessful') return original(command, { success: false, error: 'refused' });
       }
       if (switched && command.type === 'get_state' && failure === 'wrong-file') return original(command, { data: { sessionFile: '/tmp/other.jsonl' } });
-      if (command.type === 'get_tree' && failure === 'invalid-tree') return original(command, { data: { tree: [], leafId: 'missing' } });
+      if (command.type === 'get_entries' && failure === 'invalid-tree') return original(command, { data: { tree: [], leafId: 'missing' } });
       original(command);
     });
     await assert.rejects(manager.resume({ ...options, refresh: true }), /refresh|reload/);
