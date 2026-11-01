@@ -39,7 +39,7 @@ export class PimuxAttachment {
   readonly muxId: string;
   readonly socket: string;
   clientId: number | null = null;
-  /** Pi's pid, for display only: a secondary never signals it. */
+  /** Pi's PID is display data; a frontend never signals it. */
   piPid: number | null = null;
   /** Generation of the last snapshot published to browsers; -1 before the first. */
   appliedGeneration = -1;

@@ -1,17 +1,22 @@
-FROM node:22-bookworm-slim AS builder
+FROM node:24.22.1-bookworm-slim AS builder
 
 WORKDIR /app
 
 COPY package.json package-lock.json ./
+COPY vendor ./vendor
 RUN npm ci --ignore-scripts
 
 COPY tsconfig.json tsconfig.server.json tsconfig.public.json ./
 COPY src ./src
 COPY public ./public
 COPY scripts ./scripts
-RUN npm run build
+RUN node_modules/.bin/tsc -p tsconfig.server.json \
+    && node_modules/.bin/tsc -p tsconfig.public.json \
+    && node scripts/copy-katex.ts \
+    && node scripts/copy-highlight.ts \
+    && chmod 0755 bin/tau.js
 
-FROM node:22-bookworm-slim AS runtime
+FROM node:24.22.1-bookworm-slim AS runtime
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -27,9 +32,8 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev --ignore-scripts \
-    && PI_VERSION="$(node -p "require('./package-lock.json').packages['node_modules/@earendil-works/pi-coding-agent'].version")" \
-    && npm install --global --ignore-scripts "@earendil-works/pi-coding-agent@${PI_VERSION}"
+COPY vendor ./vendor
+RUN npm ci --omit=dev --ignore-scripts
 
 COPY --from=builder /app/bin ./bin
 COPY --from=builder /app/public ./public

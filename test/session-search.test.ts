@@ -94,7 +94,7 @@ test('a transcript removed during search does not fail the other matches', async
   const removed = save(root, 'project', 'a.jsonl', [header, message('needle')]);
   const remaining = save(root, 'project', 'b.jsonl', [header, message('needle')]);
   const open = fs.createReadStream;
-  t.mock.method(fs, 'createReadStream', (file, options) => {
+  t.mock.method(fs, 'createReadStream', (...[file, options]: Parameters<typeof fs.createReadStream>) => {
     if (file === removed) fs.unlinkSync(removed);
     return open(file, options);
   });

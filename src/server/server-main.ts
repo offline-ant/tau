@@ -1188,9 +1188,6 @@ function _setAuthForTest(enabled: boolean) { authEnabled = !!enabled; }
 function _setCredentialsForTest(user: string, pass: string) { TAU_SETTINGS.user = user; TAU_SETTINGS.pass = pass; }
 function _issueSessionTokenForTest(expiresAtSeconds?: number) { return issueSessionToken(expiresAtSeconds); }
 
-// Test-only hook to substitute the Pi spawn so LiveSessionManager.create()
-// can be exercised without launching a real Pi process.
-
 export {
   parseArgs,
   expandHome,

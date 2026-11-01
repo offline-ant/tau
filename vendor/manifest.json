@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "inputs": [
+    {
+      "name": "@phimacs/pimux",
+      "version": "0.1.0",
+      "file": "phimacs-pimux-0.1.0-b42fc6c.tgz",
+      "sha256": "16dd280cffdafcc5657ac6f07f6934c8c02cc14bddc827aefb8a9b1a0fd08b6c",
+      "sourceRepository": "https://github.com/offline-ant/phimacs",
+      "sourceRevision": "b42fc6cc0c68a025eeba6d4aa8e6941749a16c39",
+      "sourceDirectory": "packages/pimux",
+      "license": "MIT"
+    },
+    {
+      "name": "pi-sound",
+      "version": "0.1.0",
+      "file": "pi-sound-0.1.0.tgz",
+      "sha256": "5d3981e98f35e9cb61964b03490ad62eb30cda2b6a593111fa2ae2b1d93aeb99",
+      "sourceRepository": "https://github.com/offline-ant/phimacs",
+      "sourceRevision": "b95885c1b96b82fb866efa981bce7656aa287d40",
+      "sourceDirectory": "packages/sound",
+      "license": "MIT AND Apache-2.0"
+    }
+  ]
+}

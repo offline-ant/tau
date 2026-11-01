@@ -85,99 +85,41 @@ naturally produces `openrouter/z-ai/glm-5.2`. When adding a thinking level for
 the model input box, append `:level` to the full string:
 `openrouter/z-ai/glm-5.2:high`.
 
-## Keep the end-to-end suite near 35 seconds
+## Keep browser tests bounded
 
-A full `npm run test:e2e` run takes about 35 seconds. Files run in parallel,
-so one slow file decides the total. Give the command a long enough timeout or
-run it as a background task. A file that takes minutes usually leaves browser
-pages open after each test or slows the CPU when it does not need to.
+Close each browser page when its test ends. Separate synthetic rendering tests
+from real detached-runtime tests; the latter wait for owned Pi startup/exit and
+need a longer timeout. Never run a personal daemon or paid provider to make an
+integration test pass.
 
-## Session startup and transfer safety
+## Detached runtime and uncertainty
 
-Create/resume return only after a successful child `get_state`; existing files
-also require matching `sessionFile` and an active `get_entries` path. Initial history
-must not concatenate abandoned branches. Resume's optional `args`/`env` use the
-same validation as create and apply only to newly spawned children. Resume's
-`started` response distinguishes the request that spawned the child from an
-existing/joined tab; callers must not treat reuse as their own launch.
-Resume's `refresh: true` reloads an existing idle tab's same file through native
-`switch_session` and verifies state/tree before reporting `refreshed: true`, so a
-retained tab does not keep stale history after another frontend wrote the file.
-Busy, queued, or pending-command tabs are rejected, never cancelled or closed.
-The terminal-owner guard applies to refresh too. Do not expose `switch_session`
-through the generic `/api/rpc` allowlist.
+The Tau process never owns Pi lifetime. Tab/server closure only disconnects;
+explicit identity-bound stop is separate, including for idle roots. A committed
+runtime remains after attach failure. Failed or uncertain starts retain operation
+identity and cannot justify another spawn. A refused socket, HTTP timeout, removed
+tab or sent signal never proves the writer is gone. `force` does not bypass claims.
 
-A lifecycle error's `childStopped` means that request's child was confirmed gone,
-not universal ownership of the file. Pre-spawn resume validation can also report
-`childStopped: true`, but only with an identified path and no known live, starting,
-pending-resume, closing, or terminal-registry owner. Track in-progress creates too:
-they can open an existing file without appearing in `pendingResumes`. Ownership
-409s, unidentified requests, and unexpected errors must not authorize rollback.
-Do not infer exit from a timer, a sent signal,
-a removed tab, an HTTP timeout, or an arbitrary 400 response. Uncertain children
-remain tracked, deletion errors propagate, and concurrent resumes cannot bypass
-pending/failed cleanup. Tests use `test/fake-pi.ts` for explicit RPC readiness and
-exit events; fake children that merely survive 100 ms no longer represent startup.
-Input acknowledgements refresh authoritative child state in `PiRpcSession`, even
-when the HTTP/RPC caller already timed out. Handled extension commands also
-rebuild the active tree; a changed file requires its bounded first-line header
-for cwd because Pi's `get_state` does not expose it. Same-file commands reuse the
-cached header and cwd: fresh tabs do not have a transcript until the first
-message, so `/tools` or a cancelled `/take` must not require one. Snapshot reads
-and the actual forwarded input completion await this synchronization. Rebuilt history is also
-broadcast with the existing `live_session_snapshot` event before input completion,
-so passive browser views update too. Ordinary inference keeps using streamed
-events; failed synchronization never publishes a replacement. Later snapshots
-retry a failed rebuild against the child instead of retaining a rejected promise
-forever. Confirmed rebuilds update both snapshots and live-tab metadata for all
-clients. The HTTP prompt deadline
-remains only an early acknowledgement, not proof of completion. A slash command
-can temporarily replace its session and roll back; keep its original file
-associated with that child until state and required history are confirmed, so an
-intervening `get_state` cannot make resume start a second writer. Failed refreshes
-retain that association until child exit. Keep synchronization on actual child
-acknowledgements, not the HTTP request's promise; no polling or switch-specific
-notifications.
+Every tab, including one created here, publishes one complete pimux snapshot/replay/
+live boundary. Never concatenate `get_entries`/`get_messages` reads with replay or
+close a shared dialog merely because a run settled. A newer generation discards an
+unfinished older sequence. Queue clearing affects every frontend, but acknowledged
+recovery belongs only to the requester and the original file/leaf context. Input
+with uncertain delivery is recoverable, never automatically resent.
 
-Focused checks: `npm run typecheck`, then `tsc -p tsconfig.server.json` and
-`node --test test/pi-rpc-session.test.ts test/live-session-manager.test.ts
- test/orchestration.test.ts test/http-routes.test.ts test/session-refresh.test.ts
- test/tree-navigate.test.ts test/input-synchronization.test.ts`.
+A session process is a connection, not ownership of `piPid`. Worker lifetimes use
+exact parent process/start/boot identity and task ID. A creator is not privileged.
+Retained old-file claims must refuse rather than route commands into a runtime now
+serving another conversation. Live export must use that Pi's in-memory exporter:
+the transcript's last entry can differ from its selected leaf after tree navigation.
 
-## Shared sessions (pimux)
+Stopped-file operations need a lease over their whole read/validate/mutate
+transaction. Raw Pi 1.4 internal storage bypasses remain outside the cooperative
+guarantee; do not describe all disk mutations as universally protected.
 
-A Pi started through pimux belongs to the frontend that started it. An attached
-tab never signals it (`piPid` is display data at most), and detaching or losing
-the socket is not proof that Pi stopped, so a lost socket must never permit a
-spawn: the discovery entry decides. Opening a file has one resolution in
-`LiveSessionManager.resume`, which create also uses, because a route with its own
-check was how a second writer appeared. An unreachable mux whose wrapper or Pi
-lives fails closed. Stale means both are dead. Every entry naming a file counts,
-so a leftover entry cannot hide a live one, and that includes `starting` entries,
-which publish the file before Pi spawns: opening waits briefly for them, then
-refuses. Session-opening `args` stay rejected so the file is always visible to that
-resolution.
-
-History and in-flight work share one pimux boundary. Never combine a `get_entries`
-or `get_messages` read with replayed events: they can duplicate or lose the
-message crossing the boundary. Snapshots are published at `pimux_live`, then
-the replay; dialogs travel in the snapshot's `dialogs`, not as replayed events, so
-browsers can replace the set they hold, including for unselected tabs. The server
-answers the HTTP snapshot after that broadcast, and a browser must not apply an
-answer whose `generation` it already rendered: that would erase the replay.
-A snapshot sequence cut short (gap, newer snapshot, failure, exit, more records than
-announced) is discarded whole; only one reaching its own `pimux_live` is published.
-Dialogs close on `pimux_dialog_closed`. Input acknowledgements do not run
-`synchronizeInput` on attached tabs; pimux announces every session change itself.
-A file with a live writer is renamed through that Pi and never appended to or
-deleted here. A delta only grows `pendingSteps`; the DOM follows once per frame, so
-long replies stay linear. `sendMessage` keeps the draft while the socket is down.
-A tab id does not survive Tau or its socket, so input that did not reach a shared
-agent (`unsent-input.ts`) is kept by mux id and returns to the composer when a tab on
-that agent opens. It is never sent by itself: the prompt may have arrived.
-Checks: `node --test test/pimux-attach.test.ts test/e2e/pimux-share.e2e.ts` after
-compiling server and public TS; with Emacs, `TAU_EMACS_E2E=1 node --test
-test/e2e/emacs-share.e2e.ts`.
+Focused checks: `npm run typecheck`, explicit compilation, and
+`node --test test/detached-runtime.test.ts test/detached-runtime-native.test.ts
+ test/pimux-attach.test.ts test/session-export.test.ts`.
 
 ## Browser connections
 
@@ -277,7 +219,10 @@ final transcript is inserted once at the textarea selection; partial text is onl
 previewed, so never replace or submit the draft. Session switches cancel, and every
 exit releases microphone tracks, the audio context, and the socket. `voice.json` is
 re-read per recording (Pi's `/dictate-setting` from pi-sound writes it); malformed
-configuration is an error, and there is no fallback between backends. Settings, the
-Claude login and the speech backends are pi-sound's library (`file:../pi-sound`);
-change them there, never re-implement them here. Checks: `node --test
+configuration is an error, and there is no fallback between backends. The public
+pi-sound opener is asynchronous and accepts an AbortSignal. A backend can resolve
+after cancellation or invoke its error callback before resolving: close any late
+transcriber without emitting ready or another terminal result. Voice is disabled
+without an explicit backend, and browser PCM never authorizes native credential,
+capture-device or socket discovery. Checks: `node --test
 test/voice.test.ts test/voice-route.test.ts test/e2e/voice-input.e2e.ts`.

@@ -1,9 +1,14 @@
+import { runtimeEnvironment, agent as agentDir, cwd as project } from '../runtime-environment.ts';
 import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
-import os from 'node:os';
+import { once } from 'node:events';
+import { startRuntime, stopRuntime, listRuntimes, type RuntimeReceipt } from '@phimacs/pimux/runtime';
+import { processIdentityStatus, readProcessIdentity } from '@phimacs/pimux/process-identity';
+import { releaseHost } from '../../bin/config.js';
+import { DetachedPeer, until } from './fixtures/detached-peer.ts';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { after, before, test } from 'node:test';
@@ -11,25 +16,23 @@ import { chromium, devices, type Browser, type BrowserContext, type Page } from 
 
 /*
  * Real pimux, real Pi (faux providers only), the real compiled Tau server and
- * UI in a phone-sized Chromium. The test process plays Emacs: it is the pimux
- * primary on stdio. Private agent and pimux directories, loopback-only ports.
+ * UI in a phone-sized Chromium. The test process plays a socket frontend:
+ * creators and browsers have equal lifetime rights, including zero clients.
  * Set TAU_E2E_SCREENSHOTS=<dir> to keep screenshots.
  */
 
 const root = path.resolve(fileURLToPath(new URL('../../', import.meta.url)));
-const PIMUX = process.env.PIMUX_BIN || path.resolve(root, '../pi-ant/orchestration/pimux/bin/pimux');
 const FIXTURE = fileURLToPath(new URL('./fixtures/pimux-faux.ts', import.meta.url));
 const SHOTS = process.env.TAU_E2E_SCREENSHOTS || '';
-const skip = fs.existsSync(PIMUX) ? false : `pimux not found at ${PIMUX} (set PIMUX_BIN)`;
 
 type Record_ = Record<string, unknown>;
-const work = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-pimux-e2e-'));
-const agentDir = path.join(work, 'agent');
-const muxDir = path.join(work, 'mux');
+const work = runtimeEnvironment.root;
+const muxDir = process.env.PIMUX_DIR!;
 const holdDir = path.join(work, 'hold');
-const project = path.join(work, 'project');
 const password = crypto.randomBytes(12).toString('hex');
 const children: ChildProcess[] = [];
+const runtimes: RuntimeReceipt[] = [];
+const peers = new Set<DetachedPeer>();
 let tau: ChildProcess;
 let third: Awaited<ReturnType<typeof startMux>>;
 let fourth: Awaited<ReturnType<typeof startMux>>;
@@ -38,21 +41,7 @@ let browser: Browser;
 let context: BrowserContext;
 
 function cleanEnv(extra: Record<string, string>): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  for (const key of Object.keys(env)) {
-    if (/^(PI_ORCHESTRATION_|PIMUX_|HERDR_|TAU_)/.test(key) || ['PI_NESTED', 'TMUX', 'TMUX_PANE', 'PI_REMOTE', 'PI_CODING_AGENT_SESSION_DIR'].includes(key)) delete env[key];
-  }
-  return { ...env, PI_CODING_AGENT_DIR: agentDir, PIMUX_DIR: muxDir, FX_HOLD_DIR: holdDir, ...extra };
-}
-
-async function until<T>(check: () => T | undefined | false | null | Promise<T | undefined | false | null>, description: string, timeoutMs = 20000): Promise<T> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const value = await check();
-    if (value) return value;
-    assert.ok(Date.now() < deadline, `Timed out: ${description}`);
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
+  return { ...process.env, PI_CODING_AGENT_DIR: agentDir, PIMUX_DIR: muxDir, FX_HOLD_DIR: holdDir, ...extra };
 }
 
 let tauPorts: [number, number] | undefined;
@@ -72,65 +61,35 @@ async function startTau() {
   base = `http://127.0.0.1:${port}`;
 }
 
-/** The pimux primary: what Pilish is in real use. */
-class Primary {
-  readonly records: Record_[] = [];
-  readonly child: ChildProcess;
-  readonly exited: Promise<number | null>;
-  private buffer = '';
-  private next = 0;
-  constructor(child: ChildProcess) {
-    this.child = child;
-    child.stdout!.setEncoding('utf8').on('data', (chunk: string) => {
-      this.buffer += chunk;
-      let newline;
-      while ((newline = this.buffer.indexOf('\n')) !== -1) {
-        this.records.push(JSON.parse(this.buffer.slice(0, newline)));
-        this.buffer = this.buffer.slice(newline + 1);
-      }
-    });
-    child.stdin!.on('error', () => {});
-    this.exited = new Promise((resolve) => child.on('exit', (code) => resolve(code)));
-  }
-  send(record: Record_) { this.child.stdin!.write(JSON.stringify(record) + '\n'); }
-  mark() { return this.records.length; }
-  find(match: (record: Record_) => boolean, after = 0) { return this.records.slice(after).find(match); }
-  waitFor(match: (record: Record_) => boolean, description: string, after = 0) { return until(() => this.find(match, after), description); }
-  async request(record: Record_) {
-    const id = `p${++this.next}`;
-    this.send({ ...record, id });
-    return this.waitFor((received) => received.type === 'response' && received.id === id, `response to ${String(record.type)}`);
-  }
-  async run(message: string) {
-    const start = this.mark();
-    const response = await this.request({ type: 'prompt', message });
-    assert.equal(response.success, true, String(response.error));
-    await this.waitFor((record) => record.type === 'agent_settled', `settle after ${message}`, start);
-  }
-}
+function discovery() { return listRuntimes(); }
 
-function discovery(): Record_[] {
-  try {
-    return fs.readdirSync(muxDir).filter((name) => name.endsWith('.json') && !name.startsWith('.'))
-      .map((name) => JSON.parse(fs.readFileSync(path.join(muxDir, name), 'utf8')));
-  } catch { return []; }
+async function peerFor(receipt: RuntimeReceipt) {
+  const peer = await DetachedPeer.connect(receipt);
+  peers.add(peer);
+  return peer;
 }
 
 async function startMux(name: string, env: Record<string, string>) {
-  const sessions = path.join(agentDir, 'sessions', '--project--');
-  fs.mkdirSync(sessions, { recursive: true });
+  const sessions = path.join(runtimeEnvironment.sessions, '--project--');
+  fs.mkdirSync(sessions, { recursive: true, mode: 0o700 });
   const sessionFile = path.join(sessions, `${name}.jsonl`);
-  fs.writeFileSync(sessionFile, JSON.stringify({ type: 'session', version: 3, id: crypto.randomUUID(), timestamp: new Date().toISOString(), cwd: project }) + '\n');
-  const child = spawn(process.execPath, [PIMUX, '--', 'pi', '--mode', 'rpc', '--session', sessionFile,
-    '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-context-files', '--provider', 'tau-fx', '--model', 'one', '-e', FIXTURE],
-  { cwd: project, env: cleanEnv(env), stdio: ['pipe', 'pipe', 'pipe'] });
-  children.push(child);
-  let stderr = '';
-  child.stderr!.setEncoding('utf8').on('data', (data: string) => { stderr += data; });
-  const primary = new Primary(child);
-  await primary.waitFor((record) => record.type === 'pimux_hello', `${name} primary hello`).catch((error) => { throw new Error(`${error.message}\n${stderr}`); });
-  const entry = await until(() => discovery().find((record) => (record.session as Record_ | null)?.file === sessionFile && record.status === 'idle'), `${name} discovery`);
-  return { primary, sessionFile, muxId: String(entry.muxId) };
+  fs.writeFileSync(sessionFile, JSON.stringify({ type: 'session', version: 3, id: crypto.randomUUID(), timestamp: new Date().toISOString(), cwd: project }) + '\n', { mode: 0o600 });
+  const host = releaseHost();
+  const receipt = await startRuntime({ command: host.executable, expectedHost: host, cwd: project, env: cleanEnv(env),
+    args: ['--mode', 'rpc', '--session', sessionFile, '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-context-files', '--provider', 'tau-fx', '--model', 'one', '-e', FIXTURE],
+    ...(env.PI_ORCHESTRATION_PLACEMENT === 'worker' ? { parent: { process: readProcessIdentity(process.pid)!, taskId: name } } : {}),
+  });
+  runtimes.push(receipt);
+  assert.equal(receipt.protocol, 2);
+  assert.equal(receipt.state, 'committed');
+  return { primary: await peerFor(receipt), sessionFile, muxId: receipt.muxId, receipt };
+}
+
+async function stopTau(child: ChildProcess) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = once(child, 'exit');
+  child.kill('SIGTERM');
+  await exited;
 }
 
 function freePort(): Promise<number> {
@@ -149,12 +108,11 @@ async function shot(page: Page, name: string) {
 let root1: Awaited<ReturnType<typeof startMux>>;
 
 before(async () => {
-  if (skip) return;
   fs.mkdirSync(project, { recursive: true });
   fs.mkdirSync(agentDir, { recursive: true });
   fs.mkdirSync(holdDir, { recursive: true });
   fs.writeFileSync(path.join(agentDir, 'settings.json'), JSON.stringify({
-    defaultProvider: 'tau-fx', defaultModel: 'one', compaction: { enabled: false }, retry: { enabled: false },
+    packages: [], defaultProvider: 'tau-fx', defaultModel: 'one', compaction: { enabled: false }, retry: { enabled: false },
   }));
   const emacs = { host: 'emacs', endpoint: path.join(work, 'emacs-socket'), id: '*pi:project*' };
   root1 = await startMux('root', { PI_ORCHESTRATION_HOST: emacs.host, PI_ORCHESTRATION_ENDPOINT: emacs.endpoint, PI_ORCHESTRATION_TARGET: emacs.id });
@@ -175,21 +133,18 @@ before(async () => {
 after(async () => {
   await context?.close();
   await browser?.close();
-  for (const child of children.reverse()) {
-    if (child.exitCode !== null || child.signalCode !== null) continue;
-    const exited = new Promise((resolve) => child.once('exit', resolve));
-    child.kill('SIGTERM');
-    await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 5000))]);
-    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-  }
+  for (const child of children.reverse()) await stopTau(child);
+  for (const peer of peers) await peer.disconnect();
+  for (const receipt of runtimes.reverse()) await stopRuntime(receipt.muxId);
   fs.rmSync(work, { recursive: true, force: true });
 });
 
 const userMessages = (page: Page, text: string) => page.locator('.message.user', { hasText: text });
 const assistantText = (page: Page, text: string) => page.locator('.assistant-step-content', { hasText: text });
 
-test('Emacs and a phone share one Pi through pimux and Tau', { skip, timeout: 180000 }, async () => {
+test('a socket frontend and a phone share one detached Pi through pimux and Tau', { timeout: 180000 }, async t => {
   const page = await context.newPage();
+  t.after(() => page.close());
   await page.goto(base);
 
   // With nothing open, the overview shows the shared agents, the worker under its parent.
@@ -287,23 +242,27 @@ test('Emacs and a phone share one Pi through pimux and Tau', { skip, timeout: 18
   await page.locator('#agents-btn').click();
   await panel.locator(`.agent-row[data-mux-id="${root1.muxId}"]`).click();
   await assistantText(page, 'reply: still mine').waitFor();
-  root1.primary.child.stdin!.end();
-  assert.equal(await root1.primary.exited, 0);
+  const piIdentity = readProcessIdentity(root1.receipt.piPid)!;
+  assert.ok(piIdentity);
+  const stop = await stopRuntime(root1.muxId);
+  assert.equal(stop.state, 'stopped');
+  assert.equal(processIdentityStatus(piIdentity), 'dead');
   await page.locator('.system-message', { hasText: 'This agent was closed in emacs.' }).waitFor();
   await assistantText(page, 'reply: still mine').waitFor();
   await shot(page, 'shared-exit');
 });
 
-test('hostile discovery text stays text, a slow attach does not steal the view, a Tau restart loses no draft', { skip, timeout: 120000 }, async () => {
+test('hostile discovery text stays text, a slow attach does not steal the view, a Tau restart loses no draft', { timeout: 120000 }, async t => {
   const hostile = path.join(muxDir, 'hostile.json');
-  const cwd = '/tmp/x" onpointerenter="window.__owned=1';
+  const cwd = `${work}/x" onpointerenter="window.__owned=1`;
   fs.writeFileSync(hostile, JSON.stringify({
-    protocol: 1, muxId: 'hostile"x', socket: path.join(muxDir, 'hostile.sock'), pid: process.pid, piPid: process.pid, cwd,
+    ...discovery()[0], protocol: 2, muxId: 'hostile"x', socket: path.join(muxDir, 'hostile.sock'), pid: process.pid, piPid: process.pid, cwd,
     startedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), status: 'idle', blocked: null,
     session: { file: null, id: 'h', name: '<img src=x onerror="window.__owned=1">' }, model: null, thinkingLevel: null,
     placement: 'root', orchestration: null, parent: null,
   }), { mode: 0o600 });
   const page = await context.newPage();
+  t.after(() => page.close());
   await page.goto(base);
   const panel = page.locator('.agents-panel');
   const title = panel.locator('.agents-group-title', { hasText: 'x" onpointerenter' });
@@ -351,18 +310,24 @@ test('hostile discovery text stays text, a slow attach does not steal the view, 
   assert.equal(await page.locator('#status-text').innerText(), 'Disconnected');
   await startTau();
   await until(async () => await page.locator('#status-text').innerText() === 'Connected', 'reconnected status', 30000);
-  // Tau came back: the page returns to the agent it was showing, draft included.
-  await until(async () => await page.locator('#message-input').inputValue() === 'draft for this agent', 'the draft is back on its agent');
+  // Reconnection never submits or silently moves preserved input. Recovery is
+  // bound to its old agent and context and requires an explicit Reuse action.
+  await page.locator('#recovered-input .queued-msg', { hasText: 'draft for this agent' }).waitFor();
+  assert.equal(await page.locator('#message-input').inputValue(), '');
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Reuse', exact: true }).click();
+  await until(async () => await page.locator('#message-input').inputValue() === 'draft for this agent', 'explicitly reused draft');
   const back = await (await page.request.get(`${base}/api/live-sessions`)).json() as { sessions: Array<{ id: string; attached: { muxId: string } }> };
   const backId = await page.locator('.live-tab.active').getAttribute('data-session-id');
   assert.equal(back.sessions.find((session) => session.id === backId)?.attached.muxId, activeMux);
   await page.close();
 });
 
-test('a shared tab offers only what works: palette, title, queue, status, keyboard, refusals', { skip, timeout: 120000 }, async () => {
+test('a shared tab offers advertised tree navigation and equal root actions, title, queue, status, keyboard and refusals', { timeout: 120000 }, async t => {
   const desk = await browser.newContext({ viewport: { width: 1280, height: 800 }, httpCredentials: { username: 'e2e', password } });
   const page = await desk.newPage();
   const phone = await context.newPage();
+  t.after(async () => { await phone.close(); await desk.close(); });
   await page.goto(base);
   await phone.goto(base);
   const live = async () => (await (await page.request.get(`${base}/api/live-sessions`)).json()) as { sessions: Array<{ id: string; attached?: { muxId: string } }> };
@@ -376,12 +341,15 @@ test('a shared tab offers only what works: palette, title, queue, status, keyboa
   await openAgent(third.muxId);
   assert.equal(await page.evaluate(() => document.activeElement?.id), 'message-input', 'opening an agent focuses the composer');
 
-  // Only what this tab can do is offered.
-  assert.equal(await page.locator('#take-herdr-btn').isVisible(), false);
+  // Root actions do not depend on which frontend created this runtime. Tree
+  // navigation still requires its extension, which this fixture does not load.
+  assert.equal(await page.locator('#take-herdr-btn').isVisible(), true);
   await page.locator('#command-btn').click();
   const labels = await page.locator('.command-label').allInnerTexts();
   assert.ok(labels.includes('New session'));
-  assert.ok(!labels.includes('Session tree') && !labels.includes('Take from Herdr…'), labels.join());
+  assert.ok(!labels.includes('Session tree'), labels.join());
+  assert.ok(labels.includes('Take from Herdr…'));
+  assert.ok(labels.includes('Stop agent everywhere…'));
   await page.keyboard.press('Escape');
 
   // The tab keeps the agent's name, whatever is said in it.
@@ -405,10 +373,12 @@ test('a shared tab offers only what works: palette, title, queue, status, keyboa
   await page.keyboard.press('ArrowDown');
   await page.keyboard.press('Enter');
   await third.primary.waitFor((record) => record.method === 'notify' && record.message === 'picked:pear', 'keyboard answer', mark);
-  await until(() => page.evaluate(() => document.activeElement?.id === 'message-input'), 'focus is back in the composer');
+  await page.locator('#dialog-container.hidden').waitFor({ state: 'attached' });
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  const focusReturned = await page.evaluate(() => document.activeElement?.id === 'message-input');
 
   // Another browser sees the image too.
-  await phone.locator('#agents-btn').click();
+  if (!await phone.locator('.agents-panel').isVisible()) await phone.locator('#agents-btn').click();
   await phone.locator(`.agent-row[data-mux-id="${third.muxId}"]`).click();
   await phone.locator('.agents-panel').waitFor({ state: 'hidden' });
   const pixel = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
@@ -441,10 +411,68 @@ test('a shared tab offers only what works: palette, title, queue, status, keyboa
   await row.waitFor();
   await row.click({ button: 'right' });
   page.once('dialog', (dialog) => dialog.accept());
+  const refused = page.waitForResponse(response => response.url().endsWith('/api/sessions/delete') && response.request().method() === 'POST');
   await page.locator('.context-menu-item', { hasText: 'Delete' }).click();
-  await until(async () => /before deleting it/.test(await page.locator('#status-text').innerText()), 'the refusal is shown');
+  const refusal = await refused;
+  assert.equal(refusal.status(), 409);
+  const detail = (await refusal.json() as { error: string }).error;
+  assert.match(detail, /stop.*before deleting/);
+  await until(async () => (await page.locator('#status-text').innerText()).includes(detail), 'the refusal is shown');
   assert.equal((await live()).sessions.some((session) => session.attached?.muxId === third.muxId), true);
 
+  assert.equal(focusReturned, true, 'authoritative dialog closure must return keyboard focus to the composer');
   await phone.close();
   await desk.close();
+});
+
+test('either frontend can create, leave zero clients, reattach and stop only by an acknowledged operation', { timeout: 60000 }, async () => {
+  const api = context.request;
+  const fromPeer = await startMux('equal-lifetime', { PI_ORCHESTRATION_HOST: 'emacs', PI_ORCHESTRATION_ENDPOINT: path.join(work, 'emacs-socket'), PI_ORCHESTRATION_TARGET: '*pi:equal*' });
+  const identity = readProcessIdentity(fromPeer.receipt.piPid)!;
+  assert.ok(identity);
+  await fromPeer.primary.disconnect();
+  assert.equal(processIdentityStatus(identity), 'alive', 'creator socket EOF must not stop Pi');
+  const attached = await api.post(`${base}/api/live-sessions/attach`, { data: { muxId: fromPeer.muxId } });
+  assert.equal(attached.status(), 200);
+  const view = (await attached.json() as { session: { id: string; runtime: RuntimeReceipt } }).session;
+  assert.equal(view.runtime.piPid, fromPeer.receipt.piPid);
+  assert.equal((await api.delete(`${base}/api/live-sessions/${view.id}`)).status(), 200);
+  assert.equal(processIdentityStatus(identity), 'alive', 'zero clients must not stop a creator-started root');
+  const backToCreator = await peerFor(fromPeer.receipt);
+  assert.equal((await backToCreator.request({ type: 'get_state' })).success, true);
+  await backToCreator.disconnect();
+  assert.equal(processIdentityStatus(identity), 'alive');
+  const stoppedPeerRoot = await api.post(`${base}/api/agents/${fromPeer.muxId}/stop`, { data: { confirm: true, operationId: 'peer-origin-stop' } });
+  assert.equal(stoppedPeerRoot.status(), 200);
+  assert.equal((await stoppedPeerRoot.json() as { receipt: { state: string } }).receipt.state, 'stopped');
+  assert.equal(processIdentityStatus(identity), 'dead');
+
+  const created = await api.post(`${base}/api/live-sessions`, { data: { cwd: project, model: 'tau-fx/one', args: [
+    '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-context-files', '-e', FIXTURE,
+  ] } });
+  assert.equal(created.status(), 200, await created.text());
+  const tauView = (await created.json() as { session: { id: string; runtime: RuntimeReceipt } }).session;
+  const receipt = tauView.runtime;
+  runtimes.push(receipt);
+  const tauIdentity = readProcessIdentity(receipt.piPid)!;
+  assert.ok(tauIdentity);
+  const peer = await peerFor(receipt);
+  assert.equal((await api.delete(`${base}/api/live-sessions/${tauView.id}`)).status(), 200);
+  await peer.run('survived the creating Tau view');
+  await peer.disconnect();
+  assert.equal(processIdentityStatus(tauIdentity), 'alive', 'zero clients must not stop a Tau-created root');
+  const reattached = await api.post(`${base}/api/live-sessions/attach`, { data: { muxId: receipt.muxId } });
+  assert.equal(reattached.status(), 200);
+  const restored = (await reattached.json() as { session: { id: string; runtime: RuntimeReceipt } }).session;
+  assert.equal(restored.runtime.piPid, receipt.piPid);
+  const again = await peerFor(receipt);
+  assert.equal((await again.request({ type: 'get_state' })).success, true);
+  const stopped = await api.post(`${base}/api/live-sessions/${restored.id}/stop`, { data: { confirm: true, operationId: 'tau-origin-stop' } });
+  assert.equal(stopped.status(), 200, await stopped.text());
+  const terminal = (await stopped.json() as { receipt: { state: string } }).receipt;
+  assert.equal(terminal.state, 'stopped');
+  await again.waitFor(record => record.type === 'pimux_exit', 'stop reaches the equal socket peer');
+  assert.equal(processIdentityStatus(tauIdentity), 'dead');
+  const repeated = await api.post(`${base}/api/agents/${receipt.muxId}/stop`, { data: { confirm: true, operationId: 'reconcile-stop' } });
+  assert.deepEqual((await repeated.json() as { receipt: unknown }).receipt, terminal);
 });

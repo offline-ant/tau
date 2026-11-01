@@ -45,13 +45,13 @@
     }
   ],
   "license": "MIT",
-  "homepage": "https://github.com/milanglacier/pi-tau-web-server#readme",
+  "homepage": "https://github.com/offline-ant/tau#readme",
   "bugs": {
-    "url": "https://github.com/milanglacier/pi-tau-web-server/issues"
+    "url": "https://github.com/offline-ant/tau/issues"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/milanglacier/pi-tau-web-server.git"
+    "url": "git+https://github.com/offline-ant/tau.git"
   },
   "type": "module",
   "main": "./bin/tau.js",
@@ -59,7 +59,7 @@
     "pi-tau-web-server": "./bin/tau.js"
   },
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=24.0.0"
   },
   "publishConfig": {
     "access": "public",
@@ -70,28 +70,30 @@
     "public",
     "scripts",
     "src",
+    "vendor",
+    "docs/phimacs-candidate.md",
     "tsconfig.json",
     "tsconfig.server.json",
     "tsconfig.public.json"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.server.json && tsc -p tsconfig.public.json && node scripts/copy-katex.ts && node scripts/copy-highlight.ts",
-    "prepare": "npm run build",
     "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.public.json --noEmit && tsc -p tsconfig.test.json",
     "test": "npm run build && node --test test/*.test.ts",
     "test:e2e": "bash scripts/e2e.sh"
   },
   "dependencies": {
-    "pi-sound": "file:../pi-sound",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@phimacs/pimux": "file:vendor/phimacs-pimux-0.1.0-b42fc6c.tgz",
+    "pi-sound": "file:vendor/pi-sound-0.1.0.tgz",
     "ws": "8.21.3"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "1.4.0",
     "@highlightjs/cdn-assets": "11.12.0",
-    "@types/node": "26.5.0",
+    "@types/node": "22.19.19",
     "@types/ws": "8.18.1",
     "katex": "0.18.7",
     "playwright": "1.61.1",
-    "typescript": "7.0.2"
+    "typescript": "5.9.3"
   }
 }

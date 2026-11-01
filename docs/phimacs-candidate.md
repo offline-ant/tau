@@ -1,0 +1,64 @@
+# Private Phimacs candidate inputs
+
+This candidate is based on upstream
+`c1619a96353924e90f001b4745fc967e5008c336` and preserves the fork features recorded
+at `8c8516d7f5640893a726f2f48177cf3ec51c88c0`. It is not published or installed into
+an existing service. Candidate source, artifacts and branches remain private until
+the full integration matrix and explicit publication approval.
+
+## Reproducible package graph
+
+`vendor/manifest.json` records the exact compiled pimux and generic sound source
+revisions, archive hashes and licenses. Every internal dependency is a local
+archive with a locked integrity, never a registry-name fallback or sibling
+checkout. Package contents retain those archives, compiled JavaScript, optional
+Pi extension source, browser fonts/highlighting and original notices. The npm pack
+is an input to the coordinated release graph, not a standalone offline installer:
+file dependencies require the included vendor directory to be extracted before
+hydration. The complete release hydrates these locked inputs and ships the whole
+runtime tree; it must not advertise a bare npm-global install of this input pack.
+
+Use `npm ci --ignore-scripts`, then explicit TypeScript compilation and the two
+asset-copy scripts. There is no install-time `prepare` hook. The runtime Pi SDK is
+exactly 1.4.0; pimux and sound share that physical host package. An installed-prefix
+check must verify this identity as well as Node execution below `node_modules`.
+
+Configuration uses `--pi-command` / `TAU_PI_COMMAND` for one absolute supported
+release Pi; the default is the installed SDK entry. `PHIMACS_PI_VERSION` and
+`PHIMACS_PI_SHA256` validate the release selection. `PI_CODING_AGENT_DIR` owns user
+state. `PIMUX_DIR` changes discovery, not the production claim root. Tests use
+marked synthetic claim namespaces that cannot authorize production session paths.
+
+## Preserved behavior and acceptance
+
+The isolated rebase reconciles upstream ordered and uncertain-delivery queues,
+dialog/Abort acknowledgements, error/retry preservation, nested tool rendering,
+completion guards and session search/list controls with the fork's grouped
+activity, lazy project lists, TLS/authentication and orchestration features.
+
+Runtime tests cover both frontend creation directions, zero-client survival,
+server shutdown/restart, reconnect, authoritative snapshots, first-answer dialogs,
+explicit stop receipts, native-owner/force refusal, retained old-file claims,
+worker parent identity, exact-host refusal, lease-protected file operations and
+full-tree HTML export from the owning selected leaf. Browser tests cover deferred
+follow success/failure, repeated selection, expanded non-favourite refresh,
+out-of-order responses, draft/image/queue quarantine and acknowledged global
+queue recovery. Public sound tests cover asynchronous cancellation and disabled
+configuration without native credential or device discovery. Faux providers and
+synthetic backends only; these are not paid-provider or live-deployment tests.
+
+## External release gates
+
+- Pi 1.4.0 has unguarded internal storage paths. Managed claims protect cooperating
+  launches and lease-mediated operations, not arbitrary raw Pi/editor I/O. No Pi
+  fork is part of this candidate.
+- The official Pi 1.4.0 distribution contains bundled vulnerable dependencies.
+  External npm overrides do not patch embedded code. A reviewed owning fixed host
+  artifact is required before the complete Phimacs release can be accepted.
+- Tau/upstream declare MIT without a tracked license grant. Preserve attribution
+  and obtain clarification before public redistribution; private work is not a
+  blanket relicensing decision.
+- Final corresponding-source archives and public acquisition pins belong to the
+  coordinated release. Local commits and private hashes alone are not anonymous
+  installation or publication evidence. No public push or service change follows
+  from these tests.
