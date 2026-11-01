@@ -1,4 +1,5 @@
-import type { MessageContentBlock } from './app-types.js';
+import type { MessageContentBlock, RpcCommand } from './app-types.js';
+import type { CommandTarget } from './unsent-input.js';
 import { isImeComposition } from './keyboard.js';
 
 // ═══════════════════════════════════════
@@ -50,6 +51,8 @@ type TreeViewOptions = {
   getActiveLiveSessionId(): string | null;
   isStreaming(): boolean;
   getViewSelection(): number;
+  captureCommandTarget(sessionId?: string | null): CommandTarget | null;
+  rpcCommand(command: RpcCommand): Promise<{ success?: boolean; error?: string; data?: { editorText?: string } } | undefined>;
   captureComposerText(): (text: string) => void;
   flashStatusError(message: string, ms?: number): void;
 };
@@ -130,7 +133,7 @@ export function describeEntry(entry: TreeEntry): { kind: string; text: string } 
 }
 
 export function setupTreeView(options: TreeViewOptions) {
-  const { getActiveLiveSessionId, isStreaming, getViewSelection, captureComposerText, flashStatusError } = options;
+  const { getActiveLiveSessionId, isStreaming, getViewSelection, captureCommandTarget, rpcCommand, captureComposerText, flashStatusError } = options;
 
   // Static index.html shell elements — assert non-null at the query site,
   // matching the other setup modules.
@@ -149,6 +152,7 @@ export function setupTreeView(options: TreeViewOptions) {
   let rowEls: HTMLButtonElement[] = [];
   let activeIndex = -1;
   let openSessionId: string | null = null;
+  let openTarget: CommandTarget | null = null;
   let navigating = false;
 
   function isOpen() {
@@ -325,8 +329,8 @@ export function setupTreeView(options: TreeViewOptions) {
       return;
     }
     const sessionId = openSessionId || getActiveLiveSessionId();
-    if (!sessionId) {
-      setMessage('Select a live Tau tab first.', true);
+    if (!sessionId || !openTarget || openTarget.sessionId !== sessionId) {
+      setMessage('Select a ready live Tau tab first.', true);
       return;
     }
     const selection = getViewSelection();
@@ -334,12 +338,7 @@ export function setupTreeView(options: TreeViewOptions) {
     navigating = true;
     setMessage('Jumping…', false);
     try {
-      const resp = await fetch('/api/rpc', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'navigate_tree', sessionId, entryId }),
-      });
-      const data = await resp.json();
+      const data = await rpcCommand({ type: 'navigate_tree', ...openTarget, entryId });
       if (data?.success) {
         const editorText = data.data?.editorText;
         if (typeof editorText === 'string') keepComposerText(editorText);
@@ -445,6 +444,11 @@ export function setupTreeView(options: TreeViewOptions) {
       flashStatusError('Select a live Tau tab first.');
       return;
     }
+    openTarget = captureCommandTarget(sessionId);
+    if (!openTarget) {
+      flashStatusError('Wait for the conversation to become ready before navigating.');
+      return;
+    }
     openSessionId = sessionId;
     treeData = [];
     leafId = null;
@@ -477,6 +481,7 @@ export function setupTreeView(options: TreeViewOptions) {
     rowEls = [];
     activeIndex = -1;
     openSessionId = null;
+    openTarget = null;
     // Hand focus back to the button that opened the dialog.
     if (hadFocus && treeBtn instanceof HTMLElement && !treeBtn.classList.contains('hidden')) treeBtn.focus();
   }

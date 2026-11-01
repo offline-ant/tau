@@ -1,11 +1,14 @@
 import type { ModelRecord, RpcCommand } from './app-types.js';
 import { isImeComposition } from './keyboard.js';
+import type { CommandTarget, InputContext } from './unsent-input.js';
 import { modelMeta, modelRef, normalizeModelList, searchModels } from './model-match.js';
 
 type ModelPickerOptions = {
   getActiveLiveSessionId(): string | null;
   isViewingActiveSession(): boolean;
   rpcCommand(cmd: RpcCommand, statusMsg?: string): Promise<{ success?: boolean; data?: Record<string, unknown>; error?: string }>;
+  captureCommandTarget(): CommandTarget | null;
+  commandContextIsCurrent(sessionId: string, context: InputContext): boolean;
   flashStatusError(message: string, ms?: number): void;
   escapeHtml(text: string): string;
   setContextWindowSize(value: number): void;
@@ -14,7 +17,7 @@ type ModelPickerOptions = {
 };
 
 export function setupModelPicker(options: ModelPickerOptions) {
-  const { getActiveLiveSessionId, isViewingActiveSession, rpcCommand, flashStatusError, escapeHtml, setContextWindowSize, updateContextPill, focusComposer } = options;
+  const { getActiveLiveSessionId, isViewingActiveSession, rpcCommand, captureCommandTarget, commandContextIsCurrent, flashStatusError, escapeHtml, setContextWindowSize, updateContextPill, focusComposer } = options;
 
 // ═══════════════════════════════════════
 // Model Picker
@@ -42,6 +45,7 @@ let currentThinkingLevel = 'off';
 let modelPickerMatches: ModelRecord[] = [];
 let modelPickerActiveIndex = -1;
 let modelPickerJustSelected = false;
+let pickerTarget: CommandTarget | null = null;
 
 function modelDisplayString() {
   if (!currentModelId) return '';
@@ -194,6 +198,8 @@ function selectModelSuggestion(index: number) {
 }
 
 function openModelPicker() {
+  pickerTarget = captureCommandTarget();
+  if (!pickerTarget) return;
   // The model button is disabled by updateLiveSessionInputState when there is no
   // active live session, so this handler is only reachable via click when a
   // session exists.
@@ -214,6 +220,7 @@ function openModelPicker() {
 }
 
 function closeModelPicker() {
+  pickerTarget = null;
   modelPicker.classList.add('hidden');
   modelPickerOverlay.classList.add('hidden');
   modelPickerMatches = [];
@@ -224,7 +231,10 @@ function closeModelPicker() {
   focusComposer();
 }
 
-async function applyModelSpec(rawSpec: string) {
+async function applyModelSpec(rawSpec: string, target = captureCommandTarget()) {
+  if (!target || !commandContextIsCurrent(target.sessionId, target.inputContext)) {
+    return { success: false, error: 'The model selection belongs to a conversation that changed or is not ready.' };
+  }
   const raw = String(rawSpec || '').trim();
   // No-op when the user didn't actually edit anything. Avoids spurious
   // set_model/set_thinking_level RPCs and false validation errors on the
@@ -243,7 +253,10 @@ async function applyModelSpec(rawSpec: string) {
     flashStatusError(parsed.error);
     return { success: false, error: parsed.error };
   }
-  const r = await rpcCommand({ type: 'set_model', provider: parsed.provider, modelId: parsed.modelId }, `Switching to ${parsed.provider}/${parsed.modelId}...`);
+  const r = await rpcCommand({ type: 'set_model', ...target, provider: parsed.provider, modelId: parsed.modelId }, `Switching to ${parsed.provider}/${parsed.modelId}...`);
+  if (!commandContextIsCurrent(target.sessionId, target.inputContext)) {
+    return { success: false, error: 'The conversation changed while setting the model. Nothing else was sent.' };
+  }
   if (r && r.success) {
     const data = r.data || {};
     // Always retain the provider so modelDisplayString() can render the
@@ -259,7 +272,10 @@ async function applyModelSpec(rawSpec: string) {
       updateContextPill();
     }
     if (parsed.thinking !== null) {
-      const t = await rpcCommand({ type: 'set_thinking_level', level: parsed.thinking }, 'Setting thinking...');
+      const t = await rpcCommand({ type: 'set_thinking_level', ...target, level: parsed.thinking }, 'Setting thinking...');
+      if (!commandContextIsCurrent(target.sessionId, target.inputContext)) {
+        return { success: false, error: 'The conversation changed while setting thinking.' };
+      }
       if (t && t.success) {
         currentThinkingLevel = parsed.thinking ?? 'off';
       } else {
@@ -281,7 +297,7 @@ async function applyModelSpec(rawSpec: string) {
 }
 
 async function saveModelPicker() {
-  const result = await applyModelSpec(modelPickerInput.value);
+  const result = await applyModelSpec(modelPickerInput.value, pickerTarget);
   if (result.success) {
     closeModelPicker();
   } else {
@@ -341,10 +357,12 @@ modelPickerInput.addEventListener('keydown', (e) => {
 });
 
 async function fetchModelInfo() {
+  const target = captureCommandTarget();
+  const sessionId = getActiveLiveSessionId();
   try {
     const [modelsResp, stateResp] = await Promise.all([
-      fetch('/api/rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'get_available_models', sessionId: getActiveLiveSessionId() }) }),
-      fetch('/api/rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'get_state', sessionId: getActiveLiveSessionId() }) }),
+      fetch('/api/rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'get_available_models', sessionId }) }),
+      fetch('/api/rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'get_state', sessionId }) }),
     ]);
     const modelsData = await modelsResp.json();
     const stateData = await stateResp.json();
@@ -352,6 +370,7 @@ async function fetchModelInfo() {
     if (modelsData.success && modelsData.data?.models) {
       availableModels = modelsData.data.models;
     }
+    if (!target || !commandContextIsCurrent(target.sessionId, target.inputContext)) return;
     if (stateData.success && stateData.data?.model !== undefined) {
       // Server is canonical: stateData.data.model is null or a full
       // {provider,id} object. Assign directly — no string fallback.

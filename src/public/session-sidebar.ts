@@ -7,6 +7,7 @@
 
 import { isImeComposition } from './keyboard.js';
 import { limitSessions } from './session-limit.js';
+import type { CommandTarget } from './unsent-input.js';
 
 export type SidebarSession = {
   filePath: string;
@@ -43,6 +44,7 @@ export class SessionSidebar {
   onSessionSelect: (session: SidebarSession | null) => void;
   onNewSession: (cwd: string) => void;
   onError: (message: string) => void;
+  captureCommandTarget: (file: string) => CommandTarget | null;
   activeSessionFile: string | null;
   projects: SidebarProject[];
   sessionsByDir: Map<string, SidebarSession[]>;
@@ -70,11 +72,13 @@ export class SessionSidebar {
     onSessionSelect: (session: SidebarSession | null) => void,
     onNewSession: (cwd: string) => void,
     onError: (message: string) => void,
+    captureCommandTarget: (file: string) => CommandTarget | null = () => null,
   ) {
     this.container = container;
     this.onSessionSelect = onSessionSelect;
     this.onNewSession = onNewSession;
     this.onError = onError;
+    this.captureCommandTarget = captureCommandTarget;
     this.activeSessionFile = null;
     this.projects = [];
     this.sessionsByDir = new Map();
@@ -525,6 +529,7 @@ export class SessionSidebar {
   }
 
   startRename(itemEl: HTMLElement, session: SidebarSession) {
+    const target = this.captureCommandTarget(session.filePath);
     const titleEl = itemEl.querySelector('.session-title');
     if (!titleEl) return;
     const currentName = titleEl.textContent;
@@ -543,7 +548,7 @@ export class SessionSidebar {
           const data = await (await fetch('/api/rpc', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ type: 'set_session_name', name, filePath: session.filePath }),
+            body: JSON.stringify({ type: 'set_session_name', name, filePath: session.filePath, ...target }),
           })).json();
           if (data.success === false) throw new Error(data.error || 'Could not rename the session');
           session.name = name;
@@ -606,11 +611,12 @@ export class SessionSidebar {
   }
 
   async exportSession(session: SidebarSession) {
+    const target = this.captureCommandTarget(session.filePath);
     try {
       const data = await (await fetch('/api/rpc', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'export_html', filePath: session.filePath }),
+        body: JSON.stringify({ type: 'export_html', filePath: session.filePath, ...target }),
       })).json();
       if (data?.success && data.data?.path) {
         await fetch('/api/open', {

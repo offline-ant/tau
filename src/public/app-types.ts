@@ -1,6 +1,6 @@
 import type { DialogRequest } from './dialogs.js';
 import type { NestedCallsRecord } from './nested-tool-calls.js';
-import type { InputContext } from './unsent-input.js';
+import type { InputContext, RuntimeInputContext } from './unsent-input.js';
 
 export type PendingDialog = DialogRequest & {
   id: string;
@@ -48,6 +48,8 @@ export type LiveSession = {
   lastActiveAt?: string;
   contextUsage?: UsageRecord;
   leafId?: string | null;
+  runtimeContext?: RuntimeInputContext | null;
+  inputReady?: boolean;
   shared?: boolean;
   capabilities?: { stop?: boolean; navigateTree?: boolean };
   /** Runtime identity is independent of the frontend that first started it. Closing only disconnects. */

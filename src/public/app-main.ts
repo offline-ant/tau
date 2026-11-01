@@ -23,7 +23,7 @@ import { setupSessionStatsCard, type SessionStats } from './session-stats-card.j
 import { isImeComposition } from './keyboard.js';
 import { buildHistoryItems, messageImages, type HistoryItem, type SessionHistoryEntry } from './history-render.js';
 import { setupAgentsPanel, type OverviewAgent } from './agents-panel.js';
-import { UnsentInputStore, sameContext, type InputContext, type UnsentInput } from './unsent-input.js';
+import { UnsentInputStore, copyInputContext, runtimeInputContext, sameContext, type CommandTarget, type InputContext, type UnsentInput } from './unsent-input.js';
 
 import type { AppEvent, AppMessage, AssistantStep, ExtensionUIRequest, InteractionState, LiveInstance, LiveSession, MessageContentBlock, ModelRecord, PendingDialog, PendingFilePath, PendingImage, QueuedCommand, RpcCommand, UsageRecord } from './app-types.js';
 
@@ -57,6 +57,10 @@ const messageRenderer = new MessageRenderer(document.getElementById('messages')!
 const toolCardRenderer = new ToolCardRenderer(document.getElementById('messages')!, true);
 const dialogHandler = new DialogHandler(document.getElementById('dialog-container')!, {
   async send(command) {
+    const captured = command as RpcCommand;
+    if (!captured.sessionId || !captured.inputContext || !commandContextIsCurrent(captured.sessionId, captured.inputContext as InputContext)) {
+      throw new Error('The dialog conversation is no longer ready. Refresh it before answering.');
+    }
     const response = await fetch('/api/rpc', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(command),
     });
@@ -92,6 +96,10 @@ const sidebar = new SessionSidebar(
   handleSessionSelect,
   (cwd) => openNewLiveSessionModal(cwd),
   (message) => flashStatusError(message, 6000),
+  file => {
+    const session = liveSessions.find(session => session.sessionFile === file);
+    return session ? captureCommandTarget(session.id) : null;
+  },
 );
 sidebar.onRendered = () => updateLiveSessionIndicators();
 
@@ -476,7 +484,7 @@ wsClient.addEventListener('rpcEvent', (e: Event) => {
     const noticeId = typeof event.noticeId === 'number' ? event.noticeId : undefined;
     if (noticeId !== undefined && noticeId <= (editorNoticeIds.get(agentId) || 0)) return;
     if (noticeId !== undefined) editorNoticeIds.set(agentId, noticeId);
-    unsentInput.keep({ agentId: context.agentId, file: typeof event.sessionFile === 'string' ? event.sessionFile : null, leafId: undefined }, { text: event.text, images: [] });
+    unsentInput.keep({ agentId: context.agentId, file: typeof event.sessionFile === 'string' ? event.sessionFile : null, leafId: undefined, runtimeContext: null }, { text: event.text, images: [] });
     restoreUnsentInput();
     return;
   }
@@ -1132,19 +1140,19 @@ function clearSharedQueue(sessionId = activeLiveSessionId, confirmed = false): P
   const existing = queueClearRequests.get(sessionId);
   if (existing) return existing;
   if (!confirmed && !confirm('Remove ALL queued steering and follow-up input from EVERY frontend of this agent? Only this browser receives the returned text for review. It is not resent, and images are not returned.')) return Promise.resolve(false);
-  const context = inputContexts.get(sessionId) || inputContextOf(session);
+  const target = captureCommandTarget(sessionId);
+  if (!target) return Promise.resolve(false);
+  const context = target.inputContext;
   const selection = viewSelection;
   const request = (async () => {
     try {
       const response = await fetch('/api/rpc', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'clear_queue', id: crypto.randomUUID(), sessionId, confirmGlobal: true }),
+        body: JSON.stringify({ type: 'clear_queue', id: crypto.randomUUID(), ...target, confirmGlobal: true }),
       });
       const data = await response.json();
       if (!response.ok || data.success !== true) throw new Error(data.error || 'Queue clearing was not confirmed');
-      const origin: InputContext = { ...context,
-        ...(data.recoveryContext?.file !== undefined ? { file: data.recoveryContext.file } : {}),
-        ...(data.recoveryContext?.leafId !== undefined ? { leafId: data.recoveryContext.leafId } : {}) };
+      const origin = context;
       const returned = [...(Array.isArray(data.data?.steering) ? data.data.steering : []),
         ...(Array.isArray(data.data?.followUp) ? data.data.followUp : [])].filter((text): text is string => typeof text === 'string');
       if (returned.length) unsentInput.keep(origin, { text: returned.join('\n\n'), images: [] });
@@ -1684,7 +1692,8 @@ function handleExtensionUIRequest(event: AppEvent, sessionId: string | null = nu
     if (current.sessionId !== sessionId || current.id !== event.id) queueExtensionUIRequest(event, sessionId);
     return;
   }
-  const request = (sessionId ? { ...event, sessionId } : event) as DialogRequest;
+  const target = sessionId ? captureCommandTarget(sessionId) : null;
+  const request = (sessionId ? { ...event, sessionId, inputContext: target?.inputContext ?? null } : event) as DialogRequest;
   // A shared request stays a member until mux closes it or replaces its
   // snapshot. Native requests still use Tau's original absolute expiry.
   if (sessionId && liveSessions.find(session => session.id === sessionId)?.attached) delete request.expiresAt;
@@ -1804,7 +1813,7 @@ function processImageFile(file: File): Promise<PendingImage> {
 }
 
 async function addAttachments(files: FileList | File[]) {
-  const context = composerContext ? { ...composerContext } : null;
+  const context = composerContext ? copyInputContext(composerContext) : null;
   const selection = viewSelection;
   const list = Array.from(files);            // snapshot before any await
   for (const file of list) {
@@ -1940,16 +1949,29 @@ recoveredInputEl.setAttribute('aria-label', 'Input kept for review');
 document.querySelector('.input-area')!.prepend(recoveredInputEl);
 
 function inputContextOf(session: LiveSession): InputContext {
-  const previous = inputContexts.get(session.id);
-  const file = session.sessionFile ?? null;
-  return { agentId: session.attached?.muxId || session.id, file,
-    leafId: session.leafId !== undefined ? session.leafId : previous?.file === file ? previous.leafId : undefined };
+  return { agentId: session.attached?.muxId || session.id, file: session.sessionFile ?? null,
+    leafId: session.leafId, runtimeContext: runtimeInputContext(session.runtimeContext) };
+}
+
+function commandContextIsCurrent(sessionId: string, context: InputContext): boolean {
+  const session = liveSessions.find(session => session.id === sessionId);
+  return !!session && session.inputReady === true && !!runtimeInputContext(context.runtimeContext)
+    && sameContext(context, inputContextOf(session));
+}
+
+/** Capture once, before any await; delayed actions must keep this exact target. */
+function captureCommandTarget(sessionId = activeLiveSessionId): CommandTarget | null {
+  const session = liveSessions.find(session => session.id === sessionId);
+  if (!session || session.inputReady !== true) return null;
+  const inputContext = inputContextOf(session);
+  if (!inputContext.runtimeContext || inputContext.runtimeContext.sessionFile !== inputContext.file) return null;
+  return { sessionId: session.id, inputContext: copyInputContext(inputContext) };
 }
 
 function bindComposerContext(context: InputContext | null) {
   if (sameContext(composerContext, context)) return;
   // Browser-restored form text can precede the first authoritative identity.
-  const origin = composerContext || { agentId: null, file: null, leafId: undefined };
+  const origin = composerContext || { agentId: null, file: null, leafId: undefined, runtimeContext: null };
   unsentInput.keep(origin, { text: messageInput.value, images: pendingImages, files: pendingFilePaths });
   voiceInput?.cancel();
   messageInput.value = '';
@@ -1969,6 +1991,7 @@ function observeInputContext(session: LiveSession) {
     if (session.id === activeLiveSessionId && viewingActiveSession) {
       beginViewSelection(false);
       treeViewController.closeIfOpen();
+      modelPickerController.closeIfOpen();
       bindComposerContext(next);
     }
   }
@@ -2050,7 +2073,8 @@ function activeTabIsShared() {
 }
 
 function activeTabCanNavigate() {
-  return viewingActiveSession && !!liveSessions.find(s => s.id === activeLiveSessionId)?.capabilities?.navigateTree;
+  return viewingActiveSession && captureCommandTarget() !== null
+    && !!liveSessions.find(s => s.id === activeLiveSessionId)?.capabilities?.navigateTree;
 }
 
 function sendMessage() {
@@ -2058,7 +2082,7 @@ function sendMessage() {
     flashStatusError('Finish taking the session before sending a message.');
     return;
   }
-  if (!viewingActiveSession || !activeLiveSessionId || !composerContext) {
+  if (!viewingActiveSession || !activeLiveSessionId || !composerContext || !commandContextIsCurrent(activeLiveSessionId, composerContext)) {
     flashStatusError('Select a live conversation before sending. Your input is still here.');
     return;
   }
@@ -2077,7 +2101,7 @@ function sendMessage() {
 
   // Another frontend sharing this Pi can start a run at any moment; Pi then
   // needs to know how to queue the prompt. It ignores this when idle.
-  const cmd: QueuedCommand = { type: 'prompt', inputContext: { ...composerContext }, message: message || '(see attached image)', streamingBehavior: 'followUp' };
+  const cmd: QueuedCommand = { type: 'prompt', inputContext: copyInputContext(composerContext), message: message || '(see attached image)', streamingBehavior: 'followUp' };
   const images = pendingImages;
 
   if (pendingImages.length > 0) {
@@ -2195,7 +2219,7 @@ function escapeHtml(text: string) {
 }
 
 function flushQueue() {
-  if (!viewingActiveSession || !composerContext || wsClient.ws?.readyState !== WebSocket.OPEN || !activeLiveSessionId || state.isStreaming || !resumeQueuedInput || sessionHasPendingWork(activeLiveSessionId) || takeRequest?.sessionId === activeLiveSessionId) return;
+  if (!viewingActiveSession || !composerContext || !activeLiveSessionId || !commandContextIsCurrent(activeLiveSessionId, composerContext) || wsClient.ws?.readyState !== WebSocket.OPEN || state.isStreaming || !resumeQueuedInput || sessionHasPendingWork(activeLiveSessionId) || takeRequest?.sessionId === activeLiveSessionId) return;
   const idx = messageQueue.findIndex(cmd => cmd.sessionId === activeLiveSessionId);
   if (idx >= 0) {
     if (!sameContext(messageQueue[idx].inputContext || null, composerContext)) {
@@ -2316,7 +2340,9 @@ function abortActiveSession() {
   const session = liveSessions.find(session => session.id === sessionId)!;
   const shared = !!(session.shared || session.attached);
   if (shared && !confirm('Abort current work for EVERY frontend and remove ALL queued input from this agent? Returned queue text is kept for review only in this browser, never resent. The agent itself keeps running.')) return;
-  const context = inputContexts.get(sessionId) || inputContextOf(session);
+  const target = captureCommandTarget(sessionId);
+  if (!target) return;
+  const context = target.inputContext;
   if (shared) {
     keepUnsentInput(session, context);
     bindComposerContext(context);
@@ -2331,7 +2357,7 @@ function abortActiveSession() {
       if (shared) void clearSharedQueue(sessionId, true);
       const response = await fetch('/api/rpc', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'abort', sessionId }),
+        body: JSON.stringify({ type: 'abort', ...target }),
       });
       const data = await response.json();
       if (!response.ok || !data.success) throw new Error(data.error || 'Pi did not acknowledge the stop');
@@ -2389,13 +2415,15 @@ async function takeFromHerdr() {
     flashStatusError('Reconnect to Tau before taking a session.');
     return;
   }
-  const request = { id: crypto.randomUUID(), sessionId: session.id };
+  const target = captureCommandTarget(session.id);
+  if (!target) return;
+  const request = { id: crypto.randomUUID(), ...target };
   takeRequest = request;
   updateLiveSessionInputState();
   try {
     const response = await fetch('/api/rpc', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: request.id, sessionId: request.sessionId, type: 'prompt', message: '/take herdr' }),
+      body: JSON.stringify({ ...request, type: 'prompt', message: '/take herdr' }),
     });
     const result = await response.json();
     if (!response.ok || result.success !== true) throw new Error(result.error || 'Session takeover failed.');
@@ -2415,9 +2443,9 @@ const commandPaletteController = setupCommandPalette([
   { icon: '↙', label: 'Take from Herdr…', desc: 'Take an idle Herdr conversation into this Tau tab', available: () => viewingActiveSession, action: () => { void takeFromHerdr(); } },
   { icon: '✨', label: 'New session', desc: 'Start over in this shared agent; every frontend moves with it', available: activeTabCanStartOver, action: () => { void newSharedSession(); } },
   { icon: '🌳', label: 'Session tree', desc: 'Jump to any earlier point in the session tree', available: activeTabCanNavigate, action: () => { void treeViewController.open(); } },
-  { icon: '×', label: 'Clear agent queue everywhere…', desc: 'Remove all frontends’ queued input; keep returned text here for review', available: activeTabIsShared, action: () => { void clearSharedQueue(); } },
+  { icon: '×', label: 'Clear agent queue everywhere…', desc: 'Remove all frontends’ queued input; keep returned text here for review', available: () => activeTabIsShared() && captureCommandTarget() !== null, action: () => { void clearSharedQueue(); } },
   { icon: '×', label: 'Stop agent everywhere…', desc: 'End this agent in all frontends, even when idle', available: () => viewingActiveSession && !!activeLiveSessionId, action: () => { void stopAgentEverywhere(); } },
-  { icon: '🗜️', label: 'Compact', desc: 'Compact context to save tokens', action: () => rpcCommand({ type: 'compact' }, 'Compacting...') },
+  { icon: '🗜️', label: 'Compact', desc: 'Compact context to save tokens', available: () => viewingActiveSession && captureCommandTarget() !== null, action: () => rpcCommand({ type: 'compact' }, 'Compacting...') },
   { icon: '📋', label: 'Export HTML', desc: 'Export session as HTML file', action: () => rpcExportHtml() },
   { icon: '📊', label: 'Session Stats', desc: 'Show session statistics', action: () => showSessionStats() },
   { icon: '⬇️', label: 'Expand All Steps', desc: 'Show all assistant activity', action: () => setAssistantBlocksExpanded(true) },
@@ -2435,7 +2463,16 @@ async function rpcCommand(cmd: RpcCommand, statusMsg = '') {
       setStatusMessage(error, 3000);
       return { type: 'response', command: cmd.type, success: false, error };
     }
-    if (!cmd.sessionId && viewingActiveSession && activeLiveSessionId) cmd = { ...cmd, sessionId: activeLiveSessionId };
+    if (!cmd.sessionId && viewingActiveSession && activeLiveSessionId && !backendLocalCommands.has(cmd.type)) cmd = { ...cmd, sessionId: activeLiveSessionId };
+    const readOnly = new Set(['get_state', 'get_messages', 'get_commands', 'get_session_stats', 'get_tree', 'get_entries', 'live_session_snapshot_request']);
+    if (!backendLocalCommands.has(cmd.type) && !readOnly.has(cmd.type) && cmd.sessionId) {
+      const target = 'inputContext' in cmd ? { sessionId: cmd.sessionId, inputContext: cmd.inputContext as InputContext }
+        : captureCommandTarget(cmd.sessionId);
+      if (!target?.inputContext || !commandContextIsCurrent(target.sessionId, target.inputContext)) {
+        return { type: 'response', command: cmd.type, success: false, error: 'The conversation changed or is not ready. Nothing was sent.' };
+      }
+      cmd = { ...cmd, ...target };
+    }
     if (statusMsg) setStatusMessage(statusMsg);
     const resp = await fetch('/api/rpc', {
       method: 'POST',
@@ -2457,7 +2494,7 @@ async function rpcCommand(cmd: RpcCommand, statusMsg = '') {
 /** Root agents can start over in place; workers stay on their file. */
 function activeTabCanStartOver() {
   const session = liveSessions.find(s => s.id === activeLiveSessionId);
-  return viewingActiveSession && !!session && session.attached?.placement !== 'worker';
+  return viewingActiveSession && !!session && captureCommandTarget(session.id) !== null && session.attached?.placement !== 'worker';
 }
 
 async function newSharedSession() {
@@ -2538,6 +2575,8 @@ const modelPickerController = setupModelPicker({
   getActiveLiveSessionId: () => activeLiveSessionId,
   isViewingActiveSession: () => viewingActiveSession,
   rpcCommand,
+  captureCommandTarget,
+  commandContextIsCurrent,
   flashStatusError,
   escapeHtml,
   setContextWindowSize(value) { contextWindowSize = value; },
@@ -2552,8 +2591,10 @@ const treeViewController = setupTreeView({
   getActiveLiveSessionId: () => (activeTabCanNavigate() ? activeLiveSessionId : null),
   isStreaming: () => state.isStreaming,
   getViewSelection: () => viewSelection,
+  captureCommandTarget,
+  rpcCommand,
   captureComposerText() {
-    const origin = composerContext ? { ...composerContext } : null;
+    const origin = composerContext ? copyInputContext(composerContext) : null;
     return (text) => {
       if (origin && text) unsentInput.keep(origin, { text, images: [] });
       restoreUnsentInput();
@@ -3012,7 +3053,8 @@ setInterval(pollInstances, 10000);
 function updateLiveSessionInputState() {
   const inputArea = document.querySelector('.input-area');
   const hasLiveSession = viewingActiveSession && !!activeLiveSessionId;
-  if (hasLiveSession) {
+  const inputReady = hasLiveSession && captureCommandTarget() !== null;
+  if (inputReady) {
     messageInput.disabled = false;
     sendBtn.disabled = takeRequest?.sessionId === activeLiveSessionId;
     messageInput.placeholder = 'Message...';
@@ -3020,14 +3062,15 @@ function updateLiveSessionInputState() {
   } else {
     messageInput.disabled = true;
     sendBtn.disabled = true;
-    messageInput.placeholder = hasReceivedInitialServerState ? 'Create or select a Tau tab to chat' : 'Connecting...';
-    inputArea?.classList.add('no-active-live-session');
+    messageInput.placeholder = hasLiveSession ? 'Waiting for the conversation to become ready…'
+      : hasReceivedInitialServerState ? 'Create or select a Tau tab to chat' : 'Connecting...';
+    inputArea?.classList.toggle('no-active-live-session', !hasLiveSession);
   }
   takeHerdrBtn.setAttribute('aria-busy', String(takeRequest !== null));
   takeHerdrBtn.classList.toggle('hidden', !hasLiveSession);
   document.getElementById('command-btn')!.disabled = !hasLiveSession;
-  modelPickerController.setEnabled(hasLiveSession);
-  treeViewController.setVisible(hasLiveSession && activeTabCanNavigate());
+  modelPickerController.setEnabled(inputReady);
+  treeViewController.setVisible(inputReady && activeTabCanNavigate());
 }
 
 // ═══════════════════════════════════════
@@ -3268,11 +3311,13 @@ function currentStatusText() {
 }
 
 function updateUI() {
+  updateLiveSessionInputState();
   const hasLiveSession = !!activeLiveSessionId && viewingActiveSession;
   const isStreaming = state.isStreaming && hasLiveSession;
   const hasPendingInteraction = hasLiveSession && pendingInteractionCount(activeLiveSessionId!) > 0;
   const stopping = hasLiveSession && abortState(activeLiveSessionId!) === 'stopping';
-  abortBtn.disabled = !!stopping;
+  const inputReady = hasLiveSession && captureCommandTarget() !== null;
+  abortBtn.disabled = !!stopping || !inputReady;
   abortBtn.title = stopping ? 'Stopping…' : 'Abort';
   abortBtn.setAttribute('aria-label', stopping ? 'Stopping…' : 'Abort');
 
@@ -3286,8 +3331,8 @@ function updateUI() {
     statusText.textContent = currentStatusText();
   }
 
-  messageInput.disabled = !hasLiveSession;
-  sendBtn.disabled = !hasLiveSession || takeRequest?.sessionId === activeLiveSessionId;
+  messageInput.disabled = !inputReady;
+  sendBtn.disabled = !inputReady || takeRequest?.sessionId === activeLiveSessionId;
 
   if (isStreaming || hasPendingInteraction || stopping) {
     abortBtn.classList.remove('hidden');
@@ -3404,8 +3449,10 @@ toggleAutoCompact.addEventListener('click', async () => {
 
 // Thinking level cycle (settings panel button)
 btnThinkingLevel.addEventListener('click', async () => {
-  const data = await rpcCommand({ type: 'cycle_thinking_level' });
-  if (data?.success && data.data?.level) {
+  const target = captureCommandTarget();
+  if (!target) return;
+  const data = await rpcCommand({ type: 'cycle_thinking_level', ...target });
+  if (commandContextIsCurrent(target.sessionId, target.inputContext) && data?.success && data.data?.level) {
     btnThinkingLevel.textContent = data.data.level;
     modelPickerController.setThinkingLevel(data.data.level);
   }

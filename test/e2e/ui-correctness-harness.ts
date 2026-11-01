@@ -12,8 +12,11 @@ function deferred<T>() {
   return { promise, resolve };
 }
 export function session(id: string, extra: Partial<LiveSession> = {}): LiveSession {
-  return { id, cwd: '/synthetic/project', sessionFile: `/synthetic/${id}.jsonl`, sessionName: `Live ${id}`,
-    leafId: `${id}-leaf`, model: null, isStreaming: false, shared: true,
+  const file = extra.sessionFile === undefined ? `/synthetic/${id}.jsonl` : extra.sessionFile;
+  const leafId = extra.leafId === undefined ? `${id}-leaf` : extra.leafId;
+  return { id, cwd: '/synthetic/project', sessionFile: file, sessionName: `Live ${id}`,
+    leafId, runtimeContext: { sessionFile: file, leafId, contextId: `fixture:${file}:${leafId}` }, inputReady: true,
+    model: null, isStreaming: false, shared: true,
     attached: { muxId: `mux-${id}`, host: 'emacs', placement: 'root', name: null },
     capabilities: { stop: true, navigateTree: true }, ...extra };
 }

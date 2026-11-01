@@ -3,6 +3,7 @@
  */
 
 import { activateRow, isImeComposition, moveListFocus } from './keyboard.js';
+import type { InputContext } from './unsent-input.js';
 
 export type DialogRequest = {
   id?: string;
@@ -15,6 +16,7 @@ export type DialogRequest = {
   createdAt?: number;
   expiresAt?: number;
   sessionId?: string;
+  inputContext?: InputContext | null;
   method?: string;
   [key: string]: unknown;
 };
@@ -252,6 +254,7 @@ export class DialogHandler {
       await this.transport.send({
         type: 'extension_ui_response', id,
         sessionId: sessionId || this.getSessionId?.(),
+        inputContext: current.request?.inputContext ?? null,
         ...response,
       });
       // A successful write is not operation completion. The full server

@@ -115,7 +115,8 @@ test('an authoritative snapshot before attach completion owns the selected file 
     await view.page.locator('#message-input').fill(draft);
     const attach = view.hold('/api/live-sessions/attach');
     await view.disconnect(); await view.reconnect([], [agent]); await attach.called;
-    const advanced = { ...restored, cwd: '/synthetic/moved', sessionFile: '/synthetic/moved/conversation.jsonl', leafId: 'advanced-leaf' };
+    const advanced = { ...restored, cwd: '/synthetic/moved', sessionFile: '/synthetic/moved/conversation.jsonl', leafId: 'advanced-leaf',
+      runtimeContext: { sessionFile: '/synthetic/moved/conversation.jsonl', leafId: 'advanced-leaf', contextId: 'advanced-context' } };
     view.live.set(restored.id, advanced);
     await view.emit({ type: 'live_session_snapshot', ...snapshot(advanced, 'Advanced authoritative context', 20) });
     const selectedSnapshot = view.hold(`/api/live-sessions/${restored.id}/snapshot`);

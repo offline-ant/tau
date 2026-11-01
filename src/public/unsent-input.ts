@@ -1,12 +1,31 @@
 /** Input kept for review, never replayed, under its original agent, file and leaf. */
 import type { PendingFilePath, PendingImage } from './app-types.js';
 
-export type InputContext = { agentId: string | null; file: string | null; leafId: string | null | undefined };
+/** Opaque runtime anchor; only a complete owning snapshot can supply it. */
+export type RuntimeInputContext = { sessionFile: string | null; leafId: string | null; contextId: string };
+export type InputContext = { agentId: string | null; file: string | null; leafId: string | null | undefined; runtimeContext?: RuntimeInputContext | null };
+export type CommandTarget = { sessionId: string; inputContext: InputContext };
+
+export function runtimeInputContext(value: unknown): RuntimeInputContext | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const context = value as Record<string, unknown>;
+  if (!(context.sessionFile === null || typeof context.sessionFile === 'string')
+    || !(context.leafId === null || typeof context.leafId === 'string')
+    || typeof context.contextId !== 'string' || !context.contextId) return null;
+  return { sessionFile: context.sessionFile, leafId: context.leafId, contextId: context.contextId };
+}
+
+export function copyInputContext(context: InputContext): InputContext {
+  return { ...context, ...(context.runtimeContext ? { runtimeContext: { ...context.runtimeContext } } : {}) };
+}
 export type UnsentInput = { text: string; images: PendingImage[]; files?: PendingFilePath[] };
 export type KeptInput = { context: InputContext; input: UnsentInput };
 
 export function contextKey(context: InputContext): string {
-  return JSON.stringify([context.agentId, context.file, context.leafId === undefined ? [] : [context.leafId]]);
+  const anchor = context.runtimeContext;
+  return JSON.stringify([context.agentId, context.file, anchor
+    ? [anchor.sessionFile, anchor.leafId, anchor.contextId]
+    : [context.leafId === undefined ? [] : [context.leafId]]]);
 }
 
 export function sameContext(left: InputContext | null, right: InputContext | null): boolean {
@@ -19,7 +38,7 @@ export class UnsentInputStore {
 
   /** Receipt loss is not rejection: preserved text always needs explicit review. */
   track(id: string, context: InputContext, input: UnsentInput) {
-    this.inFlight.set(id, { context: { ...context }, input });
+    this.inFlight.set(id, { context: copyInputContext(context), input });
   }
 
   settle(id: string, delivered: boolean): boolean {
@@ -41,14 +60,14 @@ export class UnsentInputStore {
   keep(context: InputContext, input: UnsentInput) {
     if (!input.text && !input.images.length && !input.files?.length) return;
     const key = contextKey(context), kept = this.kept.get(key)?.input;
-    this.kept.set(key, { context: { ...context }, input: kept
+    this.kept.set(key, { context: copyInputContext(context), input: kept
       ? { text: [kept.text, input.text].filter(Boolean).join('\n\n'), images: [...kept.images, ...input.images],
         ...((kept.files?.length || input.files?.length) ? { files: [...kept.files || [], ...input.files || []] } : {}) }
       : { ...input, images: [...input.images], ...(input.files ? { files: [...input.files] } : {}) } });
   }
 
   entries(): KeptInput[] {
-    return [...this.kept.values()].map(({ context, input }) => ({ context: { ...context }, input }));
+    return [...this.kept.values()].map(({ context, input }) => ({ context: copyInputContext(context), input }));
   }
 
   /** The caller has explicitly chosen this original context for reuse or discard. */
