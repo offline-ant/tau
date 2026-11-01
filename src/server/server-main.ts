@@ -30,6 +30,7 @@ import { LiveSessionManager, PiRpcSession, SessionLifecycleError, SessionOpenErr
 import { pimuxCommand, pimuxEntryForFile, pimuxFiles, pimuxSharing, processAlive } from './pimux.js';
 import { AgentOverview } from './agents.js';
 import { readSessionHeader } from './session-header.js';
+import { searchSessions } from './session-search.js';
 import { buildEndpoint, orchestrationEndpoint, publishEndpoint, unpublishEndpoint } from './orchestration.js';
 import { sessionOwner, sessionOwners } from './session-owners.js';
 import { ensureTlsCertificate } from './tls.js';
@@ -616,6 +617,7 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
   }
   if (cleanPath === '/api/projects' && req.method === 'GET') return serveProjectsList(res);
   if (cleanPath === '/api/sessions' && req.method === 'GET') return serveProjectSummaries(res);
+  if (cleanPath === '/api/search' && req.method === 'GET') return serveSearch(res, parsed.searchParams.get('q') || '');
   if ((cleanPath === '/api/files') && req.method === 'GET') {
     const explicitPath = parsed.searchParams.get('path');
     const sessionId = parsed.searchParams.get('sessionId');
@@ -671,6 +673,24 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
   if (sessionMatch && req.method === 'GET') return serveSessionFile(res, sessionMatch[1], sessionMatch[2], parsed.searchParams.get('since'));
 
   json(res, 404, { error: 'Not found' });
+}
+
+async function serveSearch(res: ServerResponse, query: string) {
+  try {
+    const matches = await searchSessions(SESSIONS_DIR, query);
+    if (!matches.length) return json(res, 200, { results: [] });
+    const owners = sessionOwners();
+    const sharedFiles = pimuxFiles();
+    const liveFiles = liveFilesSet();
+    const results = matches.map(result => {
+      const shared = sharedFiles.get(canonicalFile(result.filePath)) ?? null;
+      return {
+        ...result, project: normalizeSessionCwd(result.project) || '',
+        live: liveFiles.has(result.filePath), owner: shared ? null : owners.get(result.filePath) ?? null, shared,
+      };
+    });
+    json(res, 200, { results });
+  } catch (error) { json(res, 500, { error: errorMessage(error) }); }
 }
 
 function canonicalFile(file: string) {

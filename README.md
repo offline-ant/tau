@@ -220,6 +220,8 @@ access.
 - Sidebar listing every project that has saved Pi JSONL sessions, collapsed by default
 - Expanding a project loads its sessions; `+` on a project header starts a new session there
 - Rename sessions, export to HTML
+- Search filters titles across all projects, including collapsed projects and older sessions. With two or more characters, it also searches saved message text and shows up to 30 matching sessions, each with the first snippet and a match count capped at three. Matches are literal and case-insensitive. Clearing the search restores the usual ten-row/show-all view; ordinary browsing still loads session lists only on demand (or for favourites).
+- Opening a search match uses the normal session controls: shared agents attach, terminal-owned sessions open read-only, and other sessions resume through the server's ownership checks.
 
 ### Mobile Support
 

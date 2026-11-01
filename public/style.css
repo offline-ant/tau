@@ -529,6 +529,26 @@ body {
   box-shadow: var(--shadow-inset);
 }
 
+.sidebar-search-input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+  background: var(--bg-glass);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 12px;
+  outline: none;
+  -webkit-app-region: no-drag;
+}
+.sidebar-search-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+  background: var(--bg-glass-hover);
+}
+.sidebar-search-input::placeholder { color: var(--text-dim); }
+
 .sidebar-actions {
   display: flex;
   gap: 2px;
@@ -3825,6 +3845,11 @@ code {
 
   .sidebar-header {
     padding: 16px 16px;
+  }
+
+  .sidebar-search-input {
+    font-size: 16px;
+    padding: 10px 12px;
   }
 
   .icon-btn,

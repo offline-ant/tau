@@ -30,8 +30,7 @@ export type SidebarProject = {
   lastActive: number;
 };
 
-type SearchResult = {
-  filePath: string;
+type SearchResult = Pick<SidebarSession, 'filePath' | 'file' | 'dir' | 'live' | 'owner' | 'shared'> & {
   project: string;
   sessionName?: string;
   sessionTimestamp?: string;
@@ -56,6 +55,7 @@ export class SessionSidebar {
   searchQuery: string;
   _searchTimer: ReturnType<typeof setTimeout> | null = null;
   _searchResults: SearchResult[] | null = null;
+  _searchRequest = 0;
   favourites: string[];
   contextMenu: HTMLElement | null;
 
@@ -101,7 +101,8 @@ export class SessionSidebar {
       this.projects = data.projects || [];
       this.sessionsByDir.clear();
       this.render();
-      await this.loadFavouriteProjects();
+      if (this.searchQuery) await Promise.all(this.projects.map(project => this.loadSessions(project.dirName)));
+      else await this.loadFavouriteProjects();
     } catch (error) {
       console.error('[Sidebar] Failed to load projects:', error);
       this.container.innerHTML = '<div class="session-loading">Failed to load sessions</div>';
@@ -184,9 +185,11 @@ export class SessionSidebar {
   setSearchQuery(query: string) {
     const wasSearching = !!this.searchQuery;
     this.searchQuery = query.toLowerCase().trim();
+    ++this._searchRequest;
+    this._searchResults = null;
+    this.renderSearchResults();
 
-    // Clear pending full-text search
-    if (this._searchTimer) clearTimeout(this._searchTimer);
+    this.scheduleMessageSearch();
 
     // Searching shows every session of every project, so the rows are rebuilt
     // whenever the search starts or ends.
@@ -204,10 +207,16 @@ export class SessionSidebar {
     for (const project of this.projects) void this.loadSessions(project.dirName);
     if (searchingChanged) this.render();
     else this.applySearch();
+  }
 
-    // Debounced: full-text search (300ms)
+  scheduleMessageSearch() {
+    if (this._searchTimer) clearTimeout(this._searchTimer);
+    this._searchTimer = null;
     if (this.searchQuery.length >= 2) {
-      this._searchTimer = setTimeout(() => this.fullTextSearch(this.searchQuery), 300);
+      this._searchTimer = setTimeout(() => {
+        this._searchTimer = null;
+        void this.fullTextSearch(this.searchQuery);
+      }, 300);
     }
   }
 
@@ -215,15 +224,18 @@ export class SessionSidebar {
     // Don't search if query changed since debounce
     if (query !== this.searchQuery) return;
 
+    const request = ++this._searchRequest;
     try {
       const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
       const data = await res.json();
-      if (query !== this.searchQuery) return; // stale
-
+      if (request !== this._searchRequest || query !== this.searchQuery) return;
+      if (!res.ok) throw new Error(data.error || 'Could not search session messages');
       this._searchResults = data.results || [];
       this.renderSearchResults();
     } catch (err) {
-      console.error('[Sidebar] Search failed:', err);
+      if (request === this._searchRequest && query === this.searchQuery) {
+        this.onError(err instanceof Error ? err.message : 'Could not search session messages');
+      }
     }
   }
 
@@ -253,6 +265,13 @@ export class SessionSidebar {
         item.classList.add('active');
       }
 
+      // Server-supplied identifiers also work before the lazy title list arrives.
+      const sessionForResult = (): SidebarSession => ({
+        ...this.sessionsByDir.get(result.dir)?.find(session => session.filePath === result.filePath),
+        filePath: result.filePath, file: result.file, dir: result.dir,
+        name: result.sessionName, firstMessage: result.firstMessage,
+        timestamp: result.sessionTimestamp, live: result.live, owner: result.owner, shared: result.shared,
+      });
       const title = result.sessionName || result.firstMessage || 'Untitled';
       const snippet = result.matches[0]?.snippet || '';
       const matchCount = result.matches.length;
@@ -266,22 +285,10 @@ export class SessionSidebar {
         <div class="session-meta">${time}${matchCount > 1 ? ` · ${matchCount} matches` : ''}</div>
       `;
 
-      // Find the matching project/session to pass to onSessionSelect
-      item.addEventListener('click', () => {
-        for (const project of this.projects) {
-          const session = this.sessionsByDir.get(project.dirName)?.find(s => s.filePath === result.filePath);
-          if (session) {
-            this.onSessionSelect(session);
-            return;
-          }
-        }
-        // Full-text results can arrive before this lazy project's title list.
-        const parts = result.filePath.split('/');
-        this.onSessionSelect({
-          filePath: result.filePath, file: parts.at(-1)!, dir: parts.at(-2)!,
-          name: result.sessionName, firstMessage: result.firstMessage,
-          timestamp: result.sessionTimestamp,
-        });
+      item.addEventListener('click', () => this.onSessionSelect(sessionForResult()));
+      item.addEventListener('contextmenu', event => {
+        const project = this.projects.find(project => project.dirName === result.dir);
+        if (project) this.showContextMenu(event, sessionForResult(), project, item);
       });
 
       sessionsDiv.appendChild(item);
@@ -290,13 +297,18 @@ export class SessionSidebar {
     group.appendChild(sessionsDiv);
     // Insert at top of container
     this.container.insertBefore(group, this.container.firstChild);
+    this.onRendered?.();
   }
 
   highlightMatch(text: string, query: string) {
     if (!query) return this.escapeHtml(text);
-    const escaped = this.escapeHtml(text);
-    const re = new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
-    return escaped.replace(re, '<mark>$1</mark>');
+    const re = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+    let html = '', cursor = 0;
+    for (const match of text.matchAll(re)) {
+      html += this.escapeHtml(text.slice(cursor, match.index)) + `<mark>${this.escapeHtml(match[0])}</mark>`;
+      cursor = match.index + match[0].length;
+    }
+    return html + this.escapeHtml(text.slice(cursor));
   }
 
   applySearch() {
@@ -377,8 +389,14 @@ export class SessionSidebar {
 
   /** Shows a new name for the open session in every row that lists it. */
   setActiveSessionName(name: string) {
-    const filePath = this.activeSessionFile;
-    if (!filePath) return;
+    if (this.activeSessionFile) this.setSessionName(this.activeSessionFile, name);
+  }
+
+  setSessionName(filePath: string, name: string) {
+    ++this._searchRequest;
+    for (const result of this._searchResults || []) {
+      if (result.filePath === filePath) result.sessionName = name;
+    }
     for (const project of this.projects) {
       for (const session of this.sessionsByDir.get(project.dirName) || []) {
         if (session.filePath === filePath) session.name = name;
@@ -391,6 +409,8 @@ export class SessionSidebar {
       title.textContent = name;
       title.setAttribute('title', name);
     });
+    this.applySearch();
+    this.scheduleMessageSearch();
   }
 
   // ═══════════════════════════════════════
@@ -467,6 +487,7 @@ export class SessionSidebar {
           })).json();
           if (data.success === false) throw new Error(data.error || 'Could not rename the session');
           session.name = name;
+          this.setSessionName(session.filePath, name);
         } catch (error) {
           this.onError(error instanceof Error ? error.message : 'Could not rename the session');
           name = currentName;
@@ -500,6 +521,8 @@ export class SessionSidebar {
         this.onError(data?.error || 'Could not delete the session');
         return;
       }
+      ++this._searchRequest;
+      this.scheduleMessageSearch();
       this._searchResults = this._searchResults?.filter(result => result.filePath !== session.filePath) ?? null;
       const sessions = this.sessionsByDir.get(project.dirName);
       if (sessions) this.sessionsByDir.set(project.dirName, sessions.filter(s => s.filePath !== session.filePath));

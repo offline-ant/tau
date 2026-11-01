@@ -156,6 +156,7 @@ const sidebarToggle = document.getElementById('sidebar-toggle')!;
 const sidebarOverlay = document.getElementById('sidebar-overlay')!;
 
 const refreshSessionsBtn = document.getElementById('refresh-sessions-btn')!;
+const sessionSearchInput = document.getElementById('session-search-input') as HTMLInputElement;
 const typingIndicator = document.getElementById('typing-indicator')!;
 
 const contextPillEl = document.getElementById('context-pill')!;
@@ -2417,6 +2418,10 @@ refreshSessionsBtn.addEventListener('click', () => {
     }
   }, { passive: true });
 })();
+
+sessionSearchInput.addEventListener('input', () => {
+  sidebar.setSearchQuery(sessionSearchInput.value);
+});
 
 async function newSession() {
   sessionTotalCost = 0;
