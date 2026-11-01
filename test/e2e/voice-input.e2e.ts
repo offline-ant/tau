@@ -51,7 +51,7 @@ server.on('upgrade', (request, socket, head) => {
   if (request.url === '/ws/voice') {
     voiceWss.handleUpgrade(request, socket, head, ws => {
       sockets.add(ws);
-      handleVoiceSocket(ws, (events: TranscriberEvents) => {
+      handleVoiceSocket(ws, async (events: TranscriberEvents) => {
         const recording: Recording = { bytes: 0, finished: false, closed: false, events };
         recordings.push(recording);
         return {
