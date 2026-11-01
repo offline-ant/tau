@@ -106,7 +106,7 @@ function assertReadOnly() {
   assert.deepEqual(submitted, []);
 }
 
-test('initial encoded link beats saved tab, preserves draft, and never submits work', async () => {
+test('initial encoded link beats saved tab, quarantines the previous draft, and never submits work', async () => {
   const id = 'linked/plus+and&';
   live = [session('one'), session(id)];
   const view = await open(`#session=${encodeURIComponent(id)}`);
@@ -115,7 +115,9 @@ test('initial encoded link beats saved tab, preserves draft, and never submits w
     await view.page.fill('#message-input', 'human draft');
     await view.page.evaluate(() => { location.hash = '#session=one'; });
     await active(view.page, 'one');
-    assert.equal(await view.page.inputValue('#message-input'), 'human draft');
+    assert.equal(await view.page.inputValue('#message-input'), '');
+    assert.match(await view.page.locator('#recovered-input').innerText(), /human draft/);
+    assert.match(await view.page.locator('#recovered-input').innerText(), /linked\/plus\+and&/);
     assertReadOnly();
     assert.deepEqual(view.errors, []);
   } finally { await view.close(); }

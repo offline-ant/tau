@@ -164,7 +164,7 @@ test('interleaved steps keep chronology and out-of-order tool results across com
 });
 
 test('nested records stay with their own parent without adding history items', () => {
-  const first = { complete: true, calls: [{ id: 'a/1', name: 'read', arguments: { path: '/a' }, status: 'ok', durationMs: 12 }] };
+  const first: NonNullable<AppMessage['nestedCalls']> = { complete: true, calls: [{ id: 'a/1', name: 'read', arguments: { path: '/a' }, status: 'ok', durationMs: 12 }] };
   const second = { complete: false, calls: [] };
   const { items } = buildHistoryItems([
     msg({ role: 'assistant', content: [

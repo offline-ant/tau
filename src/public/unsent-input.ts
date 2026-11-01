@@ -1,61 +1,60 @@
-/**
- * What the user wrote for a shared agent that did not reach it.
- *
- * A shared agent outlives its Tau tab: the connection to it, or to Tau itself,
- * can end while it keeps running, and a tab id does not survive that. Input is
- * therefore kept under the agent's pimux id until a tab on that agent opens.
- * It goes back into the composer, never to Pi by itself: the user decides
- * whether it still applies, and a prompt that did arrive before the connection
- * ended is not sent twice.
- */
+/** Input kept for review, never replayed, under its original agent, file and leaf. */
+import type { PendingFilePath, PendingImage } from './app-types.js';
 
-import type { PendingImage } from './app-types.js';
+export type InputContext = { agentId: string | null; file: string | null; leafId: string | null | undefined };
+export type UnsentInput = { text: string; images: PendingImage[]; files?: PendingFilePath[] };
+export type KeptInput = { context: InputContext; input: UnsentInput };
 
-export type UnsentInput = { text: string; images: PendingImage[] };
+export function contextKey(context: InputContext): string {
+  return JSON.stringify([context.agentId, context.file, context.leafId === undefined ? [] : [context.leafId]]);
+}
+
+export function sameContext(left: InputContext | null, right: InputContext | null): boolean {
+  return left === right || !!left && !!right && contextKey(left) === contextKey(right);
+}
 
 export class UnsentInputStore {
-  private kept = new Map<string, UnsentInput>();
-  private inFlight = new Map<string, { muxId: string; input: UnsentInput }>();
+  private kept = new Map<string, KeptInput>();
+  private inFlight = new Map<string, { context: InputContext; input: UnsentInput }>();
 
-  /** A prompt was handed to the WebSocket; it counts as sent once Tau acknowledges `id`. */
-  track(id: string, muxId: string, input: UnsentInput) {
-    this.inFlight.set(id, { muxId, input });
+  /** Receipt loss is not rejection: preserved text always needs explicit review. */
+  track(id: string, context: InputContext, input: UnsentInput) {
+    this.inFlight.set(id, { context: { ...context }, input });
   }
 
-  /** Tau answered prompt `id`. Returns whether it was tracked and failed, so its input is kept again. */
   settle(id: string, delivered: boolean): boolean {
     const prompt = this.inFlight.get(id);
     if (!prompt) return false;
     this.inFlight.delete(id);
-    if (!delivered) this.keep(prompt.muxId, prompt.input);
+    if (!delivered) this.keep(prompt.context, prompt.input);
     return !delivered;
   }
 
-  /** The connection carrying these prompts ended, so no acknowledgement can arrive: all of them, or one agent's. */
-  keepInFlight(muxId?: string) {
+  keepInFlight(context?: InputContext) {
     for (const [id, prompt] of this.inFlight) {
-      if (muxId !== undefined && prompt.muxId !== muxId) continue;
+      if (context && !sameContext(context, prompt.context)) continue;
       this.inFlight.delete(id);
-      this.keep(prompt.muxId, prompt.input);
+      this.keep(prompt.context, prompt.input);
     }
   }
 
-  keep(muxId: string, input: UnsentInput) {
-    const kept = this.kept.get(muxId);
-    this.kept.set(muxId, kept
-      ? { text: [kept.text, input.text].filter(Boolean).join('\n\n'), images: [...kept.images, ...input.images] }
-      : input);
+  keep(context: InputContext, input: UnsentInput) {
+    if (!input.text && !input.images.length && !input.files?.length) return;
+    const key = contextKey(context), kept = this.kept.get(key)?.input;
+    this.kept.set(key, { context: { ...context }, input: kept
+      ? { text: [kept.text, input.text].filter(Boolean).join('\n\n'), images: [...kept.images, ...input.images],
+        ...((kept.files?.length || input.files?.length) ? { files: [...kept.files || [], ...input.files || []] } : {}) }
+      : { ...input, images: [...input.images], ...(input.files ? { files: [...input.files] } : {}) } });
   }
 
-  take(muxId: string): UnsentInput | null {
-    const input = this.kept.get(muxId) ?? null;
-    this.kept.delete(muxId);
+  entries(): KeptInput[] {
+    return [...this.kept.values()].map(({ context, input }) => ({ context: { ...context }, input }));
+  }
+
+  /** The caller has explicitly chosen this original context for reuse or discard. */
+  take(context: InputContext): UnsentInput | null {
+    const key = contextKey(context), input = this.kept.get(key)?.input ?? null;
+    this.kept.delete(key);
     return input;
-  }
-
-  /** The user detached on purpose; nothing is coming back for this agent. */
-  forget(muxId: string) {
-    this.kept.delete(muxId);
-    for (const [id, prompt] of this.inFlight) if (prompt.muxId === muxId) this.inFlight.delete(id);
   }
 }

@@ -4,9 +4,10 @@ type LauncherPanelOptions = {
   launcherEl: HTMLElement;
   messagesContainer: HTMLElement;
   createSession(projectPath: string): Promise<void>;
+  selectView(kind: 'launcher' | 'chat'): void;
 };
 
-export function setupLauncherPanel({ launcherEl, messagesContainer, createSession }: LauncherPanelOptions) {
+export function setupLauncherPanel({ launcherEl, messagesContainer, createSession, selectView }: LauncherPanelOptions) {
   const launcher = new Launcher(launcherEl, createSession);
 
   async function init() {
@@ -38,6 +39,7 @@ export function setupLauncherPanel({ launcherEl, messagesContainer, createSessio
   }
 
   function show() {
+    selectView('launcher');
     launcherEl.classList.remove('hidden');
     messagesContainer.style.display = 'none';
     const inputArea = document.querySelector<HTMLElement>('.input-area');
@@ -61,6 +63,7 @@ export function setupLauncherPanel({ launcherEl, messagesContainer, createSessio
   }
 
   document.querySelector('.mode-link:first-child')?.addEventListener('click', () => {
+    selectView('chat');
     hide();
   });
 

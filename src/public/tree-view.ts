@@ -49,7 +49,8 @@ type FlatRow = { node: TreeNode; depth: number };
 type TreeViewOptions = {
   getActiveLiveSessionId(): string | null;
   isStreaming(): boolean;
-  setComposerText(text: string): void;
+  getViewSelection(): number;
+  captureComposerText(): (text: string) => void;
   flashStatusError(message: string, ms?: number): void;
 };
 
@@ -129,7 +130,7 @@ export function describeEntry(entry: TreeEntry): { kind: string; text: string } 
 }
 
 export function setupTreeView(options: TreeViewOptions) {
-  const { getActiveLiveSessionId, isStreaming, setComposerText, flashStatusError } = options;
+  const { getActiveLiveSessionId, isStreaming, getViewSelection, captureComposerText, flashStatusError } = options;
 
   // Static index.html shell elements — assert non-null at the query site,
   // matching the other setup modules.
@@ -328,6 +329,8 @@ export function setupTreeView(options: TreeViewOptions) {
       setMessage('Select a live Tau tab first.', true);
       return;
     }
+    const selection = getViewSelection();
+    const keepComposerText = captureComposerText();
     navigating = true;
     setMessage('Jumping…', false);
     try {
@@ -339,16 +342,15 @@ export function setupTreeView(options: TreeViewOptions) {
       const data = await resp.json();
       if (data?.success) {
         const editorText = data.data?.editorText;
-        close();
-        // The conversation re-renders when the server broadcasts a fresh
-        // snapshot; we only need to hand the message text to the composer.
-        if (typeof editorText === 'string') setComposerText(editorText);
-      } else {
+        if (typeof editorText === 'string') keepComposerText(editorText);
+        if (selection === getViewSelection() && openSessionId === sessionId) close();
+      } else if (selection === getViewSelection() && openSessionId === sessionId) {
         const error = data?.error || 'Failed to navigate the session tree';
         setMessage(error, true);
         flashStatusError(error);
       }
     } catch {
+      if (selection !== getViewSelection() || openSessionId !== sessionId) return;
       const error = 'Failed to navigate the session tree';
       setMessage(error, true);
       flashStatusError(error);

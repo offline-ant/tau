@@ -23,13 +23,14 @@ import { setupSessionStatsCard, type SessionStats } from './session-stats-card.j
 import { isImeComposition } from './keyboard.js';
 import { buildHistoryItems, messageImages, type HistoryItem, type SessionHistoryEntry } from './history-render.js';
 import { setupAgentsPanel, type OverviewAgent } from './agents-panel.js';
-import { UnsentInputStore, type UnsentInput } from './unsent-input.js';
+import { UnsentInputStore, sameContext, type InputContext, type UnsentInput } from './unsent-input.js';
 
 import type { AppEvent, AppMessage, AssistantStep, ExtensionUIRequest, InteractionState, LiveInstance, LiveSession, MessageContentBlock, ModelRecord, PendingDialog, PendingFilePath, PendingImage, QueuedCommand, RpcCommand, UsageRecord } from './app-types.js';
 
 type LiveSessionSnapshotData = {
   sessionId?: string;
   sessionFile?: string | null;
+  leafId?: string | null;
   session?: LiveSession;
   isStreaming?: boolean;
   model?: ModelRecord | null;
@@ -166,7 +167,17 @@ const messagesContainer = document.getElementById('messages')!;
 const launcherPanel = setupLauncherPanel({
   launcherEl: document.getElementById('launcher')!,
   messagesContainer,
+  selectView(kind) {
+    beginViewSelection();
+    bindComposerContext(null);
+    if (kind === 'chat') restoreActiveLiveSession();
+    else {
+      viewingActiveSession = false;
+      updateLiveSessionInputState();
+    }
+  },
   async createSession(projectPath) {
+    const selection = beginViewSelection();
     try {
       const res = await fetch('/api/live-sessions', {
         method: 'POST',
@@ -175,8 +186,8 @@ const launcherPanel = setupLauncherPanel({
       });
       const data = await res.json();
       if (data.session) {
-        upsertLiveSession(data.session);
-        await selectLiveSession(data.session.id);
+        rememberOpenedSession(data.session, selection);
+        if (selection === viewSelection) await selectLiveSession(data.session.id, true, selection);
       }
     } catch (e) {
       console.error('[Launcher] Failed to create Tau tab:', e);
@@ -209,6 +220,14 @@ let voiceInput: VoiceInput | null = null;
 let takeRequest: { id: string; sessionId: string } | null = null;
 let hasRestoredInitialLiveSession = false;
 const sessionLink = new SessionLink(location.hash);
+// Every explicit choice, even A -> B -> A, retires the previous view's reads.
+let viewSelection = 0;
+function beginViewSelection(explicit = true) {
+  ++viewSelection;
+  if (explicit) reattachMuxId = null;
+  stopFollowing();
+  return viewSelection;
+}
 // A URL selects a view, not permission to submit that tab's queued input.
 let resumeQueuedInput = true;
 let pendingExtensionUIRequests: ExtensionUIRequest[] = []; // background notifications only
@@ -237,6 +256,7 @@ const DIALOG_METHODS = new Set(['select', 'confirm', 'input', 'editor']);
 /** Extension UI for a terminal's chrome; Tau has no place for it, and it asks nothing of the user. */
 const DISPLAY_UI_METHODS = new Set(['setStatus', 'setWidget', 'setTitle', 'set_editor_text']);
 let reattachMuxId: string | null = null; // The shared agent on screen when Tau went away
+const editorNoticeIds = new Map<string, number>();
 const piQueues = new Map<string, { steering: string[]; followUp: string[] }>(); // Prompts Pi holds, by Tau tab
 const sidebarFiles = new Set<string>(); // Session files whose first turn the sidebar has been refreshed for
 let sidebarRefreshTimer: ReturnType<typeof setTimeout> | null = null;
@@ -421,10 +441,27 @@ wsClient.addEventListener('rpcEvent', (e: Event) => {
   const detail = (e as CustomEvent<RpcEventDetail>).detail || {};
   const event = (detail.event || detail) as AppEvent;
   const sessionId = detail.sessionId;
+  if (sessionId && event.type === 'pimux_editor_text' && typeof event.text === 'string') {
+    const session = liveSessions.find(session => session.id === sessionId);
+    if (!session) return;
+    const context = inputContexts.get(sessionId) || inputContextOf(session);
+    const agentId = session.attached?.muxId || session.id;
+    const noticeId = typeof event.noticeId === 'number' ? event.noticeId : undefined;
+    if (noticeId !== undefined && noticeId <= (editorNoticeIds.get(agentId) || 0)) return;
+    if (noticeId !== undefined) editorNoticeIds.set(agentId, noticeId);
+    unsentInput.keep({ agentId: context.agentId, file: typeof event.sessionFile === 'string' ? event.sessionFile : null, leafId: undefined }, { text: event.text, images: [] });
+    restoreUnsentInput();
+    return;
+  }
   // pimux closes a shared dialog however it ended, in every browser.
   if (sessionId && event.type === 'pimux_dialog_closed') {
     closeSharedDialog(sessionId, String(event.id));
     return;
+  }
+  if (sessionId && event.type === 'shared_queue_cleared') {
+    piQueues.set(sessionId, { steering: [], followUp: [] });
+    if (sessionId === activeLiveSessionId) renderQueuedMessages();
+    return; // The broadcast never returns the requester's recovered text to other clients.
   }
   if (sessionId && event.type === 'pimux_session_changed' && sessionId === activeLiveSessionId && viewingActiveSession) {
     setStatusMessage('The shared session moved to another conversation', 4000);
@@ -582,16 +619,9 @@ wsClient.addEventListener('liveSessionUpdated', (e: Event) => {
 wsClient.addEventListener('liveSessionClosed', (e: Event) => {
   const detail = (e as CustomEvent<{ sessionId: string; reason?: string; message?: string; notice?: boolean }>).detail;
   const session = liveSessions.find(s => s.id === detail.sessionId);
-  const muxId = session?.attached?.muxId;
-  if (session && muxId) {
-    // Closing tabs selects the next one, so only the first of a shutdown is the one on screen.
-    if (detail.reason === 'server_shutdown' && session.id === activeLiveSessionId) reattachMuxId ??= muxId;
-    if (detail.reason === 'pimux_disconnected' || detail.reason === 'server_shutdown') keepUnsentInput(session);
-    else if (detail.reason?.startsWith('pimux_exit')) {
-      // That agent is gone: what was on its way stays readable in the composer.
-      keepUnsentInput(session);
-      putInComposer(unsentInput.take(muxId));
-    } else unsentInput.forget(muxId);
+  if (session) {
+    if (detail.reason === 'server_shutdown' && session.id === activeLiveSessionId) reattachMuxId ??= session.attached?.muxId || null;
+    keepUnsentInput(session);
   }
   handleLiveSessionClosed(detail.sessionId, detail.message, detail.notice);
   scheduleSidebarRefresh();
@@ -616,6 +646,12 @@ wsClient.addEventListener('interactionState', (e: Event) => {
 // A shared tab's snapshots also carry its open dialogs, which apply to any tab.
 wsClient.addEventListener('liveSessionSnapshot', (e: Event) => {
   const snapshot = (e as CustomEvent<LiveSessionSnapshotData>).detail;
+  if (snapshot.sessionId && snapshot.session) {
+    const previous = contextGenerations.get(snapshot.sessionId);
+    if (snapshot.generation !== undefined && previous !== undefined && snapshot.generation <= previous) return;
+    if (snapshot.generation !== undefined) contextGenerations.set(snapshot.sessionId, snapshot.generation);
+    upsertLiveSession(snapshot.session);
+  }
   if (snapshot.sessionId && Array.isArray(snapshot.dialogs)) reconcileSharedDialogs(snapshot.sessionId, snapshot.dialogs, snapshot.generation);
   if (!viewingActiveSession || snapshot.sessionId !== activeLiveSessionId) return;
   const rendered = appliedGenerations.get(snapshot.sessionId);
@@ -632,6 +668,7 @@ wsClient.addEventListener('liveSessionSnapshot', (e: Event) => {
  * that is not newer would erase that replay.
  */
 const appliedGenerations = new Map<string, number>();
+const contextGenerations = new Map<string, number>();
 
 /** A shared tab's open dialogs at a pimux boundary replace those this browser holds for it. */
 function reconcileSharedDialogs(sessionId: string, dialogs: AppEvent[], generation?: number) {
@@ -712,6 +749,7 @@ const newLiveSessionProjects = document.getElementById('new-live-session-project
 const newLiveSessionSubmit = document.getElementById('new-live-session-submit')!;
 
 function setLiveSessions(sessions: LiveSession[]) {
+  for (const session of sessions) observeInputContext(session);
   liveSessions = sessions || [];
   liveInstances = liveSessions.map(s => ({ sessionFile: s.sessionFile, cwd: s.cwd, port: location.port }));
   renderLiveTabs();
@@ -730,6 +768,8 @@ function clearActiveSessionHeader() {
 function handleLiveSessionClosed(closedId: string, message?: string, notice = false) {
   if (!closedId) return;
   appliedGenerations.delete(closedId);
+  contextGenerations.delete(closedId);
+  inputContexts.delete(closedId);
   sharedDialogs.delete(closedId);
   sharedDialogGenerations.delete(closedId);
   piQueues.delete(closedId);
@@ -748,6 +788,8 @@ function handleLiveSessionClosed(closedId: string, message?: string, notice = fa
   }
   renderQueuedMessages();
   if (activeLiveSessionId === closedId) {
+    beginViewSelection(false);
+    bindComposerContext(null);
     const wasViewingActive = viewingActiveSession;
     voiceInput?.cancel();
     activeLiveSessionId = null;
@@ -772,7 +814,7 @@ function handleLiveSessionClosed(closedId: string, message?: string, notice = fa
         clearActiveSessionHeader();
         updateLiveSessionInputState();
         updateUI();
-      } else if (next) selectLiveSession(next.id);
+      } else if (next) selectLiveSession(next.id, true, beginViewSelection(false));
       else {
         viewingActiveSession = false;
         messageRenderer.renderWelcome();
@@ -792,14 +834,17 @@ function handleLiveSessionClosed(closedId: string, message?: string, notice = fa
 
 function upsertLiveSession(session: LiveSession) {
   if (!session) return;
+  observeInputContext(session);
   sessionStateRevisions.set(session.id, (sessionStateRevisions.get(session.id) || 0) + 1);
   const idx = liveSessions.findIndex(s => s.id === session.id);
   let shouldRenderTabs = false;
   if (idx >= 0) {
     const before = liveTabSignature(liveSessions[idx]);
+    const movedCwd = session.cwd !== undefined && liveSessions[idx].cwd !== session.cwd;
     const movedFile = liveSessions[idx].sessionFile !== session.sessionFile;
     liveSessions[idx] = { ...liveSessions[idx], ...session };
     shouldRenderTabs = before !== liveTabSignature(liveSessions[idx]);
+    if (movedCwd && session.id === activeLiveSessionId && viewingActiveSession && !fileSidebar.classList.contains('collapsed')) void fileBrowser.load();
     if (movedFile) {
       if (session.id === activeLiveSessionId && viewingActiveSession) sidebar.setActive(session.sessionFile);
       scheduleSidebarRefresh();
@@ -811,6 +856,11 @@ function upsertLiveSession(session: LiveSession) {
   liveInstances = liveSessions.map(s => ({ sessionFile: s.sessionFile, cwd: s.cwd, port: location.port }));
   if (shouldRenderTabs) renderLiveTabs();
   updateLiveSessionIndicators();
+}
+
+/** A late open can add a background tab, but cannot roll back a tab already known here. */
+function rememberOpenedSession(session: LiveSession, selection: number) {
+  if (selection === viewSelection || !liveSessions.some(current => current.id === session.id)) upsertLiveSession(session);
 }
 
 function getMostRecentLiveSession() {
@@ -872,7 +922,7 @@ function renderLiveTabs() {
         ${pendingInteractionCount(session.id) ? `<span class="live-tab-ui-dot" title="Waiting for approval" aria-label="${pendingInteractionCount(session.id)} pending approvals">${pendingInteractionCount(session.id)}</span>` : ''}
         <span class="live-tab-title">${escapeHtml(liveTabTitle(session))}</span>
         <span class="live-tab-model">${escapeHtml(compactModelLabel(session))}</span>
-        <span class="live-tab-close" title="${session.attached ? 'Detach (the agent keeps running)' : 'Close Tau tab'}">×</span>
+        <span class="live-tab-close" title="Disconnect tab (the agent keeps running)">×</span>
       `;
       tab.querySelector('.live-tab-close')?.addEventListener('click', (ev) => {
         ev.stopPropagation();
@@ -891,7 +941,7 @@ function restoreActiveLiveSession() {
   const saved = activeLiveSessionId && liveSessions.find(s => s.id === activeLiveSessionId);
   const next = saved || getMostRecentLiveSession();
   if (next) {
-    selectLiveSession(next.id, resumeQueuedInput);
+    selectLiveSession(next.id, resumeQueuedInput, beginViewSelection(false));
   } else {
     activeLiveSessionId = null;
     viewingActiveSession = false;
@@ -915,13 +965,15 @@ function scheduleSidebarRefresh() {
   }, 400);
 }
 
-async function selectLiveSession(id: string, resumeQueue = true) {
+async function selectLiveSession(id: string, resumeQueue = true, selection = beginViewSelection()) {
+  if (selection !== viewSelection) return;
   sessionLink.cancel();
   voiceInput?.cancel();
   const session = liveSessions.find(s => s.id === id);
   if (!session) return;
   resumeQueuedInput = resumeQueue;
   suspendCurrentDialogForTabSwitch(id);
+  treeViewController.closeIfOpen();
   stopFollowing();
   launcherPanel.hide();
   activeLiveSessionId = id;
@@ -945,7 +997,7 @@ async function selectLiveSession(id: string, resumeQueue = true) {
   try {
     const res = await fetch(`/api/live-sessions/${encodeURIComponent(id)}/snapshot`);
     const data = await res.json();
-    if (id !== activeLiveSessionId || !viewingActiveSession) return;
+    if (selection !== viewSelection || id !== activeLiveSessionId || !viewingActiveSession) return;
     if (!res.ok || data.error) {
       // A shared tab whose snapshot failed is still attached; only a missing tab is gone.
       if (res.status === 404) handleLiveSessionClosed(id);
@@ -957,7 +1009,7 @@ async function selectLiveSession(id: string, resumeQueue = true) {
       if (typeof data.generation === 'number') appliedGenerations.set(id, data.generation);
     }
   } catch (e) {
-    if (id !== activeLiveSessionId || !viewingActiveSession) return;
+    if (selection !== viewSelection || id !== activeLiveSessionId || !viewingActiveSession) return;
     messageRenderer.renderError((e instanceof Error ? e.message : '') || 'Failed to load live session snapshot');
     return;
   }
@@ -969,6 +1021,8 @@ async function selectLiveSession(id: string, resumeQueue = true) {
 
 function applyActiveSessionMetadata(session: LiveSession) {
   if (!session) return;
+  observeInputContext(session);
+  bindComposerContext(inputContextOf(session));
   activeLiveSessionFile = session.sessionFile || null;
   sidebar.setActive(activeLiveSessionFile);
   // Server is canonical: session.model is always null or a full {provider,id}
@@ -979,23 +1033,73 @@ function applyActiveSessionMetadata(session: LiveSession) {
 async function closeLiveSession(id: string) {
   const session = liveSessions.find(s => s.id === id);
   if (!session) return;
-  const hasQueuedMessages = messageQueue.some(cmd => cmd.sessionId === id);
-  if (session.attached) {
-    // Detaching stops nothing: the agent keeps running where it was started.
-    if (hasQueuedMessages && !confirm('This shared tab has queued unsent messages. Detach and discard them?')) return;
-  } else if (session.isStreaming || hasQueuedMessages) {
-    const reason = session.isStreaming && hasQueuedMessages
-      ? 'This Tau tab is streaming and has queued unsent messages. Close it, terminate the Pi session, and discard the queue?'
-      : session.isStreaming
-        ? 'This Tau tab is streaming. Close it and terminate the Pi session?'
-        : 'This Tau tab has queued unsent messages. Close it and discard them?';
-    if (!confirm(reason)) return;
-  }
+  const selection = viewSelection;
   try {
-    await fetch(`/api/live-sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
-  } catch (e) {
-    messageRenderer.renderError('Failed to close Tau tab');
+    const response = await fetch(`/api/live-sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    if (!response.ok && response.status !== 404) throw new Error('Could not disconnect the tab');
+    keepUnsentInput(session);
+    handleLiveSessionClosed(id);
+  } catch {
+    if (selection === viewSelection) flashStatusError('Failed to disconnect the tab. The agent was not stopped.');
   }
+}
+
+const stopRequests = new Set<string>();
+async function stopAgentEverywhere() {
+  const session = liveSessions.find(s => s.id === activeLiveSessionId);
+  if (!viewingActiveSession || !session || stopRequests.has(session.id)) return;
+  if (!confirm('Stop agent everywhere? This ends its running work and disconnects every frontend, including when the agent is idle. Closing a tab only disconnects; it does not stop the agent.')) return;
+  const selection = viewSelection;
+  stopRequests.add(session.id);
+  try {
+    const response = await fetch(`/api/live-sessions/${encodeURIComponent(session.id)}/stop`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: true, operationId: crypto.randomUUID() }),
+    });
+    const data = await response.json();
+    if (!response.ok || data.error || data.receipt?.state !== 'stopped') throw new Error(data.error || 'The global stop was not confirmed');
+    if (selection === viewSelection) setStatusMessage('The global stop was confirmed', 5000);
+  } catch (error) {
+    if (selection === viewSelection) flashStatusError(error instanceof Error ? error.message : 'The global stop was not confirmed', 8000);
+  } finally {
+    stopRequests.delete(session.id);
+  }
+}
+
+const queueClearRequests = new Map<string, Promise<boolean>>();
+function clearSharedQueue(sessionId = activeLiveSessionId, confirmed = false): Promise<boolean> {
+  const session = liveSessions.find(s => s.id === sessionId);
+  if (!session || !sessionId) return Promise.resolve(false);
+  const existing = queueClearRequests.get(sessionId);
+  if (existing) return existing;
+  if (!confirmed && !confirm('Remove ALL queued steering and follow-up input from EVERY frontend of this agent? Only this browser receives the returned text for review. It is not resent, and images are not returned.')) return Promise.resolve(false);
+  const context = inputContexts.get(sessionId) || inputContextOf(session);
+  const selection = viewSelection;
+  const request = (async () => {
+    try {
+      const response = await fetch('/api/rpc', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'clear_queue', id: crypto.randomUUID(), sessionId, confirmGlobal: true }),
+      });
+      const data = await response.json();
+      if (!response.ok || data.success !== true) throw new Error(data.error || 'Queue clearing was not confirmed');
+      const origin: InputContext = { ...context,
+        ...(data.recoveryContext?.file !== undefined ? { file: data.recoveryContext.file } : {}),
+        ...(data.recoveryContext?.leafId !== undefined ? { leafId: data.recoveryContext.leafId } : {}) };
+      const returned = [...(Array.isArray(data.data?.steering) ? data.data.steering : []),
+        ...(Array.isArray(data.data?.followUp) ? data.data.followUp : [])].filter((text): text is string => typeof text === 'string');
+      if (returned.length) unsentInput.keep(origin, { text: returned.join('\n\n'), images: [] });
+      restoreUnsentInput();
+      return true;
+    } catch (error) {
+      if (selection === viewSelection) flashStatusError(`${error instanceof Error ? error.message : 'Queue clearing was not confirmed'}. Queued input may still run; nothing was resent.`, 8000);
+      return false;
+    } finally {
+      queueClearRequests.delete(sessionId);
+    }
+  })();
+  queueClearRequests.set(sessionId, request);
+  return request;
 }
 
 async function loadProjectChips() {
@@ -1056,6 +1160,7 @@ function openNewLiveSessionModal(cwd?: string) {
   newLiveSessionOverlay?.classList.remove('hidden');
   newLiveSessionModal?.classList.remove('hidden');
   newLiveSessionSubmit.disabled = false;
+  newLiveSessionSubmit.textContent = 'Create tab';
   if (cwd) newLiveSessionCwd.value = cwd;
   else if (!newLiveSessionCwd.value) newLiveSessionCwd.value = liveSessions.find(s => s.id === activeLiveSessionId)?.cwd || '';
   loadProjectChips();
@@ -1080,6 +1185,7 @@ newLiveSessionForm?.addEventListener('submit', async (e) => {
   if (!cwd) return;
   newLiveSessionSubmit.disabled = true;
   newLiveSessionSubmit.textContent = 'Starting…';
+  const selection = beginViewSelection();
   try {
     const res = await fetch('/api/live-sessions', {
       method: 'POST',
@@ -1088,16 +1194,19 @@ newLiveSessionForm?.addEventListener('submit', async (e) => {
     });
     const data = await res.json();
     if (!res.ok || data.error) throw new Error(data.error || 'Failed to create Tau tab');
-    upsertLiveSession(data.session);
+    rememberOpenedSession(data.session, selection);
+    if (selection !== viewSelection) return;
     closeNewLiveSessionModal();
     newLiveSessionModel.value = '';
     await selectLiveSession(data.session.id);
     focusComposer();
   } catch (err) {
-    messageRenderer.renderError((err instanceof Error ? err.message : '') || 'Failed to create Tau tab');
+    if (selection === viewSelection) messageRenderer.renderError((err instanceof Error ? err.message : '') || 'Failed to create Tau tab');
   } finally {
-    newLiveSessionSubmit.disabled = false;
-    newLiveSessionSubmit.textContent = 'Create tab';
+    if (selection === viewSelection) {
+      newLiveSessionSubmit.disabled = false;
+      newLiveSessionSubmit.textContent = 'Create tab';
+    }
   }
 });
 
@@ -1637,11 +1746,17 @@ function processImageFile(file: File): Promise<PendingImage> {
 }
 
 async function addAttachments(files: FileList | File[]) {
+  const context = composerContext ? { ...composerContext } : null;
+  const selection = viewSelection;
   const list = Array.from(files);            // snapshot before any await
   for (const file of list) {
     if (!file.type.startsWith('image/')) continue;
     try {
-      pendingImages.push(await processImageFile(file));
+      const image = await processImageFile(file);
+      if (context && (selection !== viewSelection || !sameContext(context, composerContext))) {
+        unsentInput.keep(context, { text: '', images: [image] });
+        restoreUnsentInput();
+      } else if (context) pendingImages.push(image);
     } catch (e) {
       console.error('[Tau] Image processing failed:', e);
     }
@@ -1758,46 +1873,111 @@ function renderAttachmentPreviews() {
 
 let messageQueue: QueuedCommand[] = [];
 const unsentInput = new UnsentInputStore();
+const inputContexts = new Map<string, InputContext>();
+let composerContext: InputContext | null = null;
+const recoveredInputEl = document.createElement('section');
+recoveredInputEl.id = 'recovered-input';
+recoveredInputEl.className = 'hidden';
+recoveredInputEl.setAttribute('aria-label', 'Input kept for review');
+document.querySelector('.input-area')!.prepend(recoveredInputEl);
+
+function inputContextOf(session: LiveSession): InputContext {
+  const previous = inputContexts.get(session.id);
+  const file = session.sessionFile ?? null;
+  return { agentId: session.attached?.muxId || session.id, file,
+    leafId: session.leafId !== undefined ? session.leafId : previous?.file === file ? previous.leafId : undefined };
+}
+
+function bindComposerContext(context: InputContext | null) {
+  if (sameContext(composerContext, context)) return;
+  // Browser-restored form text can precede the first authoritative identity.
+  const origin = composerContext || { agentId: null, file: null, leafId: undefined };
+  unsentInput.keep(origin, { text: messageInput.value, images: pendingImages, files: pendingFilePaths });
+  voiceInput?.cancel();
+  messageInput.value = '';
+  messageInput.style.height = 'auto';
+  pendingImages = [];
+  pendingFilePaths = [];
+  composerContext = context;
+  renderAttachmentPreviews();
+  restoreUnsentInput();
+}
+
+/** Metadata and exact snapshots, not a mux's lifetime, own the conversation identity. */
+function observeInputContext(session: LiveSession) {
+  const previous = inputContexts.get(session.id), next = inputContextOf(session);
+  if (previous && !sameContext(previous, next)) {
+    keepUnsentInput(session, previous);
+    if (session.id === activeLiveSessionId && viewingActiveSession) {
+      beginViewSelection(false);
+      treeViewController.closeIfOpen();
+      bindComposerContext(next);
+    }
+  }
+  inputContexts.set(session.id, next);
+}
 
 function putInComposer(input: UnsentInput | null) {
   if (!input) return;
   messageInput.value = [input.text, messageInput.value].filter(Boolean).join('\n\n');
   pendingImages.push(...input.images);
+  pendingFilePaths.push(...(input.files || []).map(file => ({ ...file, sessionId: activeLiveSessionId })));
+  messageInput.dispatchEvent(new Event('input'));
   renderAttachmentPreviews();
-  setStatusMessage('Your unsent message is back in the input', 4000);
 }
 
-/** The active shared tab's agent may have input waiting from a connection that ended. */
+/** Recovery is an explicit choice, even after reconnecting to the same agent. */
 function restoreUnsentInput() {
-  if (!viewingActiveSession) return;
-  const muxId = liveSessions.find(s => s.id === activeLiveSessionId)?.attached?.muxId;
-  if (muxId) putInComposer(unsentInput.take(muxId));
+  recoveredInputEl.innerHTML = '';
+  for (const { context, input } of unsentInput.entries()) {
+    const row = document.createElement('div');
+    row.className = 'queued-msg';
+    const origin = `${context.file || 'Unknown/new conversation'} · leaf ${context.leafId === undefined ? 'unknown' : context.leafId || 'root'} · ${context.agentId || 'unknown agent'}`;
+    row.title = `${origin}. Review before sending; delivery may have been uncertain.`;
+    const label = document.createElement('span');
+    label.className = 'queued-msg-label';
+    label.textContent = 'Kept for review; not resent';
+    const text = document.createElement('span');
+    text.className = 'queued-msg-text';
+    text.textContent = `${origin}: ${input.text || '(attachments)'}`;
+    const reuse = document.createElement('button');
+    reuse.type = 'button';
+    reuse.textContent = 'Reuse';
+    reuse.disabled = !viewingActiveSession || !composerContext;
+    reuse.addEventListener('click', () => {
+      if (!viewingActiveSession || !composerContext) return;
+      if (!sameContext(context, composerContext) && !confirm(`Reuse input from ${origin} in the currently selected conversation? Review it before sending.`)) return;
+      putInComposer(unsentInput.take(context));
+      restoreUnsentInput();
+      focusComposer();
+    });
+    const discard = document.createElement('button');
+    discard.type = 'button';
+    discard.textContent = 'Discard';
+    discard.addEventListener('click', () => { unsentInput.take(context); restoreUnsentInput(); });
+    row.append(label, text, reuse, discard);
+    recoveredInputEl.appendChild(row);
+  }
+  recoveredInputEl.classList.toggle('hidden', !recoveredInputEl.children.length);
 }
 
-/** A shared tab ended while its agent may run on: its draft belongs to that agent, not to the next tab shown. */
-function keepUnsentInput(session: LiveSession) {
-  const muxId = session.attached?.muxId;
-  if (!muxId) return;
-  unsentInput.keepInFlight(muxId);
-  // Instructions still held locally were never handed to Pi. Keep those too,
-  // under this agent rather than the next tab selected after disconnect.
+/** Disconnects and context replacements preserve local input without replay or retargeting. */
+function keepUnsentInput(session: LiveSession, context = inputContexts.get(session.id) || inputContextOf(session)) {
+  unsentInput.keepInFlight(context);
   for (const command of messageQueue.filter(command => command.sessionId === session.id)) {
-    unsentInput.keep(muxId, { text: command.message || '', images: command.images || [] });
+    unsentInput.keep(command.inputContext || context, { text: command.message || '', images: command.images || [] });
   }
   messageQueue = messageQueue.filter(command => command.sessionId !== session.id);
   const dispatch = queuedPrompts.get(session.id);
-  if (dispatch && !dispatch.accepted && !dispatch.started) {
-    // The HTTP acknowledgement may have been lost: restore for review only,
-    // just like socket input whose receipt disappeared. Never replay it.
-    unsentInput.keep(muxId, { text: dispatch.command.message || '', images: dispatch.command.images || [] });
+  if (dispatch) {
+    clearTimeout(dispatch.retryTimer);
+    if (!dispatch.accepted && !dispatch.started) {
+      unsentInput.keep(dispatch.command.inputContext || context, { text: dispatch.command.message || '', images: dispatch.command.images || [] });
+    }
+    queuedPrompts.delete(session.id);
   }
-  if (session.id !== activeLiveSessionId) return;
-  const text = messageInput.value.trim();
-  if (!text && !pendingImages.length) return;
-  unsentInput.keep(muxId, { text, images: pendingImages });
-  messageInput.value = '';
-  pendingImages = [];
-  renderAttachmentPreviews();
+  if (session.id === activeLiveSessionId && sameContext(composerContext, context)) bindComposerContext(null);
+  restoreUnsentInput();
 }
 
 function settlePrompt(id: string, delivered: boolean, error?: unknown) {
@@ -1807,12 +1987,21 @@ function settlePrompt(id: string, delivered: boolean, error?: unknown) {
 }
 
 function activeTabIsShared() {
-  return !!liveSessions.find(s => s.id === activeLiveSessionId)?.attached;
+  const session = liveSessions.find(s => s.id === activeLiveSessionId);
+  return !!(session?.shared || session?.attached);
+}
+
+function activeTabCanNavigate() {
+  return viewingActiveSession && !!liveSessions.find(s => s.id === activeLiveSessionId)?.capabilities?.navigateTree;
 }
 
 function sendMessage() {
   if (takeRequest?.sessionId === activeLiveSessionId) {
     flashStatusError('Finish taking the session before sending a message.');
+    return;
+  }
+  if (!viewingActiveSession || !activeLiveSessionId || !composerContext) {
+    flashStatusError('Select a live conversation before sending. Your input is still here.');
     return;
   }
   const message = messageInput.value.trim();
@@ -1830,7 +2019,7 @@ function sendMessage() {
 
   // Another frontend sharing this Pi can start a run at any moment; Pi then
   // needs to know how to queue the prompt. It ignores this when idle.
-  const cmd: QueuedCommand = { type: 'prompt', message: message || '(see attached image)', streamingBehavior: 'followUp' };
+  const cmd: QueuedCommand = { type: 'prompt', inputContext: { ...composerContext }, message: message || '(see attached image)', streamingBehavior: 'followUp' };
   const images = pendingImages;
 
   if (pendingImages.length > 0) {
@@ -1878,10 +2067,9 @@ function sendMessage() {
 
 /** Track only input actually handed to Tau, not a still-local queued draft. */
 function sendPrompt(command: QueuedCommand, input: UnsentInput) {
-  const muxId = liveSessions.find(session => session.id === command.sessionId)?.attached?.muxId;
-  if (muxId) {
-    command.id = `tau_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-    unsentInput.track(command.id, muxId, input);
+  if (command.inputContext) {
+    command.id = crypto.randomUUID();
+    unsentInput.track(command.id, command.inputContext, input);
   }
   wsClient.send(command);
 }
@@ -1890,6 +2078,10 @@ const queuedMessagesEl = document.getElementById('queued-messages')!;
 
 function renderQueuedMessages() {
   queuedMessagesEl.innerHTML = '';
+  if (!viewingActiveSession) {
+    queuedMessagesEl.classList.add('hidden');
+    return;
+  }
   const uncertain = activeLiveSessionId ? queuedPrompts.get(activeLiveSessionId) : undefined;
   if (uncertain?.uncertain) {
     const el = document.createElement('div');
@@ -1945,9 +2137,16 @@ function escapeHtml(text: string) {
 }
 
 function flushQueue() {
-  if (!activeLiveSessionId || state.isStreaming || !resumeQueuedInput || sessionHasPendingWork(activeLiveSessionId) || takeRequest?.sessionId === activeLiveSessionId) return;
+  if (!viewingActiveSession || !composerContext || wsClient.ws?.readyState !== WebSocket.OPEN || !activeLiveSessionId || state.isStreaming || !resumeQueuedInput || sessionHasPendingWork(activeLiveSessionId) || takeRequest?.sessionId === activeLiveSessionId) return;
   const idx = messageQueue.findIndex(cmd => cmd.sessionId === activeLiveSessionId);
   if (idx >= 0) {
+    if (!sameContext(messageQueue[idx].inputContext || null, composerContext)) {
+      const [command] = messageQueue.splice(idx, 1);
+      if (command.inputContext) unsentInput.keep(command.inputContext, { text: command.message || '', images: command.images || [] });
+      restoreUnsentInput();
+      renderQueuedMessages();
+      return;
+    }
     if (messageQueue[idx].error) return; // A failed instruction needs an explicit retry or cancellation.
     const [cmd] = messageQueue.splice(idx, 1);
     lastSentMessage = cmd.message ?? null;
@@ -2056,12 +2255,22 @@ function abortActiveSession() {
   if (!viewingActiveSession || !activeLiveSessionId) return;
   const sessionId = activeLiveSessionId;
   if (abortRequests.has(sessionId)) return;
+  const session = liveSessions.find(session => session.id === sessionId)!;
+  const shared = !!(session.shared || session.attached);
+  if (shared && !confirm('Abort current work for EVERY frontend and remove ALL queued input from this agent? Returned queue text is kept for review only in this browser, never resent. The agent itself keeps running.')) return;
+  const context = inputContexts.get(sessionId) || inputContextOf(session);
+  if (shared) {
+    keepUnsentInput(session, context);
+    bindComposerContext(context);
+  }
   const revision = operationRevisions.get(sessionId) || 0;
   localAbortStates.set(sessionId, 'stopping');
   settledWhileStopping.delete(sessionId);
   updateUI();
   const request = (async () => {
     try {
+      // Stopping work must not wait for a queue-clear acknowledgement that may be lost.
+      if (shared) void clearSharedQueue(sessionId, true);
       const response = await fetch('/api/rpc', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ type: 'abort', sessionId }),
@@ -2113,10 +2322,6 @@ async function takeFromHerdr() {
     flashStatusError('Select a live Tau tab first. The Herdr conversation will replace it here.');
     return;
   }
-  if (session.attached) {
-    flashStatusError('This tab is shared with the frontend that started it; take the Herdr conversation into a Tau tab of its own.', 8000);
-    return;
-  }
   if (takeRequest || state.isStreaming || session.isStreaming || messageQueue.some(cmd => cmd.sessionId === session.id)
     || sessionHasPendingWork(session.id) || dialogHandler.currentRequest?.sessionId === session.id) {
     flashStatusError('Finish the current work, queued messages and dialogs before taking a session.');
@@ -2149,9 +2354,11 @@ async function takeFromHerdr() {
 
 // Command Palette
 const commandPaletteController = setupCommandPalette([
-  { icon: '↙', label: 'Take from Herdr…', desc: 'Take an idle Herdr conversation into this Tau tab', available: () => !activeTabIsShared(), action: () => { void takeFromHerdr(); } },
+  { icon: '↙', label: 'Take from Herdr…', desc: 'Take an idle Herdr conversation into this Tau tab', available: () => viewingActiveSession, action: () => { void takeFromHerdr(); } },
   { icon: '✨', label: 'New session', desc: 'Start over in this shared agent; every frontend moves with it', available: activeTabCanStartOver, action: () => { void newSharedSession(); } },
-  { icon: '🌳', label: 'Session tree', desc: 'Jump to any earlier point in the session tree', available: () => !activeTabIsShared(), action: () => { void treeViewController.open(); } },
+  { icon: '🌳', label: 'Session tree', desc: 'Jump to any earlier point in the session tree', available: activeTabCanNavigate, action: () => { void treeViewController.open(); } },
+  { icon: '×', label: 'Clear agent queue everywhere…', desc: 'Remove all frontends’ queued input; keep returned text here for review', available: activeTabIsShared, action: () => { void clearSharedQueue(); } },
+  { icon: '×', label: 'Stop agent everywhere…', desc: 'End this agent in all frontends, even when idle', available: () => viewingActiveSession && !!activeLiveSessionId, action: () => { void stopAgentEverywhere(); } },
   { icon: '🗜️', label: 'Compact', desc: 'Compact context to save tokens', action: () => rpcCommand({ type: 'compact' }, 'Compacting...') },
   { icon: '📋', label: 'Export HTML', desc: 'Export session as HTML file', action: () => rpcExportHtml() },
   { icon: '📊', label: 'Session Stats', desc: 'Show session statistics', action: () => showSessionStats() },
@@ -2189,10 +2396,10 @@ async function rpcCommand(cmd: RpcCommand, statusMsg = '') {
   }
 }
 
-/** Only a shared root agent starts over in place: a Tau tab opens new sessions as new tabs, and workers stay on their file. */
+/** Root agents can start over in place; workers stay on their file. */
 function activeTabCanStartOver() {
   const session = liveSessions.find(s => s.id === activeLiveSessionId);
-  return !!session?.attached && session.attached.placement !== 'worker';
+  return viewingActiveSession && !!session && session.attached?.placement !== 'worker';
 }
 
 async function newSharedSession() {
@@ -2230,11 +2437,6 @@ function focusComposer() {
   if (!isMobile() && !dialogHandler.currentRequest) messageInput.focus();
 }
 
-/** What the conversation area shows now, to notice that the user moved on. */
-function currentView() {
-  return JSON.stringify([activeLiveSessionId, viewingActiveSession, sidebar.activeSessionFile, launcherPanel.isVisible()]);
-}
-
 // Agent overview: tapping a shared agent attaches a Tau tab to it, or selects
 // the tab already attached.
 const agentsPanel = setupAgentsPanel({
@@ -2245,20 +2447,20 @@ const agentsPanel = setupAgentsPanel({
       await selectLiveSession(agent.tabId);
       return true;
     }
-    const view = currentView();
+    const view = beginViewSelection();
     try {
       const res = await fetch('/api/live-sessions/attach', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ muxId: agent.muxId }),
       });
       const data = await res.json();
       if (!res.ok || data.error || !data.session) throw new Error(data.error || 'Could not open the agent');
-      upsertLiveSession(data.session);
+      rememberOpenedSession(data.session, view);
       // Attaching can take seconds; whatever the user opened meanwhile stays.
-      if (currentView() !== view) return false;
+      if (viewSelection !== view) return false;
       await selectLiveSession(data.session.id);
       return true;
     } catch (error) {
-      flashStatusError(error instanceof Error ? error.message : 'Could not open the agent', 8000);
+      if (viewSelection === view) flashStatusError(error instanceof Error ? error.message : 'Could not open the agent', 8000);
       return false;
     }
   },
@@ -2280,13 +2482,15 @@ const modelPickerController = setupModelPicker({
 // command palette). Selecting an entry moves the session leaf server-side;
 // the conversation re-renders when the server broadcasts a fresh snapshot.
 const treeViewController = setupTreeView({
-  getActiveLiveSessionId: () => (viewingActiveSession && activeLiveSessionId ? activeLiveSessionId : null),
+  getActiveLiveSessionId: () => (activeTabCanNavigate() ? activeLiveSessionId : null),
   isStreaming: () => state.isStreaming,
-  setComposerText(text) {
-    messageInput.value = text;
-    // Trigger the textarea auto-resize handler.
-    messageInput.dispatchEvent(new Event('input'));
-    if (!isMobile()) messageInput.focus();
+  getViewSelection: () => viewSelection,
+  captureComposerText() {
+    const origin = composerContext ? { ...composerContext } : null;
+    return (text) => {
+      if (origin && text) unsentInput.keep(origin, { text, images: [] });
+      restoreUnsentInput();
+    };
   },
   flashStatusError,
 });
@@ -2445,6 +2649,7 @@ async function handleSessionSelect(session: SidebarSession | null) {
   lastUsage = null;
   updateContextPill();
   if (session) await switchSession(session.filePath, session);
+  else await switchSession(null);
 
   // Close sidebar on mobile after selecting
   if (isMobile()) {
@@ -2474,6 +2679,8 @@ type FollowedSession = {
   entries: SessionHistoryEntry[];
   owner: SessionOwner;
   timer: ReturnType<typeof setInterval>;
+  selection: number;
+  polling: boolean;
 };
 
 let followed: FollowedSession | null = null;
@@ -2509,34 +2716,43 @@ function renderFollowedSession(current: FollowedSession) {
 
 async function pollFollowedSession() {
   const current = followed;
-  if (!current) return;
+  if (!current || current.selection !== viewSelection || current.polling) return;
+  current.polling = true;
   try {
     const chunk = await readFollowedSession(current.dirName, current.file, current.offset);
-    if (followed !== current) return;
+    if (followed !== current || current.selection !== viewSelection) return;
     current.offset = chunk.offset;
     if (chunk.reset) current.entries = chunk.entries;
     else if (chunk.entries.length) current.entries = current.entries.concat(chunk.entries);
     else return;
     renderFollowedSession(current);
   } catch (e) {
+    if (followed !== current || current.selection !== viewSelection) return;
     stopFollowing();
     messageRenderer.renderError(e instanceof Error ? e.message : 'Stopped following this session');
+  } finally {
+    current.polling = false;
   }
 }
 
-async function followSession(session: SidebarSession, owner: SessionOwner) {
+async function followSession(session: SidebarSession, owner: SessionOwner, selection: number) {
+  if (selection !== viewSelection) return;
   stopFollowing();
   const { dir: dirName, file } = session;
   try {
     const chunk = await readFollowedSession(dirName, file, 0);
-    followed = { dirName, file, offset: chunk.offset, entries: chunk.entries, owner, timer: setInterval(pollFollowedSession, FOLLOW_POLL_MS) };
+    if (selection !== viewSelection) return;
+    followed = { dirName, file, offset: chunk.offset, entries: chunk.entries, owner, selection, polling: false, timer: setInterval(pollFollowedSession, FOLLOW_POLL_MS) };
     renderFollowedSession(followed);
   } catch (e) {
-    messageRenderer.renderError(e instanceof Error ? e.message : 'Failed to read session file');
+    if (selection === viewSelection) messageRenderer.renderError(e instanceof Error ? e.message : 'Failed to read session file');
   }
 }
 
 async function switchSession(sessionFile: string | null | undefined, session: SidebarSession | null = null) {
+  const selection = beginViewSelection();
+  bindComposerContext(null);
+  voiceInput?.cancel();
   try {
     // Clear any streaming state from previous session to prevent bleed
     currentMessageSteps.clear();
@@ -2557,13 +2773,13 @@ async function switchSession(sessionFile: string | null | undefined, session: Si
     if (sessionFile) {
       const live = liveSessions.find(s => s.sessionFile === sessionFile);
       if (live) {
-        await selectLiveSession(live.id);
+        await selectLiveSession(live.id, true, selection);
         return;
       }
       const owner = session ? sessionOwnerOf(session.owner) : null;
       if (owner) {
         updateLiveSessionInputState();
-        await followSession(session!, owner);
+        await followSession(session!, owner, selection);
         return;
       }
       // No live tab yet — ask the server to resume this session.
@@ -2577,6 +2793,8 @@ async function switchSession(sessionFile: string | null | undefined, session: Si
           body: JSON.stringify({ filePath: sessionFile }),
         });
         const data = await res.json();
+        if (res.ok && !data.error && data.session) rememberOpenedSession(data.session, selection);
+        if (selection !== viewSelection) return;
         if (!res.ok || data.error) {
           clearConversation();
           viewingActiveSession = false;
@@ -2586,21 +2804,16 @@ async function switchSession(sessionFile: string | null | undefined, session: Si
           // between the click and the request.
           const refused = sessionOwnerOf(data.owner);
           if (refused && session) {
-            await followSession(session, refused);
+            await followSession(session, refused, selection);
             return;
           }
           messageRenderer.renderError(data.error || 'Failed to resume session');
           return;
         }
-        // If the server found an existing live tab (reused), just focus it.
-        if (data.reused && data.session) {
-          upsertLiveSession(data.session);
-          await selectLiveSession(data.session.id);
-          return;
-        }
-        upsertLiveSession(data.session);
-        await selectLiveSession(data.session.id);
+        if (!data.session) throw new Error('The resume response did not identify a live tab');
+        await selectLiveSession(data.session.id, true, selection);
       } catch (e) {
+        if (selection !== viewSelection) return;
         clearConversation();
         messageRenderer.renderError('Failed to resume session');
         viewingActiveSession = false;
@@ -2612,6 +2825,7 @@ async function switchSession(sessionFile: string | null | undefined, session: Si
 
     messageRenderer.renderWelcome();
   } catch (error) {
+    if (selection !== viewSelection) return;
     console.error('[App] Failed to switch session:', error);
     messageRenderer.renderError('Failed to switch session');
   }
@@ -2639,11 +2853,7 @@ function applyLiveSessionSnapshot(data: LiveSessionSnapshotData, requestedAtRevi
   // the past. Do not let an HTTP response overwrite newer WebSocket state.
   viewingActiveSession = true;
   if (!staleMetadata) {
-    const previousCwd = liveSessions.find(session => session.id === activeLiveSessionId)?.cwd;
-    if (data.session) {
-      upsertLiveSession(data.session);
-      if (data.session.cwd !== previousCwd && !fileSidebar.classList.contains('collapsed')) void fileBrowser.load();
-    }
+    if (data.session) upsertLiveSession(data.session);
     activeLiveSessionFile = data.sessionFile || data.session?.sessionFile || null;
     sidebar.setActive(activeLiveSessionFile);
     if (liveSessions.find(session => session.id === sessionId)?.attached && data.isStreaming === false) {
@@ -2747,12 +2957,10 @@ function updateLiveSessionInputState() {
     inputArea?.classList.add('no-active-live-session');
   }
   takeHerdrBtn.setAttribute('aria-busy', String(takeRequest !== null));
-  // Taking replaces a Tau tab's own conversation; a shared tab has none to give up.
-  takeHerdrBtn.classList.toggle('hidden', !hasLiveSession || activeTabIsShared());
+  takeHerdrBtn.classList.toggle('hidden', !hasLiveSession);
   document.getElementById('command-btn')!.disabled = !hasLiveSession;
   modelPickerController.setEnabled(hasLiveSession);
-  // Tree navigation needs Tau's extension, which a shared Pi does not load.
-  treeViewController.setVisible(hasLiveSession && !activeTabIsShared());
+  treeViewController.setVisible(hasLiveSession && activeTabCanNavigate());
 }
 
 // ═══════════════════════════════════════
@@ -3214,6 +3422,7 @@ applyTheme(getCurrentTheme());
 async function fetchSessionStats(): Promise<SessionStats | null> {
   if (!viewingActiveSession || !activeLiveSessionId) return null;
   const requestSessionId = activeLiveSessionId;
+  const selection = viewSelection;
   try {
     const resp = await fetch('/api/rpc', {
       method: 'POST',
@@ -3222,7 +3431,7 @@ async function fetchSessionStats(): Promise<SessionStats | null> {
     });
     const data = await resp.json();
     if (!data?.success || !data.data) return null;
-    if (activeLiveSessionId !== requestSessionId || !viewingActiveSession) return null;
+    if (selection !== viewSelection || activeLiveSessionId !== requestSessionId || !viewingActiveSession) return null;
     const stats = data.data as SessionStats;
 
     // Sync authoritative numbers into the locally-tracked pill state so the

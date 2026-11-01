@@ -69,7 +69,7 @@ export class DialogHandler {
       optionsContainer.appendChild(optionDiv);
     });
 
-    dialog.querySelector('#dialog-cancel')!.onclick = () => {
+    dialog.querySelector<HTMLButtonElement>('#dialog-cancel')!.onclick = () => {
       this.respond(id, { cancelled: true }, sessionId);
     };
 
@@ -92,11 +92,11 @@ export class DialogHandler {
       </div>
     `;
 
-    dialog.querySelector('#dialog-yes')!.onclick = () => {
+    dialog.querySelector<HTMLButtonElement>('#dialog-yes')!.onclick = () => {
       this.respond(id, { confirmed: true }, sessionId);
     };
 
-    dialog.querySelector('#dialog-no')!.onclick = () => {
+    dialog.querySelector<HTMLButtonElement>('#dialog-no')!.onclick = () => {
       this.respond(id, { confirmed: false }, sessionId);
     };
 
@@ -133,8 +133,8 @@ export class DialogHandler {
       if (e.key === 'Enter') submit();
     });
 
-    dialog.querySelector('#dialog-submit')!.onclick = submit;
-    dialog.querySelector('#dialog-cancel')!.onclick = () => {
+    dialog.querySelector<HTMLButtonElement>('#dialog-submit')!.onclick = submit;
+    dialog.querySelector<HTMLButtonElement>('#dialog-cancel')!.onclick = () => {
       this.respond(id, { cancelled: true }, sessionId);
     };
 
@@ -163,12 +163,12 @@ export class DialogHandler {
     const textarea = dialog.querySelector<HTMLTextAreaElement>('#dialog-textarea');
     if (!textarea) return;
 
-    dialog.querySelector('#dialog-save')!.onclick = () => {
+    dialog.querySelector<HTMLButtonElement>('#dialog-save')!.onclick = () => {
       const value = textarea.value;
       this.respond(id, value ? { value } : { cancelled: true }, sessionId);
     };
 
-    dialog.querySelector('#dialog-cancel')!.onclick = () => {
+    dialog.querySelector<HTMLButtonElement>('#dialog-cancel')!.onclick = () => {
       this.respond(id, { cancelled: true }, sessionId);
     };
 

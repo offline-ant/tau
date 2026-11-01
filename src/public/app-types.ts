@@ -1,5 +1,6 @@
 import type { DialogRequest } from './dialogs.js';
 import type { NestedCallsRecord } from './nested-tool-calls.js';
+import type { InputContext } from './unsent-input.js';
 
 export type PendingDialog = DialogRequest & {
   id: string;
@@ -46,7 +47,10 @@ export type LiveSession = {
   createdAt?: string;
   lastActiveAt?: string;
   contextUsage?: UsageRecord;
-  /** Set when this tab is attached to a Pi another frontend started through pimux; closing only detaches. */
+  leafId?: string | null;
+  shared?: boolean;
+  capabilities?: { stop?: boolean; navigateTree?: boolean };
+  /** Runtime identity is independent of the frontend that first started it. Closing only disconnects. */
   attached?: { muxId: string; host: string | null; placement: string; name: string | null } | null;
 };
 
@@ -127,6 +131,6 @@ export type AppEvent = {
 
 export type PendingImage = { data: string; mimeType: string };
 export type PendingFilePath = { path: string; name: string; ext: string; sessionId?: string | null };
-export type QueuedCommand = { type: string; id?: string; message?: string; images?: PendingImage[]; sessionId?: string; error?: string; streamingBehavior?: 'followUp' | 'steer' };
+export type QueuedCommand = { type: string; inputContext?: InputContext; id?: string; message?: string; images?: PendingImage[]; sessionId?: string; error?: string; streamingBehavior?: 'followUp' | 'steer' };
 export type ExtensionUIRequest = { sessionId: string; event: AppEvent };
 export type RpcCommand = { type: string; sessionId?: string; filePath?: string; [key: string]: unknown };
