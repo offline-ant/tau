@@ -46,7 +46,8 @@ test('codemode arguments are safe highlighted JavaScript in live and reloaded ca
   );
   await page.reload();
   await card.waitFor({ state: 'attached' });
-  await card.locator('.tool-card-header').click();
+  assert.equal(await card.locator('.tool-card-header').getAttribute('aria-expanded'), 'true', 'grouped history keeps the tool body readable');
+  assert.equal(await card.locator('.tool-args code').isVisible(), true);
   await assertSource();
   assert.equal(await card.locator('.tool-args code').innerHTML(), liveHtml);
   assert.equal(await card.locator('.tool-output').textContent(), 'Plain tool output <script>');
@@ -68,8 +69,9 @@ test('codemode source stays readable and safe when highlighting assets cannot lo
   const { page, errors, card, broadcast, id } = await openNestedPage(t, { blockServiceWorkers: true });
   await page.route('**/vendor/highlight/*.js', route => route.abort());
   await page.reload();
-  await page.waitForFunction((count: number) =>
-    document.querySelectorAll('#messages > .message').length === count, B_ROUNDS * 2);
+  await page.waitForFunction((rounds: number) =>
+    document.querySelectorAll('#messages > .message.user').length === rounds &&
+    document.querySelectorAll('#messages > .assistant-block').length === rounds, B_ROUNDS);
   const source = 'const html = "<img src=x onerror=alert(1)>";\nreturn "```";\n';
   broadcast({ type: 'tool_execution_start', toolCallId: id, toolName: 'codemode', args: { code: source } });
   await card.waitFor({ state: 'attached' });
@@ -323,10 +325,22 @@ test('built-in bash, edit, read, and write tool calls render cleanly in live, ne
     assert.ok(await nestedWriteRow.locator('.nested-call-arguments .hljs-keyword').count() > 0);
   };
 
+  const activity = page.locator('#messages > .assistant-block').filter({ has: bashCard });
+  assert.equal(await activity.count(), 1);
+  assert.deepEqual(await activity.locator('.tool-card').evaluateAll(cards => cards.map(card => (card as HTMLElement).dataset.toolCallId)),
+    [...toolCalls.map(call => call.id), nestedRootId], 'root tool cards retain their order inside one activity block');
+  assert.equal(await activity.locator('.assistant-block-toggle').getAttribute('aria-expanded'), 'false');
+  assert.equal(await bashCard.isVisible(), false, 'collapsed activity shows its last result, not earlier tool steps');
+  await activity.locator('.assistant-block-toggle').click();
   for (const tc of toolCalls) {
-    await page.locator(`.tool-card[data-tool-call-id="${tc.id}"] .tool-card-header`).click();
+    const header = page.locator(`.tool-card[data-tool-call-id="${tc.id}"] .tool-card-header`);
+    assert.equal(await header.getAttribute('aria-expanded'), 'true', 'grouped tool bodies start open');
+    await header.click();
+    assert.equal(await header.getAttribute('aria-expanded'), 'false', 'individual tool details can still be collapsed');
+    await header.click();
   }
-  await nestedRootCard.locator('.tool-card-header').click();
+  assert.equal(await nestedRootCard.locator('.tool-card-header').getAttribute('aria-expanded'), 'true');
+  assert.equal(await nestedRootCard.locator('.nested-calls-toggle').getAttribute('aria-expanded'), 'false', 'a clean completed call list has its own collapsed state');
   await nestedRootCard.locator('.nested-calls-toggle').click();
   await assertCards();
 
@@ -358,6 +372,10 @@ test('built-in bash, edit, read, and write tool calls render cleanly in live, ne
 
   await page.reload();
   await writeTxtCard.waitFor({ state: 'attached' });
+  assert.equal(await activity.locator('.assistant-block-toggle').getAttribute('aria-expanded'), 'false');
+  assert.deepEqual(await activity.locator('.tool-card').evaluateAll(cards => cards.map(card => (card as HTMLElement).dataset.toolCallId)),
+    [...toolCalls.map(call => call.id), nestedRootId], 'reloaded history preserves the live root-card group and order');
+  await activity.locator('.assistant-block-toggle').click();
   await toolCommand(page, 'Expand All Tools');
   for (let i = 0; i < nestedCallsList.length; i++) {
     await nestedRootCard.locator('.nested-call-row').nth(i).locator('.nested-call-toggle').click();

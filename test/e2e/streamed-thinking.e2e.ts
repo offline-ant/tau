@@ -15,7 +15,7 @@ import {
 
 setupHistoryE2E();
 
-// Text of an assistant message that sits outside its thinking block.
+// Only text-labelled steps of this activity block; never thinking or tool content.
 async function textOutsideThinking(message: ReturnType<Page['locator']>) {
   return (await message.locator('.assistant-block-item[data-label="text"] .assistant-step-content').allTextContents()).join('').trim();
 }
@@ -57,7 +57,7 @@ for (const { label, textBefore, textAfter, body } of THINKING_CASES) {
         assistantMessageEvent: { type: 'thinking_delta', contentIndex: content.length, delta } });
     }
     content.push({ type: 'thinking', thinking });
-    const message = page.locator('#messages > .message.assistant').last();
+    const message = page.locator('#messages > .assistant-block').last();
     await page.waitForFunction((expected: string) =>
       document.querySelector('.assistant-step-content.thinking-block.streaming .thinking-content')?.textContent === expected, thinking);
     assert.equal(await textOutsideThinking(message), textBefore || '', 'thinking leaked into the main text while streaming');
@@ -74,6 +74,12 @@ for (const { label, textBefore, textAfter, body } of THINKING_CASES) {
     assert.equal(await message.locator('.thinking-block').count(), 1);
     assert.equal(await message.locator('.thinking-block .thinking-content').textContent(), thinking);
     assert.equal(await textOutsideThinking(message), body, 'thinking leaked into the main text after the message finished');
+    assert.deepEqual(await message.locator('.assistant-block-item').evaluateAll(items => items.map(item => (item as HTMLElement).dataset.label)),
+      [...(textBefore ? ['text'] : []), 'thinking', textAfter ? 'text' : 'bash'], 'thinking, text and tool steps retain their original order in one activity block');
+    assert.equal(await message.locator('.assistant-block-item[data-label="text"]').count(), body ? 1 : 0);
+    await message.locator('.assistant-block-toggle').click();
+    assert.equal(await message.locator('.thinking-content').isVisible(), true, 'expanding activity reveals its distinct thinking step');
+    assert.equal(await textOutsideThinking(message), body, 'expansion cannot merge thinking into text');
     await assertNoPageErrors(errors);
   });
 }
