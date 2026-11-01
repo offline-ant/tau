@@ -49,6 +49,13 @@ export default function pimuxFaux(pi: ExtensionAPI): void {
       return { content: [{ type: 'text', text: `picked ${choice ?? 'none'}` }], details: {} };
     },
   }));
+  pi.registerCommand('fx-tree', {
+    description: 'Move the selected branch without adding a persistence marker',
+    handler: async (target, ctx) => {
+      const result = await ctx.navigateTree(target.trim(), { summarize: false });
+      if (result.cancelled) throw new Error('Fixture branch move was cancelled');
+    },
+  });
   pi.registerCommand('fx-two', {
     description: 'Ask two dialogs at once',
     handler: async (_args, ctx) => {

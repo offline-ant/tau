@@ -1,10 +1,11 @@
-/** HTML export opens only a private captured copy, never a live writer's file. */
+/** Live exports run in their owning Pi; file-only exports open a private capture. */
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { lookupClaim } from '@phimacs/pimux/ownership';
+import { isRecord } from '@phimacs/pimux/protocol';
 import { releaseHost } from './config.js';
 import { PiRpcSession, LiveSessionManager } from './sessions.js';
 import { pimuxSharing } from './pimux.js';
@@ -26,11 +27,15 @@ export async function exportSession(file: string, output: string, session?: PiRp
       }
     }
     if (session) {
-      await session.snapshot();
-      const boundary = session.attachment?.snapshot;
-      if (!boundary || boundary.historyError || !Array.isArray(boundary.entries)) throw new Error('Runtime could not supply the complete session tree for export');
-      captured = [JSON.stringify({ type: 'session', version: 3, id: boundary.session.id,
-        timestamp: new Date().toISOString(), cwd: boundary.session.cwd }), ...boundary.entries.map(entry => JSON.stringify(entry))].join('\n') + '\n';
+      // Pi's public export_html command calls AgentSession.exportToHtml(), which
+      // reads both the complete tree and the in-memory leaf from its own manager.
+      // A JSONL copy cannot encode a branch move that appended no entry.
+      const response = await session.send({ type: 'export_html', outputPath: output }, { timeoutMs: 30000 });
+      if (response.success !== true) throw new Error(typeof response.error === 'string' ? response.error : 'The owning Pi refused the HTML export');
+      const result = isRecord(response.data) ? response.data : {};
+      if (typeof result.path !== 'string' || path.resolve(result.path) !== path.resolve(output)
+        || !fs.existsSync(output)) throw new Error('The owning Pi did not produce the requested HTML export');
+      return output;
     } else {
       // A native managed writer is readable, but cannot be opened by a second Pi.
       // Copy its completed records without repairing/migrating the source.
