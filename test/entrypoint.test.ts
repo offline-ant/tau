@@ -14,6 +14,8 @@ const CHILD_ENV = {
   TAU_HOST: '127.0.0.1',
   TAU_PORT: '0',
   TAU_HTTP_PORT: '0',
+  TAU_USER: 'entrypoint-user',
+  TAU_PASS: 'entrypoint-password',
   TAU_STATIC_DIR: path.join(PROJECT_ROOT, 'public'),
 };
 

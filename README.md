@@ -6,8 +6,8 @@
 > (remote `upstream`, branch `pi-orchestration`). It adds orchestration support for
 > pi-ant: tau acts as a *web host* for Pi workers, and never becomes a second writer
 > on a session file a terminal worker owns. See [Orchestration host](#orchestration-host).
-> It also ships default HTTP Basic credentials, so the default `0.0.0.0` bind is
-> authenticated out of the box.
+> Authentication requires explicitly configured HTTP Basic credentials. Tau refuses
+> startup without them unless `tau.authEnabled` is explicitly `false`.
 
 Pi Tau Web Server is a fork of [deflating/tau](https://github.com/deflating/tau), forked at
 [`5e2bce39`](https://github.com/deflating/tau/tree/5e2bce39) and rewritten from
@@ -65,8 +65,11 @@ npm install --global pi-tau-web-server
 
 ## Usage
 
+Configure authentication first (see [Authentication](#authentication)), or supply
+credentials when starting:
+
 ```bash
-pi-tau-web-server
+TAU_USER=pi TAU_PASS='choose-a-password' pi-tau-web-server
 ```
 
 Open the printed URL (default `https://localhost:3443`). Click `+` in the tab bar or sidebar to create an in-page Tau tab, choose or type a project directory, optionally enter a Pi `/model`-style model string, then chat.
@@ -254,15 +257,19 @@ Seven built-in themes: Telegram (default: blue header, white agent bubbles, ligh
 | `TAU_HOSTNAMES`    |    _(none)_ |      Comma-separated extra certificate/browser host names |
 | `TAU_PROJECTS_DIR` |    _(none)_ | Directory scanned for project chips in the new-tab modal |
 | `TAU_STATIC_DIR`   | _(bundled)_ |                               Override static files path |
-| `TAU_USER`         |        `rs` |                                 HTTP Basic Auth username |
-| `TAU_PASS`         |         `l` |                                 HTTP Basic Auth password |
+| `TAU_USER`         |    _(none)_ |                  Required nonempty Basic Auth username |
+| `TAU_PASS`         |    _(none)_ |                  Required nonempty Basic Auth password |
 | `TAU_COOKIE_SECRET`| _(generated)_ |            Secret that signs session cookies (optional) |
 
 Tau also reads matching values from `~/.pi/agent/settings.json` under the `tau` key (`host`, `port`, `httpPort`, `hostnames` (array), `projectsDir`, `user`, `pass`, `authEnabled`, `cookieSecret`).
 
 ### Authentication
 
-Tau Web Server supports HTTP Basic Auth. This fork ships **default credentials `rs` / `l`**, so auth is enabled out of the box and the default `0.0.0.0` bind is never an unauthenticated session-spawning API. Replace them in `~/.pi/agent/settings.json` or via environment variables, then toggle "Require login" in Tau Settings. Setting `TAU_USER`/`TAU_PASS` (or the settings keys) to an empty string leaves auth unconfigured and disabled.
+Tau Web Server uses HTTP Basic Auth by default and has **no default credentials**.
+Set a nonempty username and password in `~/.pi/agent/settings.json` or with
+`TAU_USER` and `TAU_PASS`. Environment values override settings, including empty
+strings: an empty or missing credential causes startup to fail before either
+listener opens, rather than silently disabling authentication.
 
 ```json
 {
@@ -272,6 +279,14 @@ Tau Web Server supports HTTP Basic Auth. This fork ships **default credentials `
   }
 }
 ```
+
+To deliberately run without authentication, set `"authEnabled": false` under
+`tau` in settings.json. This is the only startup opt-out; empty credential values
+are not an opt-out. This exposes the UI and session-spawning API to everyone who
+can reach either listener, so choose the bind address/network access accordingly.
+With credentials configured, Tau Settings can still toggle "Require login" and
+persists that choice. Without credentials, enabling it is rejected: configure
+credentials and restart first. Credential changes take effect on the next restart.
 
 Both HTTP and WebSocket connections are gated when enabled. Only the exact path `/api/health` remains open for monitoring.
 
