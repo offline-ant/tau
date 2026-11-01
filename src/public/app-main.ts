@@ -64,6 +64,24 @@ const dialogHandler = new DialogHandler(document.getElementById('dialog-containe
     if (!response.ok || !data.success) throw new Error(data.error || 'Could not send response. Please retry.');
   },
 }, () => activeLiveSessionId);
+let focusedDialog: HTMLElement | null = null;
+document.addEventListener('focusin', event => {
+  const target = event.target;
+  // Disabling the chosen answer can release focus to the body before the mux
+  // confirms closure. A later focused control, unlike that neutral blur, owns it.
+  if (!(target instanceof Element) || target === document.body || target === document.documentElement) return;
+  const dialog = dialogHandler.currentDialog;
+  focusedDialog = dialog?.contains(target) ? dialog : null;
+});
+
+function clearResolvedDialog() {
+  const dialog = dialogHandler.currentDialog;
+  const ownedFocus = !!dialog && (dialog.contains(document.activeElement) || focusedDialog === dialog);
+  dialogHandler.clearCurrentDialog();
+  focusedDialog = null;
+  return ownedFocus;
+}
+
 const assistantBlocks = new AssistantBlocks(document.getElementById('messages')!);
 const assistantBlockControllers = new Set([assistantBlocks]);
 let expandedAssistantBlocks = false;
@@ -682,9 +700,10 @@ function reconcileSharedDialogs(sessionId: string, dialogs: AppEvent[], generati
     .map(dialog => [String(dialog.id), dialog]));
   sharedDialogs.set(sessionId, open);
   const current = dialogHandler.currentRequest;
-  if (current?.sessionId === sessionId && !open.has(String(current.id))) dialogHandler.clearCurrentDialog();
+  const restoreFocus = current?.sessionId === sessionId && !open.has(String(current.id)) ? clearResolvedDialog() : false;
   renderLiveTabs();
   processQueuedExtensionUIRequest();
+  if (restoreFocus && viewingActiveSession && sessionId === activeLiveSessionId) focusComposer();
   // The snapshot caller applies metadata before updating input/dispatch. A
   // boundary that closes a dialog may simultaneously establish a busy run.
 }
@@ -694,12 +713,16 @@ function closeSharedDialog(sessionId: string, id: string) {
   if (!liveSessions.find(session => session.id === sessionId)?.attached) return;
   sharedDialogs.get(sessionId)?.delete(id);
   const current = dialogHandler.currentRequest;
+  let restoreFocus = false;
   if (current?.sessionId === sessionId && String(current.id) === id) {
-    dialogHandler.clearCurrentDialog();
+    restoreFocus = clearResolvedDialog();
     processQueuedExtensionUIRequest();
   }
   renderLiveTabs();
-  if (viewingActiveSession && activeLiveSessionId === sessionId) updateUI();
+  if (viewingActiveSession && activeLiveSessionId === sessionId) {
+    updateUI();
+    if (restoreFocus) focusComposer();
+  }
 }
 
 // A link is one navigation request, not a preference reapplied on reconnect.
@@ -1573,12 +1596,11 @@ function reconcileInteractionState(next: InteractionState) {
   if (current && next.interactionRevision <= current.interactionRevision) return;
   interactionStates.set(next.sessionId, next);
   const visible = dialogHandler.currentRequest;
-  if (visible?.sessionId === next.sessionId && !next.pendingDialogs.some(request => request.id === visible.id)) {
-    // Server resolution is not a user cancellation; never send another reply.
-    dialogHandler.clearCurrentDialog();
-  }
+  const restoreFocus = visible?.sessionId === next.sessionId && !next.pendingDialogs.some(request => request.id === visible.id)
+    ? clearResolvedDialog() : false;
   processQueuedExtensionUIRequest(next.sessionId);
   renderLiveTabs();
+  if (restoreFocus && viewingActiveSession && next.sessionId === activeLiveSessionId) focusComposer();
 }
 
 function queueExtensionUIRequest(event: AppEvent, sessionId: string) {

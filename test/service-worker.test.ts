@@ -34,6 +34,7 @@ test('the shell retains offline rich-rendering assets and invalidates the older 
   assert.notEqual(cache, 'tau-fork-v7');
   assert.notEqual(cache, 'tau-fork-v8');
   assert.notEqual(cache, 'tau-fork-v9');
+  assert.notEqual(cache, 'tau-fork-v10');
 });
 
 test('the service worker precaches exactly the modules the app loads', () => {
