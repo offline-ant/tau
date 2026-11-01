@@ -1,3 +1,4 @@
+import { runtimeEnvironment } from './runtime-environment.ts';
 import { test, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -5,25 +6,21 @@ import path from 'node:path';
 import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { FakePimux, until } from './fake-pimux.ts';
-import { FakePi } from './fake-pi.ts';
+import { FakeRuntimeLauncher } from './runtime-launcher.ts';
 import type { JsonRecord } from '../src/server/types.ts';
 
-process.env.TAU_HOST = '127.0.0.1';
-process.env.TMPDIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-pimux-tmp-'));
-process.env.PI_CODING_AGENT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-pimux-'));
-process.env.PI_CODING_AGENT_SESSION_DIR = path.join(process.env.PI_CODING_AGENT_DIR, 'sessions');
-process.env.PIMUX_DIR = path.join(process.env.PI_CODING_AGENT_DIR, 'mux');
-process.env.TAU_USER = '';
-process.env.TAU_PASS = '';
-fs.writeFileSync(path.join(process.env.PI_CODING_AGENT_DIR, 'settings.json'), JSON.stringify({ tau: { authEnabled: false } }));
+import * as tau from '../bin/tau.js';
+import * as overview from '../bin/agents.js';
+import * as attachment from '../bin/pimux-attachment.js';
+import * as panel from '../public/agents-panel.js';
+const { server, liveManager, SESSIONS_DIR, handleRpcCommand } = tau as any;
+const { AgentOverview } = overview as any;
+const { PimuxAttachment } = attachment as any;
+const { buildAgentGroups } = panel as any;
 
-const { server, liveManager, SESSIONS_DIR, _setSpawnPiForTest, handleRpcCommand } = (await import('../bin/tau.js')) as any;
-const { AgentOverview } = (await import('../bin/agents.js')) as any;
-const { PimuxAttachment } = (await import('../bin/pimux-attachment.js')) as any;
-const { buildAgentGroups } = (await import('../public/agents-panel.js')) as any;
-
+const originalStart = liveManager.runtime.start;
 const MUX_DIR = process.env.PIMUX_DIR;
-const PROJECT = path.join(process.env.PI_CODING_AGENT_DIR, 'project');
+const PROJECT = path.join(process.env.PI_CODING_AGENT_DIR!, 'project');
 const PROJECT_SESSIONS = path.join(SESSIONS_DIR, '--project--');
 let base = '';
 let muxes: FakePimux[] = [];
@@ -41,7 +38,7 @@ before(async () => {
 after(async () => {
   await liveManager.shutdown();
   await new Promise((resolve) => server.close(resolve));
-  fs.rmSync(process.env.PI_CODING_AGENT_DIR!, { recursive: true, force: true });
+  fs.rmSync(runtimeEnvironment.root, { recursive: true, force: true });
 });
 
 afterEach(async () => {
@@ -49,12 +46,12 @@ afterEach(async () => {
   for (const mux of muxes) await mux.close();
   muxes = [];
   browserMessages.length = 0;
-  _setSpawnPiForTest(null);
+  liveManager.runtime.start = originalStart;
 });
 
 /** Spawning Pi in these tests means a second writer: fail loudly. */
 function forbidSpawn() {
-  _setSpawnPiForTest(() => { throw new Error('Tau spawned a Pi on a pimux-shared file'); });
+  liveManager.runtime.start = async () => { throw new Error('Tau started a second writer on a shared file'); };
 }
 
 function sessionFile(name: string) {
@@ -84,12 +81,12 @@ test('resume of a pimux-shared file attaches instead of spawning a second writer
   const first = await post('/api/live-sessions/resume', { filePath: file });
   assert.equal(first.status, 200, String(first.body.error));
   assert.equal(first.body.attached, true);
-  assert.equal(first.body.started, true);
+  assert.equal(first.body.started, false, 'an attachment is not a new Pi launch');
   const session = first.body.session as JsonRecord;
   assert.equal((session.attached as JsonRecord).muxId, mux.muxId);
-  assert.equal(session.pid, null, 'an attached tab owns no process');
+  assert.equal(session.pid, process.pid, 'validated Pi identity is display data, not process ownership');
   const live = liveManager.get(session.id);
-  assert.deepEqual(live.entries.map((entry: JsonRecord) => entry.type), ['session', 'message'], 'history comes from the snapshot tree');
+  assert.deepEqual(live.entries.map((entry: JsonRecord) => entry.type), ['message'], 'history comes from the snapshot tree');
   const again = await post('/api/live-sessions/resume', { filePath: file });
   assert.equal(again.body.reused, true);
   assert.equal((again.body.session as JsonRecord).id, session.id);
@@ -100,15 +97,15 @@ test('resume of a pimux-shared file attaches instead of spawning a second writer
   assert.equal(mux.connections.size, 1);
 });
 
-test('attach by mux id, refresh refusal and session-opening args', async () => {
+test('attach by mux id, snapshot refresh and rejection of session-opening args', async () => {
   forbidSpawn();
   const { file, mux } = await sharedSession('byid');
   const attached = await post('/api/live-sessions/attach', { muxId: mux.muxId });
   assert.equal(attached.status, 200, String(attached.body.error));
   assert.equal(attached.body.started, true);
   const refresh = await post('/api/live-sessions/resume', { filePath: file, refresh: true });
-  assert.equal(refresh.status, 409);
-  assert.match(String(refresh.body.error), /always current/);
+  assert.equal(refresh.status, 200);
+  assert.equal(refresh.body.refreshed, true, 'refresh requests a boundary without reopening the file');
   const args = await post('/api/live-sessions', { cwd: PROJECT, args: ['--session', file] });
   assert.equal(args.status, 400);
   assert.match(String(args.body.error), /must not open a session/);
@@ -126,8 +123,9 @@ test('a starting pimux is matched by its intended file: Tau attaches once it lis
   const mux = new FakePimux(MUX_DIR!, 'mux-starting', { sessionFile: file, cwd: PROJECT, status: 'starting', piPid: null });
   muxes.push(mux);
   const opening = post('/api/live-sessions/resume', { filePath: file });
-  await new Promise((resolve) => setTimeout(resolve, 200));
+  await until(() => liveManager.hasPendingResume(file), 'opening waits for runtime commitment');
   assert.equal(liveManager.sessions.size, 0, 'nothing opens while it starts');
+  mux.publish({ status: 'idle', phase: 'committed', piPid: process.pid });
   await mux.listen();
   const opened = await opening;
   assert.equal(opened.status, 200, String(opened.body.error));
@@ -153,7 +151,7 @@ test('a pimux that never finishes starting fails closed, never spawning', async 
 test('a stale entry does not hide the live pimux of the same file', async () => {
   forbidSpawn();
   const { file, mux } = await sharedSession('beside');
-  const stale = new FakePimux(MUX_DIR!, 'a-stale', { sessionFile: file, cwd: PROJECT, pid: deadPid(), piPid: deadPid() });
+  const stale = new FakePimux(MUX_DIR!, 'a-stale', { sessionFile: file, cwd: PROJECT, pid: deadPid(), piPid: deadPid(), ownerIdentity: undefined, piIdentity: null });
   muxes.push(stale);
   const opened = await post('/api/live-sessions/resume', { filePath: file });
   assert.equal(opened.status, 200, String(opened.body.error));
@@ -168,7 +166,7 @@ test('deleting a session: a live pimux refuses, a stale entry does not', async (
   await mux.close();
   muxes = muxes.filter((item) => item !== mux);
   const staleFile = sessionFile('delete-stale');
-  muxes.push(new FakePimux(MUX_DIR!, 'mux-delete-stale', { sessionFile: staleFile, cwd: PROJECT, pid: deadPid(), piPid: deadPid() }));
+  muxes.push(new FakePimux(MUX_DIR!, 'mux-delete-stale', { sessionFile: staleFile, cwd: PROJECT, pid: deadPid(), piPid: deadPid(), ownerIdentity: undefined, piIdentity: null }));
   const deleted = await post('/api/sessions/delete', { filePath: staleFile });
   assert.equal(deleted.status, 200, String(deleted.body.error));
   assert.equal(fs.existsSync(staleFile), false);
@@ -176,9 +174,11 @@ test('deleting a session: a live pimux refuses, a stale entry does not', async (
 
 function collectingAttachment() {
   const applied: JsonRecord[] = [];
-  return { applied, attachment: new PimuxAttachment('mux', '/nowhere', (published: JsonRecord) => applied.push(published)) };
+  const attachment = new PimuxAttachment('mux', '/nowhere', (published: JsonRecord) => applied.push(published), { piPid: process.pid, sessionFile: null });
+  attachment.handle({ type: 'pimux_hello', protocol: 2, muxId: 'mux', piPid: process.pid, clientId: 1, capabilities: ['snapshot', 'stop', 'detached'] });
+  return { applied, attachment };
 }
-const snapshotRecord = (generation: number, replay: number) => ({ type: 'pimux_snapshot', generation, replay, reason: 'request' });
+const snapshotRecord = (generation: number, replay: number) => ({ type: 'pimux_snapshot', generation, replay, reason: 'request', session: { file: null, id: 'snapshot-session', name: null, cwd: PROJECT }, leafId: null, idle: true, thinkingLevel: 'off' });
 const replayed = { type: 'message_update', delta: 'stale' };
 
 for (const interruption of [
@@ -223,9 +223,7 @@ test('records beyond the announced replay end the sequence instead of accumulati
   const { attachment, applied } = collectingAttachment();
   attachment.handle(snapshotRecord(5, 1));
   assert.equal(attachment.handle(replayed), true);
-  assert.equal(attachment.handle({ type: 'agent_start' }), false);
-  assert.equal(attachment.handle({ type: 'agent_end' }), false);
-  attachment.handle({ type: 'pimux_live', generation: 5 });
+  assert.throws(() => attachment.handle({ type: 'agent_start' }), /more replay records/);
   assert.equal(applied.length, 0);
 });
 
@@ -269,28 +267,23 @@ test('a browser that stopped reading is dropped, and the others keep receiving',
   assert.equal(liveManager.clients.has(stalled), false);
 });
 
-test('a known but unreachable pimux fails closed; a stale one does not block', async (t) => {
+test('unreachable live owners fail closed; confirmed stale owners permit a new managed launch', async t => {
   const file = sessionFile('unreachable');
-  // The wrapper lives (this process) but its socket does not exist yet.
   const starting = new FakePimux(MUX_DIR!, 'mux-unreachable', { sessionFile: file, cwd: PROJECT });
   muxes.push(starting);
   forbidSpawn();
   const refused = await post('/api/live-sessions/resume', { filePath: file });
   assert.equal(refused.status, 409);
-  assert.equal(refused.body.muxId, 'mux-unreachable');
   assert.equal(liveManager.sessions.size, 0);
-  // A dead wrapper and Pi: the entry is stale and the file may be opened.
-  const dead = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']).stdout.toString();
-  starting.publish({ pid: Number(dead), piPid: Number(dead) });
-  const child = new FakePi();
-  _setSpawnPiForTest((_cmd: string, args: string[]) => {
-    child.state.sessionFile = args[args.indexOf('--session') + 1];
-    return child.asChild();
-  });
-  t.after(() => _setSpawnPiForTest(null));
+  const dead = deadPid();
+  starting.publish({ pid: dead, piPid: dead, ownerIdentity: undefined, piIdentity: null });
+  const launcher = new FakeRuntimeLauncher();
+  liveManager.runtime.start = launcher.start;
+  t.after(() => launcher.close());
   const resumed = await post('/api/live-sessions/resume', { filePath: file });
   assert.equal(resumed.status, 200, String(resumed.body.error));
-  assert.equal(resumed.body.attached, undefined);
+  assert.equal(resumed.body.attached, true, 'new managed roots use exactly the same socket transport');
+  assert.equal(launcher.calls.length, 1);
 });
 
 test('selection bootstraps a boundary: snapshot first, then replay, with open dialogs', async () => {
@@ -313,7 +306,7 @@ test('selection bootstraps a boundary: snapshot first, then replay, with open di
   assert.equal(snapshot.generation, mux.generation);
   assert.equal(snapshot.isStreaming, true);
   assert.deepEqual((snapshot.dialogs as JsonRecord[]).map((dialog) => dialog.id), ['d1']);
-  const forSession = browserMessages.filter((message) => message.sessionId === id && (message.event as JsonRecord | undefined)?.type !== 'response');
+  const forSession = browserMessages.filter((message) => message.sessionId === id && (message.type === 'live_session_snapshot' || message.type === 'event') && (message.event as JsonRecord | undefined)?.type !== 'response');
   assert.deepEqual(forSession.map((message) => message.type === 'event' ? (message.event as JsonRecord).type : message.type),
     ['live_session_snapshot', 'agent_start', 'message_start'], 'dialogs travel in the snapshot, not as replayed events');
   mux.broadcast({ type: 'pimux_dialog_closed', id: 'd1', reason: 'answered', clientId: 9 });
@@ -336,7 +329,7 @@ test('renames go through the Pi that writes the file; deleting a live file is re
   assert.equal((await post('/api/sessions/delete', { filePath: file })).status, 409);
   const tree = await handleRpcCommand({ type: 'navigate_tree', sessionId: (body.session as JsonRecord).id, entryId: 'u1' });
   assert.equal(tree.success, false);
-  assert.match(tree.error, /not available in a shared session/);
+  assert.match(tree.error, /does not advertise/);
   const listing = await (await fetch(`${base}/api/sessions/--project--`)).json() as { sessions: JsonRecord[] };
   assert.equal(listing.sessions.find((session) => session.filePath === file)?.shared, mux.muxId);
 });
@@ -402,7 +395,10 @@ test('foreign events update shared tab state', async () => {
   assert.equal(session.thinkingLevel, 'high');
   const other = sessionFile('events-new');
   mux.broadcast({ type: 'pimux_session_changed', generation: 99, reason: 'new', sessionFile: other, previousSessionFile: null, sessionId: 'x', sessionName: null, cwd: PROJECT });
-  await until(() => session.sessionFile === other, 'session change');
+  assert.notEqual(session.sessionFile, other, 'a change record alone is not authoritative history');
+  mux.extraSnapshot.session = { file: other, id: 'new', name: null, cwd: PROJECT };
+  for (const socket of mux.connections) mux.snapshot(socket, 'session_changed');
+  await until(() => session.sessionFile === other, 'authoritative session boundary');
   assert.equal(liveManager.findBySessionFile(other), session);
 });
 
@@ -413,14 +409,14 @@ test('a gap rebuilds every view from the snapshot that follows', async () => {
   const id = (body.session as JsonRecord).id as string;
   const session = liveManager.get(id);
   mux.broadcast({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'lost later' }] } });
-  await until(() => session.entries.length === 3, 'tracked message');
+  await until(() => session.entries.length === 2, 'tracked message');
   browserMessages.length = 0;
   mux.entries = [];
   mux.leafId = null;
   mux.broadcast({ type: 'pimux_gap', generation: mux.generation + 1, dropped: 7 });
   for (const socket of mux.connections) mux.snapshot(socket, 'gap');
   await until(() => browserMessages.some((message) => message.type === 'live_session_snapshot'), 'snapshot after the gap');
-  assert.deepEqual(session.entries.map((entry: JsonRecord) => entry.type), ['session']);
+  assert.deepEqual(session.entries.map((entry: JsonRecord) => entry.type), []);
 });
 
 test('a shared session rebuilds a deep active path from flat entries, and leaves abandoned branches out', async () => {
@@ -446,7 +442,7 @@ test('a change without history shows the new identity, no old conversation and a
   mux.leafId = 'elsewhere';
   for (const socket of mux.connections) mux.snapshot(socket, 'session_changed');
   await until(() => browserMessages.some((message) => (message.event as JsonRecord | undefined)?.notifyType === 'error'), 'history error');
-  assert.deepEqual(session.entries.map((entry: JsonRecord) => entry.type), ['session']);
+  assert.deepEqual(session.entries.map((entry: JsonRecord) => entry.type), []);
   const notice = browserMessages.find((message) => (message.event as JsonRecord | undefined)?.notifyType === 'error')!;
   assert.match(String((notice.event as JsonRecord).message), /history could not be loaded: Invalid string length/);
 });
@@ -464,7 +460,7 @@ test('a snapshot failure on attach reports the reason at once', async () => {
 test('a stale pimux entry does not hide a terminal owner; a live one attaches despite force', async () => {
   const file = sessionFile('stale-owner');
   const dead = Number(spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']).stdout.toString());
-  const stale = new FakePimux(MUX_DIR!, 'mux-stale', { sessionFile: file, cwd: PROJECT, pid: dead, piPid: dead });
+  const stale = new FakePimux(MUX_DIR!, 'mux-stale', { sessionFile: file, cwd: PROJECT, pid: dead, piPid: dead, ownerIdentity: undefined, piIdentity: null });
   muxes.push(stale);
   const registry = path.join(process.env.TMPDIR!, 'pi-orchestration-targets');
   fs.mkdirSync(registry, { recursive: true });
@@ -481,22 +477,25 @@ test('a stale pimux entry does not hide a terminal owner; a live one attaches de
   assert.equal(forced.body.attached, true);
 });
 
-test('spawned tabs do not inherit orchestration placement or parent', async (t) => {
-  let env: Record<string, string> = {};
-  const child = new FakePi({ sessionFile: '' });
-  _setSpawnPiForTest((_cmd: string, _args: string[], options: { env: Record<string, string> }) => { env = options.env; return child.asChild(); });
-  t.after(() => _setSpawnPiForTest(null));
+test('new managed roots discard inherited placement/parent identities and preserve explicit overrides', async t => {
+  const launcher = new FakeRuntimeLauncher();
+  liveManager.runtime.start = launcher.start;
+  t.after(() => launcher.close());
   process.env.PI_ORCHESTRATION_PLACEMENT = 'worker';
   process.env.PI_ORCHESTRATION_PARENT = '{"host":"emacs"}';
+  process.env.PHIMACS_PARENT_TASK = '{"taskId":"old-task"}';
   try {
     const session = await liveManager.create({ cwd: PROJECT });
+    const env = launcher.calls[0].env!;
     assert.equal(env.PI_ORCHESTRATION_PLACEMENT, undefined);
     assert.equal(env.PI_ORCHESTRATION_PARENT, undefined);
+    assert.equal(env.PHIMACS_PARENT_TASK, undefined);
     assert.equal(env.PI_ORCHESTRATION_HOST, 'web');
     await liveManager.delete(session.id);
   } finally {
     delete process.env.PI_ORCHESTRATION_PLACEMENT;
     delete process.env.PI_ORCHESTRATION_PARENT;
+    delete process.env.PHIMACS_PARENT_TASK;
   }
 });
 

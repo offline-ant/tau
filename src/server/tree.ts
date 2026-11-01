@@ -256,7 +256,7 @@ export async function navigateTree(session: NavigableSession, entryId: string): 
     // Refresh entries and broadcast BEFORE verifying the leaf: at this point
     // the child is authoritative, so even when verification fails below every
     // client must be re-rendered onto whatever the child actually has.
-    session.entries = pathFromRoot(byId, newLeafId) as unknown as JsonRecord[];
+    // The mux snapshot, not this independent read, owns the history boundary.
     session.manager.broadcast({ type: 'live_session_snapshot', sessionId: session.id, ...await session.snapshot() });
     session.manager.broadcastUpdated(session.id);
     // On success the extension appended a marker at the navigation target and

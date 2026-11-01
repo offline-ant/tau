@@ -1,15 +1,24 @@
-import { test } from 'node:test';
+import { runtimeEnvironment, cwd } from './runtime-environment.ts';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import os from 'node:os';
-import { FakePi, flushIo } from './fake-pi.ts';
+import { flushIo } from './fake-pi.ts';
+import fs from 'node:fs';
+import { FakeRuntimeLauncher } from './runtime-launcher.ts';
+import { until } from './fake-pimux.ts';
+import { RuntimeOperationError } from '@phimacs/pimux/runtime';
+import { acquireClaim, releaseClaim } from '@phimacs/pimux/ownership';
+import { readProcessIdentity } from '@phimacs/pimux/process-identity';
 import type { JsonRecord } from '../src/server/types.ts';
 import { WebSocket } from 'ws';
 
 // The built server module is a plain JS artifact without declarations; the
 // old require() call typed these as any, so keep that contract here.
-const { LiveSessionManager, _setSpawnPiForTest } = (await import('../bin/tau.js')) as any;
+import * as tau from '../bin/tau.js';
+const { LiveSessionManager } = tau as any;
 import type { TestContext } from 'node:test';
+after(() => fs.rmSync(runtimeEnvironment.root, { recursive: true, force: true }));
 
 interface StubClient {
   readyState: number;
@@ -155,7 +164,7 @@ test('shutdown waits for every cleanup and reports failures without dropping unc
   mgr.sessions.set(failed.id, failed);
   mgr.sessions.set(delayed.id, delayed);
   let settled = false;
-  const shuttingDown = assert.rejects(mgr.shutdown(), /1 Pi child exit\(s\) unconfirmed/).then(() => { settled = true; });
+  const shuttingDown = assert.rejects(mgr.shutdown(), /1 view disconnect\(s\) unconfirmed/).then(() => { settled = true; });
   await flushIo();
   assert.equal(settled, false);
   finish();
@@ -164,178 +173,120 @@ test('shutdown waits for every cleanup and reports failures without dropping unc
   assert.equal(mgr.get(delayed.id), undefined);
 });
 
-test('create() waits for readiness before storing and broadcasting the real model', async (t: TestContext) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  const child = new FakePi({ autoRespond: false, state: { model: { provider: 'openai', id: 'gpt-5.5' }, thinkingLevel: 'high' } });
-  _setSpawnPiForTest(() => child.asChild());
-  t.after(() => _setSpawnPiForTest(null));
-  const mgr = new LiveSessionManager();
+function fixture(t: TestContext) {
+  const launcher = new FakeRuntimeLauncher();
+  const manager = new LiveSessionManager({ start: launcher.start });
+  t.after(async () => { await manager.shutdown().catch(() => {}); await launcher.close(); });
+  return { launcher, manager };
+}
+
+test('create() publishes a session only after managed commitment and the authoritative socket boundary', async t => {
+  const { launcher, manager } = fixture(t);
+  let ready!: () => void;
+  launcher.gate = new Promise(resolve => { ready = resolve; });
+  launcher.configure = mux => { mux.extraSnapshot = { model: { provider: 'fx', id: 'deep' }, thinkingLevel: 'high' }; };
   const client = openClient();
-  mgr.addClient(client);
-  const cwd = os.tmpdir();
-  const creating = mgr.create({ cwd });
-  t.mock.timers.tick(1000);
-  await flushIo();
-  assert.equal(mgr.sessions.size, 0);
+  manager.addClient(client);
+  const creating = manager.create({ cwd });
+  await until(() => launcher.calls.length === 1, 'launch entered');
+  assert.equal(manager.sessions.size, 0);
   assert.equal(client.sent.length, 0);
-  assert.deepEqual(child.commands.map((command) => command.type), ['get_state']);
-  child.autoRespond = true;
-  child.respond(child.commands[0]);
+  ready();
   const session = await creating;
-  assert.equal(mgr.get(session.id), session);
-  assert.equal(session.cwd, path.resolve(cwd));
-  assert.equal(session.pid, 12345);
-  const messages = client.sent.map((message) => JSON.parse(message));
-  const created = messages.filter((message) => message.type === 'live_session_created');
+  const created = client.sent.map(message => JSON.parse(message)).filter(message => message.type === 'live_session_created');
   assert.equal(created.length, 1);
-  assert.equal(created[0].session.id, session.id);
-  assert.deepEqual(created[0].session.model, { provider: 'openai', id: 'gpt-5.5' });
+  assert.equal(created[0].session.model.id, 'deep');
   assert.equal(created[0].session.thinkingLevel, 'high');
-  assert.ok(child.commands.some((command) => command.type === 'get_session_stats'));
+  assert.equal(created[0].session.runtime.protocol, 2);
+  assert.equal(session.transport.kind, 'pimux');
 });
 
-test('resume() forwards args/env and uses the active branch while preserving header/name', async (t: TestContext) => {
-  const cwd = os.tmpdir();
-  const sessionFile = path.join(cwd, 'tau-resume-branch.jsonl');
-  const root = { id: 'root', parentId: null, type: 'message', message: { role: 'user', content: 'question' } };
-  const kept = { id: 'kept', parentId: 'root', type: 'message', message: { role: 'assistant', content: 'kept answer' } };
-  const discarded = { id: 'discarded', parentId: 'root', type: 'message', message: { role: 'assistant', content: 'other branch' } };
-  const header = { type: 'session', id: 'session-id', cwd };
-  const child = new FakePi({ sessionFile, entries: [root, kept, discarded], leafId: 'kept' });
-  const calls: Array<{ args: string[]; options: JsonRecord }> = [];
-  _setSpawnPiForTest((_command: string, args: string[], options: JsonRecord) => {
-    calls.push({ args, options });
-    return child.asChild();
-  });
-  t.after(() => _setSpawnPiForTest(null));
-  const mgr = new LiveSessionManager();
-  const client = openClient();
-  mgr.addClient(client);
-  const args = ['--provider', 'openai', '--thinking', 'high'];
-  const env = { PI_CODING_AGENT_DIR: '/tmp/private-agent', HERDR_SOCKET_PATH: '/tmp/herdr.sock' };
-  const { session: session } = await mgr.resume({ sessionFile, cwd, model: 'gpt-4o', entries: [header, root, kept, discarded], sessionName: 'My Session', args, env });
-  assert.equal(mgr.get(session.id), session);
-  assert.deepEqual(session.entries, [header, root, kept]);
-  assert.equal(session.sessionName, 'My Session');
-  assert.equal(session.sessionFile, sessionFile);
-  assert.equal(calls[0].args[calls[0].args.indexOf('--session') + 1], sessionFile);
-  assert.equal(calls[0].args[calls[0].args.indexOf('--model') + 1], 'gpt-4o');
-  assert.deepEqual(calls[0].args.slice(-args.length), args);
-  const childEnv = calls[0].options.env as Record<string, string>;
-  for (const [key, value] of Object.entries(env)) assert.equal(childEnv[key], value);
-  const created = client.sent.map((message) => JSON.parse(message)).find((message) => message.type === 'live_session_created');
-  assert.equal(created.session.sessionFile, sessionFile);
-  assert.equal(created.session.sessionName, 'My Session');
+test('resume() forwards overrides and takes its active branch and name from the mux, not the disk cache', async t => {
+  const { launcher, manager } = fixture(t);
+  const file = path.join(runtimeEnvironment.sessions, 'branch.jsonl');
+  const root = { id: 'root', parentId: null, type: 'message' };
+  const kept = { id: 'kept', parentId: 'root', type: 'message' };
+  const other = { id: 'other', parentId: 'root', type: 'message' };
+  launcher.configure = mux => { mux.entries = [root, kept, other]; mux.leafId = 'kept'; mux.extraSnapshot.session = { file, id: 'branch', name: 'Runtime title', cwd }; };
+  const args = ['--provider', 'fx', '--thinking', 'high'];
+  const env = { PI_CODING_AGENT_DIR: '/synthetic/agent', HERDR_SOCKET_PATH: '/synthetic/herdr.sock' };
+  const result = await manager.resume({ sessionFile: file, cwd, model: 'fx/one', entries: [{ id: 'stale' }], sessionName: 'Stale title', args, env });
+  assert.deepEqual(result.session.entries, [root, kept]);
+  assert.equal(result.session.sessionName, 'Runtime title');
+  assert.equal(launcher.calls[0].args[launcher.calls[0].args.indexOf('--session') + 1], file);
+  assert.deepEqual(launcher.calls[0].args.slice(-args.length), args);
+  for (const [key, value] of Object.entries(env)) assert.equal(launcher.calls[0].env?.[key], value);
 });
 
-test('resume() coalesces delayed concurrent and repeated resumes for the same file', async (t: TestContext) => {
-  const sessionFile = '/tmp/tau-concurrent-resume.jsonl';
-  const child = new FakePi({ sessionFile, autoRespond: false });
-  let spawned = 0;
-  _setSpawnPiForTest(() => { spawned++; return child.asChild(); });
-  t.after(() => _setSpawnPiForTest(null));
-  const mgr = new LiveSessionManager();
-  const first = mgr.resume({ sessionFile, cwd: os.tmpdir() });
-  const second = mgr.resume({ sessionFile, cwd: os.tmpdir() });
-  assert.equal(mgr.hasPendingResume(sessionFile), true);
-  await flushIo();
-  assert.equal(spawned, 1);
-  assert.equal(mgr.sessions.size, 0);
-  child.autoRespond = true;
-  child.respond(child.commands[0]);
+test('resume() joins concurrent startup and later reuses the same view without another managed launch', async t => {
+  const { launcher, manager } = fixture(t);
+  const file = path.join(runtimeEnvironment.sessions, 'concurrent.jsonl');
+  let ready!: () => void;
+  launcher.gate = new Promise(resolve => { ready = resolve; });
+  const first = manager.resume({ sessionFile: file, cwd });
+  const second = manager.resume({ sessionFile: file, cwd });
+  await until(() => launcher.calls.length === 1, 'one launch');
+  assert.equal(manager.hasPendingResume(file), true);
+  ready();
   const [a, b] = await Promise.all([first, second]);
   assert.equal(a.session, b.session);
   assert.equal(a.started, true);
   assert.equal(b.started, false);
-  const repeated = await mgr.resume({ sessionFile, cwd: os.tmpdir() });
-  assert.equal(repeated.session, a.session);
-  assert.equal(repeated.started, false);
-  assert.equal(spawned, 1);
-  assert.equal(mgr.hasPendingResume(sessionFile), false);
+  assert.equal((await manager.resume({ sessionFile: file, cwd })).session, a.session);
+  assert.equal(launcher.calls.length, 1);
+  assert.equal(manager.hasPendingResume(file), false);
 });
 
-test('resume() waits for actual child exit during concurrent deletes', async (t: TestContext) => {
-  const sessionFile = '/tmp/tau-wait-exit.jsonl';
-  const children: FakePi[] = [];
-  _setSpawnPiForTest(() => {
-    const child = new FakePi({ sessionFile, exitOnSignal: null });
-    children.push(child);
-    return child.asChild();
-  });
-  t.after(() => _setSpawnPiForTest(null));
-  const mgr = new LiveSessionManager();
-  const { session: first } = await mgr.resume({ sessionFile, cwd: os.tmpdir() });
-  const deletion = mgr.delete(first.id);
-  const duplicateDeletion = mgr.delete(first.id);
-  assert.equal(mgr.hasTerminatingResume(sessionFile), true);
-  assert.equal(mgr.get(first.id), first, 'retain ownership until exit');
-  const resuming = mgr.resume({ sessionFile, cwd: os.tmpdir() });
-  await flushIo();
-  assert.equal(children.length, 1);
-  assert.deepEqual(children[0].signals, ['SIGTERM']);
-  children[0].exit(null, 'SIGTERM');
-  const [second] = await Promise.all([resuming, deletion, duplicateDeletion]);
-  assert.notEqual(first.id, second.session.id);
-  assert.equal(second.started, true);
-  assert.equal(children.length, 2);
-  assert.equal(mgr.sessions.size, 1);
-  assert.equal(mgr.hasTerminatingResume(sessionFile), false);
+test('resume during a disconnect refuses until the view settles, then reattaches without restarting Pi', async t => {
+  const { launcher, manager } = fixture(t);
+  const file = path.join(runtimeEnvironment.sessions, 'disconnecting.jsonl');
+  const { session } = await manager.resume({ sessionFile: file, cwd });
+  const transport = session.transport;
+  const close = transport.close.bind(transport);
+  let finish!: () => void;
+  const gate = new Promise<void>(resolve => { finish = resolve; });
+  t.mock.method(transport, 'close', () => gate.then(close));
+  const deletion = manager.delete(session.id);
+  await assert.rejects(manager.resume({ sessionFile: file, cwd }), /disconnecting/);
+  assert.equal(launcher.calls.length, 1);
+  finish();
+  await deletion;
+  const successor = await manager.resume({ sessionFile: file, cwd });
+  assert.notEqual(successor.session.id, session.id);
+  assert.equal(successor.started, false);
+  assert.equal(launcher.calls.length, 1);
 });
 
-test('failed cleanup rejects delete and concurrent resume without dropping ownership', async (t: TestContext) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  const sessionFile = '/tmp/tau-uncertain-exit.jsonl';
-  const child = new FakePi({ sessionFile, exitOnSignal: null });
-  let spawned = 0;
-  _setSpawnPiForTest(() => { spawned++; return child.asChild(); });
-  t.after(() => _setSpawnPiForTest(null));
-  const mgr = new LiveSessionManager();
-  const { session: session } = await mgr.resume({ sessionFile, cwd: os.tmpdir() });
-  const deletion = assert.rejects(mgr.delete(session.id), { childStopped: false, sessionId: session.id });
-  const resuming = assert.rejects(mgr.resume({ sessionFile, cwd: os.tmpdir() }), { childStopped: false, sessionId: session.id });
-  await flushIo();
-  t.mock.timers.tick(1500);
-  await flushIo();
-  t.mock.timers.tick(5000);
-  await Promise.all([deletion, resuming]);
-  assert.equal(mgr.get(session.id), session);
-  assert.equal(spawned, 1);
-  await assert.rejects(mgr.resume({ sessionFile, cwd: os.tmpdir() }), { childStopped: false, sessionId: session.id });
-  assert.equal(spawned, 1);
-  child.exit(null, 'SIGKILL');
-  assert.equal(mgr.sessions.size, 0);
+test('failed disconnect retains the unavailable view and never grants permission to launch a second writer', async t => {
+  const { launcher, manager } = fixture(t);
+  const file = path.join(runtimeEnvironment.sessions, 'uncertain-disconnect.jsonl');
+  const { session } = await manager.resume({ sessionFile: file, cwd });
+  const transport = session.transport;
+  const close = transport.close.bind(transport);
+  t.mock.method(transport, 'close', async () => { throw new Error('disconnect unconfirmed'); });
+  await assert.rejects(manager.delete(session.id), /disconnect unconfirmed/);
+  assert.equal(manager.get(session.id), session);
+  await assert.rejects(manager.resume({ sessionFile: file, cwd }), /disconnecting/);
+  assert.equal(launcher.calls.length, 1);
+  t.mock.method(transport, 'close', close);
+  await manager.delete(session.id);
 });
 
-test('ambiguous startup retains the child and blocks later resumes until exit', async (t: TestContext) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  const sessionFile = '/tmp/tau-failed-start.jsonl';
-  const child = new FakePi({ sessionFile, autoRespond: false, exitOnSignal: null });
-  let spawned = 0;
-  _setSpawnPiForTest(() => { spawned++; return child.asChild(); });
-  t.after(() => _setSpawnPiForTest(null));
-  const mgr = new LiveSessionManager();
-  const failing = assert.rejects(mgr.resume({ sessionFile, cwd: os.tmpdir() }), { childStopped: false });
-  await flushIo();
-  child.respond(child.commands[0], { success: false, error: 'configuration rejected' });
-  await flushIo();
-  t.mock.timers.tick(1500);
-  await flushIo();
-  t.mock.timers.tick(5000);
-  await failing;
-  assert.equal(mgr.sessions.size, 1);
-  assert.equal(mgr.hasPendingResume(sessionFile), false);
-  await assert.rejects(mgr.resume({ sessionFile, cwd: os.tmpdir() }), { childStopped: false });
-  assert.equal(spawned, 1);
-  child.exit(null, 'SIGKILL');
-  assert.equal(mgr.sessions.size, 0);
+test('ambiguous startup identifies its retained operation and a live common claim blocks another launch', async t => {
+  const { launcher, manager } = fixture(t);
+  const file = path.join(runtimeEnvironment.sessions, 'uncertain-start.jsonl');
+  launcher.failure = new RuntimeOperationError('startup uncertain', 'retained-operation', 'retained-runtime');
+  await assert.rejects(manager.resume({ sessionFile: file, cwd }), /retained-operation/);
+  const identity = readProcessIdentity(process.pid)!;
+  const claim = acquireClaim(file, { id: 'retained-runtime', kind: 'rpc', protocol: 2, socket: path.join(process.env.PIMUX_DIR!, 'retained.sock'), operationId: 'retained-operation', wrapper: identity, pi: identity });
+  t.after(() => releaseClaim(claim));
+  await assert.rejects(manager.resume({ sessionFile: file, cwd }), /unavailable/);
+  assert.equal(launcher.calls.length, 1);
 });
 
-test('create() rejects a missing cwd without spawning a child', async (t: TestContext) => {
-  let spawned = false;
-  _setSpawnPiForTest(() => { spawned = true; return new FakePi().asChild(); });
-  t.after(() => _setSpawnPiForTest(null));
-  const mgr = new LiveSessionManager();
-  await assert.rejects(mgr.create({ cwd: '/definitely/not/a/real/path/tau' }), { childStopped: true });
-  assert.equal(spawned, false);
-  assert.equal(mgr.sessions.size, 0);
+test('create() rejects a missing directory before invoking the managed launcher', async t => {
+  const { launcher, manager } = fixture(t);
+  await assert.rejects(manager.create({ cwd: '/definitely/not/a/real/path/tau' }), /Directory not found/);
+  assert.equal(launcher.calls.length, 0);
+  assert.equal(manager.sessions.size, 0);
 });

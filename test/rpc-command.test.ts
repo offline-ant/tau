@@ -1,19 +1,16 @@
+import { runtimeEnvironment } from './rpc-test-environment.ts';
+import { runtimeFixture } from './runtime-fixture.ts';
+import { until } from './fake-pimux.ts';
 import { test, beforeEach, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import * as tau from '../bin/tau.js';
 
-// Isolate settings + sessions in a temp tree, and configure auth credentials
-// so set_auth can succeed. Env must be set before requiring the module.
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-rpc-'));
-process.env.PI_CODING_AGENT_DIR = TMP;
-process.env.PI_CODING_AGENT_SESSION_DIR = path.join(TMP, 'sessions');
-process.env.TAU_USER = 'admin';
-process.env.TAU_PASS = 's3cret';
+const TMP = runtimeEnvironment.root;
 
-// Load the server after the env + credentials are in place: the module reads
-// them at load time, and ESM hoists static imports ahead of this body.
+// The first environment module supplies synthetic credentials before Tau loads.
 const {
   handleRpcCommand,
   PiRpcSession,
@@ -23,7 +20,8 @@ const {
   _setAuthForTest,
   _setExecFileForTest,
   SESSIONS_DIR,
-} = (await import('../bin/tau.js')) as any;
+  PI_COMMAND,
+} = tau as any;
 
 interface RpcTestSession {
   id: string;
@@ -130,7 +128,8 @@ fireworks     accounts/fireworks/models/deepseek-v4-flash         1M       384K 
 
 test('get_available_models returns parsed pi model list', async () => {
   _setExecFileForTest((file: string, args: string[], opts: object, cb: (err: Error | null, stdout: string, stderr: string) => void) => {
-    assert.equal(file, 'pi');
+    assert.equal(file, PI_COMMAND);
+    assert.equal(path.isAbsolute(file), true, 'metadata never invokes global Pi');
     assert.deepEqual(args, ['--list-models']);
     cb(null, `provider      model                                               context  max-out  thinking  images
 openrouter    z-ai/glm-5.2                                        128K     16K      yes       no
@@ -272,11 +271,12 @@ test('unknown command is rejected', async () => {
   assert.match(resp.error, /Unknown command: bogus/);
 });
 
-test('new_session is for shared tabs: a spawned tab opens new sessions as new tabs', async () => {
-  const session = injectSession({ send: async () => assert.fail('must not reach Pi') });
-  const resp = await handleRpcCommand({ type: 'new_session', sessionId: session.id });
-  assert.equal(resp.success, false);
-  assert.match(resp.error, /new Tau tab/);
+test('new_session moves the same shared runtime rather than creating a frontend-owned tab', async () => {
+  const commands: string[] = [];
+  const session = injectSession({ send: async command => { commands.push(String(command.type)); return { type: 'response', success: true, data: {} }; } });
+  const response = await handleRpcCommand({ type: 'new_session', sessionId: session.id });
+  assert.equal(response.success, true);
+  assert.deepEqual(commands, ['new_session']);
 });
 
 test('native commands are proxied to the child and success is preserved', async () => {
@@ -300,20 +300,21 @@ test('Abort acknowledgement timeout reports failure and preserves the running st
   assert.equal(session.metadata().abortState, 'timed_out');
 });
 
-test('UI reply acknowledges stdin delivery immediately without a Pi response or timer', async () => {
-  const session = new PiRpcSession(liveManager, { cwd: '/tmp' });
-  const writes: Record<string, unknown>[] = [];
-  session.child = { stdin: { writable: true, write(data: string, cb: () => void) { writes.push(JSON.parse(data)); cb(); } } };
+test('UI reply acknowledges socket delivery without an RPC timer and membership waits for mux closure', async t => {
+  const { session, mux, emit } = await runtimeFixture(t);
   liveManager.sessions.set(session.id, session);
-  session.handleEvent({ type: 'extension_ui_request', id: 'confirm-1', method: 'confirm' });
-  const resp = await handleRpcCommand({ type: 'extension_ui_response', id: 'confirm-1', sessionId: session.id, confirmed: false });
-  assert.equal(resp.success, true);
-  assert.deepEqual(resp.data, { delivered: true });
+  await emit({ type: 'extension_ui_request', id: 'confirm-1', method: 'confirm' });
+  await until(() => session.attachment?.dialogs.has('confirm-1'), 'dialog received');
+  const response = await handleRpcCommand({ type: 'extension_ui_response', id: 'confirm-1', sessionId: session.id, confirmed: false });
+  assert.equal(response.success, true);
+  assert.deepEqual(response.data, { delivered: true });
   assert.equal(session.pending.size, 0);
-  assert.deepEqual(writes, [{ type: 'extension_ui_response', id: 'confirm-1', confirmed: false }]);
+  assert.equal(session.attachment?.dialogs.has('confirm-1'), true);
+  await until(() => mux.commands.some(command => command.id === 'confirm-1' && command.confirmed === false), 'reply delivered');
+  await emit({ type: 'pimux_dialog_closed', id: 'confirm-1', reason: 'answered' });
+  await until(() => !session.attachment?.dialogs.has('confirm-1'), 'mux closure');
   const stale = await handleRpcCommand({ type: 'extension_ui_response', id: 'confirm-1', sessionId: session.id, confirmed: true });
   assert.equal(stale.success, false);
-  assert.equal(writes.length, 1);
 });
 
 test('prompt acknowledgement timeout is not treated as acceptance', async () => {

@@ -11,7 +11,7 @@
 
 import fs from 'node:fs';
 
-import { listPimuxEntries, pimuxDirectory, pimuxDisplayName, processAlive, type PimuxEntry, type PimuxRef } from './pimux.js';
+import { listPimuxEntries, pimuxDirectory, pimuxDisplayName, pimuxOwnerAlive, type PimuxEntry, type PimuxRef } from './pimux.js';
 
 export type AgentStatus = 'starting' | 'blocked' | 'working' | 'done' | 'idle';
 export type Agent = {
@@ -99,7 +99,7 @@ export class AgentOverview {
   }
 
   refresh() {
-    const entries = listPimuxEntries(this.dir).filter((entry) => processAlive(entry.pid));
+    const entries = listPimuxEntries(this.dir).filter(pimuxOwnerAlive);
     const live = new Set(entries.map((entry) => entry.muxId));
     for (const id of this.memory.keys()) if (!live.has(id)) this.memory.delete(id);
     this.agents = entries.map((entry) => {

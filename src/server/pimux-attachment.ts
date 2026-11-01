@@ -14,24 +14,16 @@
  */
 
 import type { JsonRecord } from './types.js';
+import { DIALOG_METHODS, PROTOCOL_VERSION, type SnapshotData, type SessionIdentity } from '@phimacs/pimux/protocol';
+import { canonicalSessionPath } from '@phimacs/pimux/ownership';
 
-const DIALOG_METHODS = new Set(['select', 'confirm', 'input', 'editor']);
-const SEQUENCE_INTERRUPTIONS = new Set(['pimux_gap', 'pimux_snapshot', 'pimux_snapshot_failed', 'pimux_exit']);
+const SEQUENCE_INTERRUPTIONS = new Set(['pimux_gap', 'pimux_snapshot', 'pimux_snapshot_failed', 'pimux_exit', 'pimux_session_changed', 'pimux_tree_changed']);
 
-export type PimuxSnapshotRecord = JsonRecord & {
+export type PimuxSnapshotRecord = JsonRecord & SnapshotData & {
   generation: number;
   reason?: string;
-  session?: { file: string | null; id: string; name: string | null; cwd: string };
-  model?: unknown;
-  thinkingLevel?: string;
-  idle?: boolean;
-  leafId?: string | null;
-  entries?: unknown[];
-  /** A change whose history Pi could not send: only the identity fields are current. */
-  historyError?: string;
   run?: { active?: boolean; compacting?: boolean; tailTruncated?: boolean };
-  /** Number of replay records in this sequence. */
-  replay?: number;
+  replay: number;
 };
 
 export type AppliedSnapshot = { snapshot: PimuxSnapshotRecord; replay: JsonRecord[]; dialogs: JsonRecord[] };
@@ -56,40 +48,70 @@ export class PimuxAttachment {
   private collecting: { snapshot: PimuxSnapshotRecord; replay: JsonRecord[] } | null = null;
   private waiters: Waiter[] = [];
   private readonly onSnapshot: (applied: AppliedSnapshot) => void;
+  private readonly expected: { piPid: number; sessionFile: string | null };
+  private hello = false;
+  private terminalError: Error | null = null;
+  private lastFailure: { generation: number; error: Error } | null = null;
+  ready = false;
+  leafId: string | null = null;
+  session: SessionIdentity | null = null;
+  /** Complete flat tree at the authoritative boundary, distinct from UI projection. */
+  snapshot: PimuxSnapshotRecord | null = null;
+  private replayBytes = 0;
 
-  constructor(muxId: string, socket: string, onSnapshot: (applied: AppliedSnapshot) => void) {
+  constructor(muxId: string, socket: string, onSnapshot: (applied: AppliedSnapshot) => void, expected: { piPid: number; sessionFile: string | null }) {
     this.muxId = muxId;
     this.socket = socket;
     this.onSnapshot = onSnapshot;
+    this.expected = expected;
   }
 
   /** Consumes protocol and replay records; returns false for records the session handles itself. */
   handle(record: JsonRecord): boolean {
     if (this.collecting && SEQUENCE_INTERRUPTIONS.has(String(record.type))) this.collecting = null;
+    if (SEQUENCE_INTERRUPTIONS.has(String(record.type))) this.ready = false;
     if (this.collecting) {
       if (record.type === 'pimux_live') {
-        if (record.generation === this.collecting.snapshot.generation) this.finishSnapshot();
+        if (record.generation === this.collecting.snapshot.generation && this.collecting.replay.length === this.collecting.snapshot.replay) this.finishSnapshot();
         else this.collecting = null;
         return true;
       }
       // Sequences are contiguous; a response here would belong to a command, not the replay.
       if (record.type === 'response') return false;
       // More records than announced: this is no longer the sequence, and must not grow without end.
-      if (this.collecting.replay.length >= (this.collecting.snapshot.replay ?? Infinity)) {
-        this.collecting = null;
-        return false;
-      }
+      if (this.collecting.replay.length >= this.collecting.snapshot.replay) throw new Error('Runtime sent more replay records than announced');
+      this.replayBytes += Buffer.byteLength(JSON.stringify(record));
+      if (this.replayBytes > 64 * 1024 * 1024) throw new Error('Runtime replay exceeds bound');
       this.collecting.replay.push(record);
       return true;
     }
     switch (record.type) {
-      case 'pimux_hello':
+      case 'pimux_hello': {
+        const capabilities = record.capabilities;
+        if (record.protocol !== PROTOCOL_VERSION || record.muxId !== this.muxId || record.piPid !== this.expected.piPid
+          || !Array.isArray(capabilities) || !['snapshot', 'stop', 'detached'].every(cap => capabilities.includes(cap))) {
+          throw new Error('Runtime protocol, identity or capabilities mismatch');
+        }
+        this.hello = true;
         this.clientId = typeof record.clientId === 'number' ? record.clientId : null;
         this.piPid = typeof record.piPid === 'number' ? record.piPid : null;
         return true;
-      case 'pimux_snapshot':
-        this.collecting = { snapshot: record as PimuxSnapshotRecord, replay: [] };
+      }
+      case 'pimux_snapshot': {
+        if (!this.hello || !Number.isSafeInteger(record.generation) || !Number.isSafeInteger(record.replay)
+          || Number(record.replay) < 0 || Number(record.replay) > 1_000_000 || !record.session || typeof record.session !== 'object') {
+          throw new Error('Invalid runtime snapshot');
+        }
+        const snapshot = record as PimuxSnapshotRecord;
+        if (this.appliedGeneration < 0 && this.expected.sessionFile && (!snapshot.session.file
+          || canonicalSessionPath(snapshot.session.file) !== canonicalSessionPath(this.expected.sessionFile))) {
+          throw new Error('Runtime is serving a different conversation');
+        }
+        if (snapshot.generation <= this.appliedGeneration) throw new Error('Runtime snapshot generation did not advance');
+        this.replayBytes = 0;
+        this.collecting = { snapshot, replay: [] };
         return true;
+      }
       case 'pimux_live':
       case 'pimux_gap':
         return true;
@@ -119,6 +141,11 @@ export class PimuxAttachment {
     this.dialogs.clear();
     for (const dialog of dialogs) this.dialogs.set(String(dialog.id), dialog);
     this.appliedGeneration = snapshot.generation;
+    if (this.lastFailure && this.lastFailure.generation <= snapshot.generation) this.lastFailure = null;
+    this.leafId = snapshot.leafId;
+    this.session = snapshot.session;
+    this.snapshot = snapshot;
+    this.ready = true;
     this.onSnapshot({ snapshot, replay: replay.filter((record) => !isDialogRequest(record)), dialogs });
     const satisfied = this.waiters.filter((waiter) => waiter.generation <= snapshot.generation);
     this.waiters = this.waiters.filter((waiter) => waiter.generation > snapshot.generation);
@@ -127,7 +154,9 @@ export class PimuxAttachment {
 
   /** Resolves once a snapshot of `generation` or later has been published; generation 0 waits for the first. */
   waitFor(generation: number, timeoutMs = 35000): Promise<void> {
-    if (this.appliedGeneration >= generation && this.appliedGeneration >= 0) return Promise.resolve();
+    if (this.terminalError) return Promise.reject(this.terminalError);
+    if (this.lastFailure && generation <= this.lastFailure.generation && this.appliedGeneration < generation) return Promise.reject(this.lastFailure.error);
+    if (this.ready && this.appliedGeneration >= generation && this.appliedGeneration >= 0) return Promise.resolve();
     return new Promise((resolve, reject) => {
       const waiter: Waiter = {
         generation, resolve, reject,
@@ -142,6 +171,8 @@ export class PimuxAttachment {
 
   /** `pimux_snapshot_failed` for `generation`: only requests it did not supersede fail. */
   private fail(generation: number, error: Error) {
+    this.lastFailure = { generation, error };
+    if (this.appliedGeneration < 0) this.terminalError = error;
     const failed = this.waiters.filter((waiter) => waiter.generation <= generation);
     this.waiters = this.waiters.filter((waiter) => waiter.generation > generation);
     for (const waiter of failed) { clearTimeout(waiter.timer); waiter.reject(error); }
@@ -149,6 +180,8 @@ export class PimuxAttachment {
 
   /** The connection ended: nothing can satisfy the waiters any more. */
   close(error: Error) {
+    this.terminalError = error;
+    this.ready = false;
     this.collecting = null;
     for (const waiter of this.waiters) { clearTimeout(waiter.timer); waiter.reject(error); }
     this.waiters = [];

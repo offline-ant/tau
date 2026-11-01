@@ -1,101 +1,89 @@
-import { test, before, after, beforeEach } from 'node:test';
+import { runtimeEnvironment } from './runtime-environment.ts';
+import { runtimeFixture } from './runtime-fixture.ts';
+import { until } from './fake-pimux.ts';
+import { test, before, after, beforeEach, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
-import { WebSocket, WebSocketServer } from 'ws';
-import type { TestContext } from 'node:test';
-import type { WebSocket as WsWebSocket } from 'ws';
+import { WebSocket, type ClientOptions } from 'ws';
+import type { AddressInfo } from 'node:net';
 import { WebSocketClient } from '../public/websocket-client.js';
-
-// Loopback + isolated settings tree.
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-ws-'));
-process.env.TAU_HOST = '127.0.0.1';
-process.env.PI_CODING_AGENT_DIR = TMP;
-process.env.PI_CODING_AGENT_SESSION_DIR = path.join(TMP, 'sessions');
-fs.mkdirSync(process.env.PI_CODING_AGENT_SESSION_DIR, { recursive: true });
-// These cases connect unauthenticated; this fork configures default
-// credentials, so opt out explicitly with empty values.
-process.env.TAU_USER = '';
-process.env.TAU_PASS = '';
-
-// Load the server after the env + settings are in place: the module reads
-// them at load time, and ESM hoists static imports ahead of this body.
-const { server, computeUrls, liveManager, PiRpcSession, _setAuthForTest } = (await import('../bin/tau.js')) as any;
+import { server, computeUrls, liveManager, wss, _setAuthForTest } from '../bin/tau.js';
+import type { JsonRecord } from '../src/server/types.ts';
 
 let base = '';
 let wsUrl = '';
 
-interface FakeWsSession {
-  id: string;
-  cwd: string;
-  model: string;
-  modelSpec: string;
-  thinkingLevel: string;
-  isStreaming: boolean;
-  sessionFile: string;
-  sessionName: string | null;
-  contextUsage: { tokens?: number } | null;
-  metadata: () => { id: string; cwd: string; model: string; isStreaming: boolean };
-  snapshot: () => { session: { id: string }; entries: unknown[]; model: string; isStreaming: boolean };
-  terminate: () => Promise<void>;
-}
-
-function fakeSession(id: string): FakeWsSession {
+function fakeSession(id: string) {
+  const metadata = { id, cwd: runtimeEnvironment.root, model: 'fx/one', isStreaming: false };
   return {
-    id,
-    cwd: '/tmp/proj',
-    model: 'openai/gpt-5.5',
-    modelSpec: '',
-    thinkingLevel: 'off',
-    isStreaming: false,
-    sessionFile: `/tmp/${id}.jsonl`,
-    sessionName: null,
-    contextUsage: null,
-    metadata: () => ({ id, cwd: '/tmp/proj', model: 'openai/gpt-5.5', isStreaming: false }),
-    snapshot: () => ({ session: { id }, entries: [], model: 'openai/gpt-5.5', isStreaming: false }),
+    ...metadata, modelSpec: '', thinkingLevel: 'off', sessionFile: path.join(runtimeEnvironment.sessions, `${id}.jsonl`),
+    sessionName: null, contextUsage: null,
+    metadata: () => metadata,
+    snapshot: () => ({ session: metadata, entries: [], model: 'fx/one', isStreaming: false }),
     terminate: async () => {},
   };
 }
 
 before(async () => {
   _setAuthForTest(false);
-  await new Promise<void>((resolve) => {
-    server.listen(0, '127.0.0.1', () => {
-      const port = server.address().port;
-      computeUrls(port);
-      base = `http://127.0.0.1:${port}`;
-      wsUrl = `ws://127.0.0.1:${port}/ws`;
-      resolve();
-    });
-  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', () => {
+    const port = (server.address() as AddressInfo).port;
+    computeUrls(port);
+    base = `http://127.0.0.1:${port}`;
+    wsUrl = `ws://127.0.0.1:${port}/ws`;
+    resolve();
+  }));
 });
-
 after(async () => {
-  await new Promise<void>((resolve) => server.close(() => resolve()));
+  for (const client of wss.clients) client.terminate();
+  await liveManager.shutdown();
+  await new Promise<void>(resolve => server.close(() => resolve()));
+  fs.rmSync(runtimeEnvironment.root, { recursive: true, force: true });
 });
-
-beforeEach(() => {
+beforeEach(async () => {
+  for (const client of wss.clients) client.terminate();
+  await liveManager.shutdown();
   liveManager.sessions.clear();
+  await until(() => liveManager.clients.size === 0, 'previous browser connections closed');
 });
 
-function connect(opts: any = {}) {
-  const headers = opts.headers || {};
-  if (opts.origin !== null) headers.Origin = opts.origin ?? base;
-  headers.Host = new URL(base).host;
-  const ws = new WebSocket(wsUrl, { headers, ...opts });
-  return ws;
+type ConnectOptions = Omit<ClientOptions, 'origin' | 'headers'> & { origin?: string | null; headers?: Record<string, string> };
+function connect(options: ConnectOptions = {}) {
+  const { origin, headers: supplied, ...rest } = options;
+  const headers = { ...supplied, Host: new URL(base).host };
+  if (origin !== null) Object.assign(headers, { Origin: origin ?? base });
+  return new WebSocket(wsUrl, { ...rest, headers });
 }
-
-function nextMessage(ws: WsWebSocket, timeout = 2000): Promise<any> {
+function nextMessage(ws: WebSocket, timeout = 2000): Promise<JsonRecord> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('timed out waiting for WS message')), timeout);
-    ws.once('message', (data: Buffer) => { clearTimeout(timer); resolve(JSON.parse(data.toString())); });
-    ws.once('error', (e: Error) => { clearTimeout(timer); reject(e); });
+    const cleanup = () => { clearTimeout(timer); ws.off('message', message); ws.off('error', error); };
+    const message = (data: Buffer) => { cleanup(); resolve(JSON.parse(data.toString()) as JsonRecord); };
+    const error = (cause: Error) => { cleanup(); reject(cause); };
+    const timer = setTimeout(() => { cleanup(); reject(new Error('Timed out waiting for WebSocket message')); }, timeout);
+    ws.once('message', message);
+    ws.once('error', error);
   });
 }
+function collect(ws: WebSocket): JsonRecord[] {
+  const records: JsonRecord[] = [];
+  ws.on('message', data => records.push(JSON.parse(data.toString()) as JsonRecord));
+  return records;
+}
+function list(value: unknown): JsonRecord[] {
+  assert.ok(Array.isArray(value));
+  return value as JsonRecord[];
+}
+async function browserRuntime(t: TestContext) {
+  const fixture = await runtimeFixture(t);
+  liveManager.sessions.set(fixture.session.id, fixture.session);
+  // The socket fixture's real session sends to its own manager. Route that
+  // manager's normal fanout to this test server's browser connections.
+  t.mock.method(fixture.manager, 'broadcast', (record: unknown) => liveManager.broadcast(record));
+  return fixture;
+}
 
-test('the browser transport dispatches authoritative interaction state without treating it as an RPC event', () => {
+test('browser transport dispatches authoritative interaction state without treating it as an RPC event', () => {
   const client = new WebSocketClient('ws://127.0.0.1/unused');
   const message = { type: 'interaction_state', sessionId: 'live', interactionRevision: 3, pendingDialogs: [] };
   let received: unknown;
@@ -107,108 +95,104 @@ test('the browser transport dispatches authoritative interaction state without t
   assert.equal(rpcEvents, 0);
 });
 
-test('cross-origin WebSocket upgrade is rejected', async () => {
-  const ws = connect({ origin: 'http://evil.example' });
-  // ws client does not surface the HTTP status on the error event, so we
-  // only assert that the upgrade does not succeed.
-  await assert.rejects(
-    () => new Promise((_, reject) => {
-      ws.on('error', reject);
-      ws.on('open', () => reject(new Error('cross-origin upgrade should not succeed')));
-    }),
-  );
-  try { ws.close(); } catch {}
+test('cross-origin WebSocket upgrade is rejected rather than opening a connection', async () => {
+  const ws = connect({ origin: 'http://untrusted.invalid' });
+  await assert.rejects(new Promise<void>((resolve, reject) => { ws.once('error', reject); ws.once('open', resolve); }));
+  ws.close();
 });
 
 test('same-origin WebSocket upgrade receives the initial live-session state', async () => {
   liveManager.sessions.set('tau_1', fakeSession('tau_1'));
   const ws = connect();
-  const msg = await nextMessage(ws);
-  assert.equal(msg.type, 'state');
-  assert.equal(msg.liveSessions.length, 1);
-  assert.equal(msg.liveSessions[0].id, 'tau_1');
+  const message = await nextMessage(ws);
+  assert.equal(message.type, 'state');
+  assert.equal(list(message.liveSessions).length, 1);
+  assert.equal(list(message.liveSessions)[0].id, 'tau_1');
   ws.close();
 });
 
-test('RPC commands over WebSocket are handled and respond', async () => {
-  const ws = connect();
-  await nextMessage(ws); // swallow initial state
-  ws.send(JSON.stringify({ type: 'get_auth' }));
-  const resp = await nextMessage(ws);
-  assert.equal(resp.type, 'response');
-  assert.equal(resp.success, true);
-  assert.equal(resp.data.configured, false);
-  ws.close();
-});
-
-test('WebSocket disconnect does not terminate backend live sessions', async () => {
-  const s = fakeSession('tau_1');
-  let terminated = false;
-  s.terminate = async () => { terminated = true; };
-  liveManager.sessions.set('tau_1', s);
+test('RPC commands over WebSocket preserve authentication configuration and return a response', async () => {
   const ws = connect();
   await nextMessage(ws);
-  // close the browser-side connection and wait for the server to process it
-  await new Promise((resolve) => {
-    ws.on('close', resolve);
-    ws.close();
-  });
-  // give the server a tick to run its close handler
-  await new Promise((r) => setTimeout(r, 50));
-  assert.equal(terminated, false, 'disconnecting a client must not terminate child sessions');
-  assert.equal(liveManager.sessions.has('tau_1'), true);
-  assert.equal(liveManager.clients.size, 0);
+  ws.send(JSON.stringify({ type: 'get_auth' }));
+  const response = await nextMessage(ws);
+  assert.equal(response.type, 'response');
+  assert.equal(response.success, true);
+  assert.equal((response.data as JsonRecord).configured, false);
+  ws.close();
 });
 
-test('a new browser recovers an unanswered dialog and both clients observe its first resolution', async (t) => {
-  const session = new PiRpcSession(liveManager, { cwd: '/tmp' });
-  const writes: Record<string, unknown>[] = [];
-  session.child = { stdin: { writable: true, write(data: string, cb: () => void) { writes.push(JSON.parse(data)); cb(); } } };
+test('browser disconnect leaves the backend view and agent untouched', async () => {
+  const session = fakeSession('tau_1');
+  let disconnected = false;
+  session.terminate = async () => { disconnected = true; };
   liveManager.sessions.set(session.id, session);
-  // Any extension dialog behaves this way; the title is only a familiar label.
-  session.handleEvent({ type: 'extension_ui_request', id: 'offline-request', method: 'confirm', title: 'Permission Required', timeout: 10000 });
-  const ws1 = connect();
-  const seen1: any[] = [];
-  ws1.on('message', data => seen1.push(JSON.parse(data.toString())));
-  const initial1 = await nextMessage(ws1);
-  assert.equal(initial1.liveSessions[0].pendingInteractionCount, 1);
-  const ws2 = connect();
-  const seen2: any[] = [];
-  ws2.on('message', data => seen2.push(JSON.parse(data.toString())));
+  const ws = connect();
+  await nextMessage(ws);
+  await new Promise<void>(resolve => { ws.once('close', () => resolve()); ws.close(); });
+  await until(() => liveManager.clients.size === 0, 'browser detached');
+  assert.equal(disconnected, false);
+  assert.equal(liveManager.sessions.has(session.id), true);
+});
+
+test('a new browser recovers a mux-owned dialog and both browsers observe its first authoritative closure', async t => {
+  const { session, mux, emit } = await browserRuntime(t);
+  const dialog = { type: 'extension_ui_request', id: 'offline-request', method: 'confirm', title: 'Synthetic permission', timeout: 10000 };
+  mux.replay = [dialog];
+  await emit(dialog);
+  await until(() => session.attachment?.dialogs.has(dialog.id), 'dialog retained by socket view');
+  const ws1 = connect(), seen1 = collect(ws1);
+  const first = await nextMessage(ws1);
+  assert.equal(list(first.liveSessions)[0].pendingInteractionCount, 1);
+  const ws2 = connect(), seen2 = collect(ws2);
   await nextMessage(ws2);
-  t.after(() => { ws1.close(); ws2.close(); session.handleExit(0, null); });
-  async function waitFor(messages: any[], predicate: (message: any) => boolean) {
-    const deadline = Date.now() + 2000;
-    while (!messages.some(predicate)) {
-      assert.ok(Date.now() < deadline, 'timed out waiting for dialog state');
-      await new Promise(resolve => setTimeout(resolve, 5));
-    }
-    return messages.find(predicate);
-  }
+  t.after(() => { ws1.close(); ws2.close(); });
   for (const ws of [ws1, ws2]) ws.send(JSON.stringify({ type: 'live_session_snapshot_request', sessionId: session.id }));
-  const snap1 = await waitFor(seen1, msg => msg.type === 'live_session_snapshot');
-  const snap2 = await waitFor(seen2, msg => msg.type === 'live_session_snapshot');
+  const snap1 = await until(() => seen1.find(record => record.type === 'live_session_snapshot'), 'first browser snapshot');
+  const snap2 = await until(() => seen2.find(record => record.type === 'live_session_snapshot'), 'second browser snapshot');
   assert.deepEqual(snap1.pendingDialogs, snap2.pendingDialogs);
-  assert.equal(snap1.pendingDialogs[0].id, 'offline-request');
-  ws1.send(JSON.stringify({ type: 'extension_ui_response', sessionId: session.id, id: 'offline-request', confirmed: false }));
-  const resolved = (msg: any) => msg.type === 'interaction_state' && msg.pendingDialogs.length === 0;
-  const state1 = await waitFor(seen1, resolved);
-  const state2 = await waitFor(seen2, resolved);
-  assert.equal(state1.interactionRevision, state2.interactionRevision);
-  assert.ok(state1.interactionRevision > snap1.interactionRevision);
-  ws2.send(JSON.stringify({ type: 'extension_ui_response', sessionId: session.id, id: 'offline-request', confirmed: true }));
-  await waitFor(seen2, msg => msg.type === 'response' && msg.success === false && msg.id === 'offline-request');
-  assert.deepEqual(writes, [{ type: 'extension_ui_response', id: 'offline-request', confirmed: false }]);
+  assert.equal(list(snap1.pendingDialogs)[0].id, dialog.id);
+  ws1.send(JSON.stringify({ type: 'extension_ui_response', sessionId: session.id, id: dialog.id, confirmed: false }));
+  await until(() => mux.commands.find(command => command.type === 'extension_ui_response' && command.id === dialog.id), 'first response delivered');
+  assert.equal(session.attachment?.dialogs.has(dialog.id), true, 'delivery alone does not remove mux-owned membership');
+  mux.replay = [];
+  await emit({ type: 'pimux_dialog_closed', id: dialog.id, reason: 'answered', clientId: session.attachment?.clientId });
+  const closed = (record: JsonRecord) => record.type === 'event' && (record.event as JsonRecord)?.type === 'pimux_dialog_closed';
+  await until(() => seen1.find(closed), 'first browser closure');
+  await until(() => seen2.find(closed), 'second browser closure');
+  ws2.send(JSON.stringify({ type: 'extension_ui_response', sessionId: session.id, id: dialog.id, confirmed: true }));
+  await until(() => seen2.find(record => record.type === 'response' && record.success === false && record.id === dialog.id), 'stale second response rejected');
+  assert.deepEqual(mux.commands.filter(command => command.type === 'extension_ui_response'), [{ type: 'extension_ui_response', id: dialog.id, confirmed: false }]);
   assert.equal(session.pending.size, 0);
 });
 
-test('manager broadcasts are delivered to connected WS clients', async () => {
+test('shared queue clearing requires global confirmation and sends recovered input only to its requester', async t => {
+  const { session, mux } = await browserRuntime(t);
+  mux.responses.clear_queue = { success: true, data: { steering: ['private recovery text'], followUp: ['second item'] } };
+  const ws1 = connect(), seen1 = collect(ws1);
+  await nextMessage(ws1);
+  const ws2 = connect(), seen2 = collect(ws2);
+  await nextMessage(ws2);
+  t.after(() => { ws1.close(); ws2.close(); });
+  ws2.send(JSON.stringify({ type: 'clear_queue', sessionId: session.id, id: 'unconfirmed' }));
+  await until(() => seen2.find(record => record.type === 'response' && record.id === 'unconfirmed' && record.success === false), 'unconfirmed clear rejected');
+  assert.equal(mux.commands.some(command => command.type === 'clear_queue'), false);
+  ws1.send(JSON.stringify({ type: 'clear_queue', sessionId: session.id, id: 'confirmed', confirmGlobal: true }));
+  const response = await until(() => seen1.find(record => record.type === 'response' && record.id === 'confirmed'), 'requester acknowledgement');
+  assert.equal(response.success, true);
+  assert.deepEqual(response.data, { steering: ['private recovery text'], followUp: ['second item'] });
+  assert.ok(response.recoveryContext);
+  await until(() => seen2.find(record => record.type === 'event' && (record.event as JsonRecord)?.type === 'shared_queue_cleared'), 'other browser notified of destructive clear');
+  assert.equal(JSON.stringify(seen2).includes('private recovery text'), false);
+  assert.equal(JSON.stringify(seen2).includes('second item'), false);
+});
+
+test('manager broadcasts are delivered to connected WebSocket clients', async () => {
   const ws = connect();
   await nextMessage(ws);
-  // exercise the same broadcast path the manager uses on create()
   liveManager.broadcast({ type: 'live_session_created', session: fakeSession('tau_new').metadata() });
-  const msg = await nextMessage(ws);
-  assert.equal(msg.type, 'live_session_created');
-  assert.equal(msg.session.id, 'tau_new');
+  const message = await nextMessage(ws);
+  assert.equal(message.type, 'live_session_created');
+  assert.equal((message.session as JsonRecord).id, 'tau_new');
   ws.close();
 });

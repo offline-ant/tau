@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import type { JsonRecord } from '../src/server/types.ts';
+import { readProcessIdentity } from '@phimacs/pimux/process-identity';
 
 /**
  * A pimux wrapper's socket side without Pi: it answers attach with hello and a
@@ -28,6 +29,7 @@ export class FakePimux {
   idle = true;
   /** Responses by command type; default success with empty data. */
   responses: Record<string, JsonRecord> = {};
+  withheld = new Set<string>();
   entry: JsonRecord;
   private server: net.Server | null = null;
 
@@ -38,7 +40,7 @@ export class FakePimux {
     this.jsonPath = path.join(dir, `${muxId}.json`);
     const { sessionFile, cwd, ...rest } = entry;
     this.entry = {
-      protocol: 1, muxId, socket: this.socketPath, pid: process.pid, piPid: process.pid, cwd,
+      protocol: 2, phase: 'committed', operationId: `operation-${muxId}`, ownerIdentity: readProcessIdentity(process.pid), piIdentity: readProcessIdentity(process.pid), muxId, socket: this.socketPath, pid: process.pid, piPid: process.pid, cwd,
       startedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), status: 'idle', blocked: null,
       session: { file: sessionFile, id: `id-${muxId}`, name: null }, model: { provider: 'fx', id: 'one' }, thinkingLevel: 'off',
       placement: 'root', orchestration: { host: 'emacs', endpoint: '/tmp/emacs-test', id: `*pi:${muxId}*` }, parent: null, ...rest,
@@ -55,7 +57,7 @@ export class FakePimux {
 
   listen(): Promise<void> {
     this.server = net.createServer((socket) => this.accept(socket));
-    return new Promise((resolve) => this.server!.listen(this.socketPath, resolve));
+    return new Promise((resolve) => this.server!.listen(this.socketPath, () => { fs.chmodSync(this.socketPath, 0o600); resolve(); }));
   }
 
   private accept(socket: net.Socket) {
@@ -74,7 +76,7 @@ export class FakePimux {
         this.handle(socket, command);
       }
     });
-    this.write(socket, { type: 'pimux_hello', protocol: 1, muxId: this.muxId, clientId: this.connections.size, role: 'secondary', piPid: process.pid, socket: this.socketPath });
+    this.write(socket, { type: 'pimux_hello', protocol: this.entry.protocol, muxId: this.muxId, clientId: this.connections.size, capabilities: ['snapshot', 'stop', 'detached'], piPid: process.pid, socket: this.socketPath });
     this.snapshot(socket, 'attach');
   }
 
@@ -85,6 +87,7 @@ export class FakePimux {
       this.snapshot(socket, 'request', generation);
       return;
     }
+    if (this.withheld.has(String(command.type))) return;
     const response = this.responses[String(command.type)] ?? { success: true, data: {} };
     this.write(socket, { type: 'response', id: command.id, command: command.type, ...response });
   }

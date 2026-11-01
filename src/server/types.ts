@@ -54,9 +54,9 @@ export type RpcCommand = {
   [key: string]: unknown;
 };
 /**
- * Extra `pi` CLI arguments and environment for a spawned session. Callers that
- * drive tau programmatically (pi-ant orchestration) need the child to run with
- * their own extensions, model flags, and orchestration variables.
+ * Extra Pi arguments/environment for a newly committed managed runtime.
+ * Reusing an existing runtime never reapplies these launch-only overrides.
+ * Orchestration supplies explicit extension, model and parent-task identities.
  */
 export type SessionSpawnOverrides = {
   args?: string[];

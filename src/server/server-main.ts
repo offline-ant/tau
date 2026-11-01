@@ -2,10 +2,9 @@
 /*
  * Tau standalone server.
  *
- * Serves the Tau web UI, manages backend-owned `pi --mode rpc` child sessions
- * and attaches tabs to Pi processes other frontends share through pimux.
- * Browser connections are views only; explicit live-session DELETE or server
- * shutdown terminates child Pi processes and only detaches shared ones.
+ * Serves the Tau web UI and equal socket clients of detached Pi runtimes.
+ * Tab DELETE and server shutdown disconnect views, never stop agents.
+ * Explicit identity-bound global stop is a separate confirmed operation.
  */
 
 import http from 'node:http';
@@ -13,7 +12,7 @@ import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { spawn, execFile, type ExecException } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
 import { WebSocketServer, WebSocket } from 'ws';
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -26,9 +25,13 @@ import { ARGS, AUTH_CONFIGURED, HOST, HTTP_PORT, MIME_TYPES, PI_AGENT_DIR, PI_CO
 import { SESSION_COOKIE_NAME, SESSION_REFRESH_THRESHOLD_SECONDS, buildSessionCookie, issueSessionToken, parseCookies, verifySessionToken } from './auth.js';
 import { completeDirectories } from './path-completion.js';
 import { getAvailableModels, modelLabel, normalizeModel, parseModelSpecToModel, parsePiListModels, _clearModelListCacheForTest, _setExecFileForTest } from './model-utils.js';
-import { LiveSessionManager, PiRpcSession, SessionLifecycleError, SessionOpenError, assertNoSessionArgs, isGenericSessionName, liveManager, makeId, _setSpawnPiForTest } from './sessions.js';
-import { pimuxCommand, pimuxEntryForFile, pimuxFiles, pimuxSharing, processAlive } from './pimux.js';
+import { LiveSessionManager, PiRpcSession, SessionOpenError, assertNoSessionArgs, isGenericSessionName, liveManager, makeId } from './sessions.js';
+import { pimuxCommand, pimuxEntryForFile, pimuxFiles, pimuxSharing } from './pimux.js';
 import { AgentOverview } from './agents.js';
+import { canonicalSessionPath, lookupClaim } from '@phimacs/pimux/ownership';
+import { stopRuntime } from '@phimacs/pimux/runtime';
+import { withStoppedSessionLease } from './session-files.js';
+import { exportSession } from './session-export.js';
 import { readSessionHeader } from './session-header.js';
 import { searchSessions } from './session-search.js';
 import { buildEndpoint, orchestrationEndpoint, publishEndpoint, unpublishEndpoint } from './orchestration.js';
@@ -139,12 +142,7 @@ function sendLifecycleError(res: ServerResponse, error: unknown) {
   if (error instanceof SessionOpenError) {
     return json(res, error.status, { error: error.message, ...(error.muxId ? { muxId: error.muxId } : {}) });
   }
-  if (error instanceof SessionLifecycleError) {
-    return json(res, error.childStopped ? 400 : 503, {
-      error: error.message, sessionId: error.sessionId, childStopped: error.childStopped,
-    });
-  }
-  return json(res, 400, { error: errorMessage(error) });
+  return json(res, errorStatus(error), { error: errorMessage(error) });
 }
 
 function readBody(req: IncomingMessage): Promise<RpcCommand> {
@@ -166,19 +164,19 @@ let tailscaleUrl = '';
 
 function resolveSessionFile(filePath: string) {
   if (!filePath || typeof filePath !== 'string') throw new Error('filePath required');
-  const resolved = path.resolve(filePath);
-  const root = path.resolve(SESSIONS_DIR);
+  const resolved = canonicalSessionPath(filePath);
+  const root = canonicalSessionPath(SESSIONS_DIR);
   if (!resolved.startsWith(root + path.sep) || !resolved.endsWith('.jsonl')) {
     throw new Error('Invalid session file');
   }
-  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) throw new Error('Session not found');
+  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) throw Object.assign(new Error('Session not found'), { status: 404 });
   return resolved;
 }
 
 /**
  * Validates programmatic spawn fields for live-session create and resume.
  *
- * These let an orchestration client (pi-ant) run the child with its own
+ * These let an orchestration client run a managed runtime with its own
  * extensions, model flags, and environment. They do not widen the server's
  * blast radius: the API already starts `pi` in a caller-chosen directory and
  * prompts it, so it is an authenticated code-execution surface either way.
@@ -214,15 +212,19 @@ function parseSpawnOverrides(body: RpcCommand): { args?: string[]; env?: Record<
  * file; opening it would make Tau a second writer. A pimux-shared file is not
  * refused here: opening it attaches.
  */
-function terminalOwnerRefusal(file: string, force: boolean) {
-  const shared = pimuxEntryForFile(file);
-  if (force || (shared && (processAlive(shared.pid) || processAlive(shared.piPid)))) return null;
+function terminalOwnerRefusal(file: string, _force: boolean) {
+  const claim = lookupClaim(file);
+  if (claim && (claim.owner.kind !== 'rpc' || claim.owner.protocol !== 2)) {
+    return { error: 'Session has a live or uncertain nonattachable owner. Force cannot override a writer claim.' };
+  }
+  if (claim?.owner.kind === 'rpc') return null;
   const owner = sessionOwner(file);
-  return owner ? { error: `Session is running as ${owner.name} on ${owner.host}. Follow it read-only, or resume with force to take it over.`, owner } : null;
+  return owner ? { error: `Session is running as ${owner.name} on ${owner.host}. Follow it read-only or stop that agent first.`, owner } : null;
 }
 
 /** Why deleting this stored session would destroy a conversation some Pi is still writing, or null. */
 async function liveFileRefusal(file: string) {
+  if (lookupClaim(file)) return 'Session is owned by a live or uncertain managed runtime; stop it before deleting.';
   if (liveManager.findBySessionFile(file) || liveManager.hasStartingSession(file) || liveManager.hasPendingResume(file) || liveManager.hasTerminatingResume(file)) {
     return 'This session is open in a Tau tab; close the tab before deleting it.';
   }
@@ -233,10 +235,12 @@ async function liveFileRefusal(file: string) {
   return null;
 }
 
-function appendSessionName(filePath: string, name: string) {
-  const resolved = resolveSessionFile(filePath);
-  fs.appendFileSync(resolved, JSON.stringify({ type: 'session_info', name, timestamp: new Date().toISOString() }) + '\n');
-  return resolved;
+async function appendSessionName(filePath: string, name: string) {
+  return withStoppedSessionLease(filePath, () => {
+    const resolved = resolveSessionFile(filePath);
+    fs.appendFileSync(resolved, JSON.stringify({ type: 'session_info', name, timestamp: new Date().toISOString() }) + '\n');
+    return resolved;
+  });
 }
 
 function updateLiveSessionName(session: PiRpcSession | null | undefined, name: string) {
@@ -278,7 +282,7 @@ function openUrl(url: string): Promise<void> {
   }
   const opener = process.platform === 'darwin' ? 'open' : 'xdg-open';
   return new Promise<void>((resolve, reject) => {
-    execFile(opener, [url], (err: ExecException | null) => err ? reject(err) : resolve());
+    execFile(opener, [url], (err) => err ? reject(err) : resolve());
   });
 }
 
@@ -288,7 +292,7 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
   const success = (data?: unknown): RpcResponse => ({ type: 'response', command: cmd, success: true, id, ...(data !== undefined ? { data } : {}) });
   const error = (message: string): RpcResponse => ({ type: 'response', command: cmd, success: false, error: message, id, ...(cmd === 'prompt' ? { delivery: 'rejected' } : {}) });
 
-  // Backend-local commands do not require a live Pi child.
+  // Backend-local commands do not require a live runtime connection.
   if (cmd === 'get_auth') return success({ configured: AUTH_CONFIGURED, enabled: authEnabled });
   if (cmd === 'set_auth') {
     if (!AUTH_CONFIGURED) return error('No credentials configured. Set tau.user and tau.pass in settings.json');
@@ -320,7 +324,6 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
     if (live) {
       // A live Pi writes its own file: rename through it, so its state and
       // every frontend sharing it agree, and the file has one writer.
-      if (live.refreshing) return error('Session refresh is in progress; wait a moment and send again');
       try {
         const resp = await live.send({ type: 'set_session_name', name }, { timeoutMs: 10000 });
         if (resp.success === false) return error(String(resp.error || 'Pi refused the rename'));
@@ -329,7 +332,9 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
       return success({ name });
     }
     if (!resolvedFile) return error('sessionId or filePath required');
-    const shared = await pimuxSharing(resolvedFile);
+    let shared: Awaited<ReturnType<typeof pimuxSharing>>;
+    try { shared = await pimuxSharing(resolvedFile); }
+    catch (cause) { return error(errorMessage(cause)); }
     if (shared?.reachability === 'unreachable') return error('This session is shared by another frontend that does not accept connections right now; rename it there.');
     if (shared) {
       try {
@@ -340,7 +345,7 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
     const owner = sessionOwner(resolvedFile);
     if (owner) return error(`Session is running as ${owner.name} on ${owner.host}; rename it there.`);
     if (liveManager.hasStartingSession(resolvedFile) || liveManager.hasPendingResume(resolvedFile)) return error('Session is opening; wait a moment and send again');
-    try { appendSessionName(resolvedFile, name); } catch (e) { return error(errorMessage(e)); }
+    try { await appendSessionName(resolvedFile, name); } catch (e) { return error(errorMessage(e)); }
     return success({ name });
   }
 
@@ -350,8 +355,7 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
   // /tau-tree-navigate extension command in-process — see src/server/tree.ts).
   if (cmd === 'navigate_tree') {
     if (!session) return error('Live session not found');
-    // Tau's tree extension is not loaded in a Pi another frontend started.
-    if (session.attachment) return error('Session tree navigation is not available in a shared session; use the frontend that started it.');
+    if (!session.capabilities.navigateTree) return error('This runtime does not advertise the tree navigation command.');
     const entryId = typeof command.entryId === 'string' ? command.entryId.trim() : '';
     if (!entryId) return error('entryId required');
     try {
@@ -364,16 +368,8 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
       if (command.sessionId && !session) throw new Error('Live session not found');
       const sf = command.filePath ? resolveSessionFile(command.filePath) : session?.sessionFile;
       if (!sf) throw new Error('No session file to export yet');
-      const args = ['--export', sf];
-      if (command.outputPath) args.push(resolveExportOutputPath(command.outputPath, sf));
-      const output = await new Promise<string>((resolve, reject) => {
-        execFile(PI_COMMAND, args, { cwd: session?.cwd || path.dirname(sf), timeout: 30000, encoding: 'utf8' }, (err: ExecException | null, stdout: string, stderr: string) => {
-          if (err) reject(new Error(stderr || err.message)); else resolve(stdout);
-        });
-      });
-      let result = output.trim().split('\n').pop() || sf.replace(/\.jsonl$/, '.html');
-      result = path.resolve(expandHome(result));
-      if (!fs.existsSync(result)) result = sf.replace(/\.jsonl$/, '.html');
+      const output = resolveExportOutputPath(command.outputPath || sf.replace(/\.jsonl$/, '.html'), sf);
+      const result = await exportSession(sf, output, session);
       return success({ path: result });
     } catch (e) { return error(errorMessage(e)); }
   }
@@ -403,10 +399,11 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
   if (cmd === 'live_session_snapshot_request') return { type: 'live_session_snapshot', sessionId: session.id, ...await session.snapshot() };
   if (cmd === 'set_auto_compaction') return success({ enabled: !!command.enabled });
 
-  // A spawned tab opens new sessions as new tabs; only a shared Pi moves with its frontends.
-  if (cmd === 'new_session' && !session.attachment) return error('Open a new Tau tab for a new session.');
-  const native = new Set(['new_session', 'prompt', 'steer', 'follow_up', 'abort', 'compact', 'set_model', 'cycle_model', 'set_thinking_level', 'cycle_thinking_level', 'get_session_stats', 'get_tree', 'get_entries', 'extension_ui_response']);
+  // Session replacement moves every frontend of the same runtime.
+  const native = new Set(['new_session', 'prompt', 'steer', 'follow_up', 'abort', 'compact', 'set_model', 'cycle_model', 'set_thinking_level', 'cycle_thinking_level', 'get_session_stats', 'get_tree', 'get_entries', 'clear_queue', 'extension_ui_response']);
   if (!native.has(cmd ?? '')) return error(`Unknown command: ${cmd}`);
+  if (cmd === 'clear_queue' && command.confirmGlobal !== true) return error('Clearing the queue removes input from every frontend; explicit confirmation is required.');
+  const requestContext = { file: session.sessionFile, leafId: session.attachment?.leafId, generation: session.attachment?.appliedGeneration };
 
   // While navigate_tree is moving the child's leaf (pi's stdin loop does not
   // serialize a new prompt behind a running extension command), a prompt
@@ -438,7 +435,8 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
     if (isSetThinkingLevel && resp.success === false && prevThinkingLevel !== null) {
       session.thinkingLevel = prevThinkingLevel;
     }
-    return { ...resp, success: resp.success !== false, ...(cmd === 'prompt' && resp.success === false ? { delivery: 'rejected' } : {}) };
+    if (cmd === 'clear_queue' && resp.success !== false) liveManager.broadcast({ type: 'event', sessionId: session.id, event: { type: 'shared_queue_cleared' } });
+    return { ...resp, success: resp.success !== false, ...(cmd === 'clear_queue' ? { recoveryContext: requestContext } : {}), ...(cmd === 'prompt' && resp.success === false ? { delivery: 'rejected' } : {}) };
   } catch (e) {
     if (isSetThinkingLevel && prevThinkingLevel !== null) session.thinkingLevel = prevThinkingLevel;
     // A timeout or broken transport does not establish whether Pi ran a prompt.
@@ -527,19 +525,7 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
   if (cleanPath === '/api/live-sessions/resume' && req.method === 'POST') {
     readBody(req).then(async (body) => {
       if (!body.filePath || typeof body.filePath !== 'string') return json(res, 400, { error: 'filePath required' });
-      const requestedFile = path.resolve(body.filePath);
-      // Only these synchronous validation failures prove this request never
-      // spawned. An existing, starting, or closing destination (or a terminal
-      // owner) still makes source rollback unsafe, even with invalid input.
-      const rejectBeforeSpawn = (message: string) => json(res, 400, {
-        error: message,
-        childStopped: !liveManager.findBySessionFile(requestedFile)
-          && !liveManager.hasStartingSession(requestedFile)
-          && !liveManager.hasPendingResume(requestedFile)
-          && !liveManager.hasTerminatingResume(requestedFile)
-          && !sessionOwner(requestedFile)
-          && !pimuxEntryForFile(requestedFile),
-      });
+      const rejectBeforeSpawn = (message: string) => json(res, 400, { error: message });
       let resolvedFile: string;
       let overrides: { args?: string[]; env?: Record<string, string> };
       try {
@@ -582,7 +568,16 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
     return;
   }
   if (cleanPath === '/api/agents' && req.method === 'GET') return json(res, 200, { agents: agentOverview.list() });
-  const liveMatch = cleanPath.match(/^\/api\/live-sessions\/([^/]+)(?:\/snapshot)?$/);
+  const stopAgent = cleanPath.match(/^\/api\/agents\/([^/]+)\/stop$/);
+  if (stopAgent && req.method === 'POST') {
+    readBody(req).then(async body => {
+      if (body.confirm !== true || body.operationId !== undefined && typeof body.operationId !== 'string') return json(res, 400, { error: 'Explicit global-stop confirmation and a valid operationId are required' });
+      try { return json(res, 200, { receipt: await stopRuntime(decodeURIComponent(stopAgent[1]), { operationId: body.operationId as string | undefined }) }); }
+      catch (error) { return sendLifecycleError(res, error); }
+    }).catch(error => json(res, 400, { error: errorMessage(error) }));
+    return;
+  }
+  const liveMatch = cleanPath.match(/^\/api\/live-sessions\/([^/]+)(?:\/(?:snapshot|stop))?$/);
   if (liveMatch) {
     let id;
     try {
@@ -592,6 +587,15 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
     }
     const session = liveManager.get(id);
     if (!session) return json(res, 404, { error: 'Live session not found' });
+    if (cleanPath.endsWith('/stop') && req.method === 'POST') {
+      readBody(req).then(async body => {
+        if (body.confirm !== true) return json(res, 400, { error: 'Stopping ends this agent in every frontend. Explicit confirmation is required, including when idle.' });
+        if (body.operationId !== undefined && typeof body.operationId !== 'string') return json(res, 400, { error: 'operationId must be a string' });
+        try { return json(res, 200, { receipt: await session.stop(body.operationId as string | undefined) }); }
+        catch (error) { return sendLifecycleError(res, error); }
+      }).catch(error => json(res, 400, { error: errorMessage(error) }));
+      return;
+    }
     const isSnapshotRoute = cleanPath.endsWith('/snapshot');
     if (isSnapshotRoute && req.method === 'GET') {
       // Selecting an attached tab is opening that agent: it is no longer done.
@@ -662,7 +666,7 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
       const sessionFile = resolveSessionFile(body.filePath);
       const refusal = await liveFileRefusal(sessionFile);
       if (refusal) return json(res, 409, { error: refusal });
-      fs.unlinkSync(sessionFile);
+      await withStoppedSessionLease(sessionFile, () => fs.unlinkSync(resolveSessionFile(sessionFile)));
       json(res, 200, { success: true });
     }).catch((e) => json(res, 400, { error: errorMessage(e) }));
     return;
@@ -812,7 +816,8 @@ function serveProjectSummaries(res: ServerResponse) {
 
 function serveProjectSessions(res: ServerResponse, dirName: string) {
   try {
-    const projectDir = path.join(SESSIONS_DIR, dirName);
+    const projectDir = canonicalSessionPath(path.join(SESSIONS_DIR, decodeURIComponent(dirName)));
+    if (!isWithinPath(canonicalSessionPath(SESSIONS_DIR), projectDir)) return json(res, 403, { error: 'Project is outside session storage' });
     if (!fs.existsSync(projectDir) || !fs.statSync(projectDir).isDirectory()) return json(res, 404, { error: 'Project not found' });
     const liveFiles = liveFilesSet();
     const owners = sessionOwners();
@@ -897,7 +902,9 @@ function readWindow(fd: number, position: number, length: number) {
  * no longer describe the same conversation.
  */
 function serveSessionFile(res: ServerResponse, dirName: string, file: string, since: string | null) {
-  const filePath = path.join(SESSIONS_DIR, dirName, file);
+  let filePath: string;
+  try { filePath = resolveSessionFile(path.join(SESSIONS_DIR, decodeURIComponent(dirName), decodeURIComponent(file))); }
+  catch (error) { return json(res, errorStatus(error), { error: errorMessage(error) }); }
   if (!fs.existsSync(filePath)) return json(res, 404, { error: 'Session not found' });
   const size = fs.statSync(filePath).size;
   const requested = since === null ? 0 : Number(since);
@@ -911,8 +918,8 @@ function serveSessionFile(res: ServerResponse, dirName: string, file: string, si
   // Whole lines only: the last partial line stays unread until its newline
   // arrives, so the next poll starts at a record boundary.
   let consumed = start;
-  stream.on('data', (chunk: string) => {
-    buffer += chunk;
+  stream.on('data', (chunk) => {
+    buffer += chunk.toString();
     const lines = buffer.split('\n'); buffer = lines.pop() || '';
     for (const line of lines) {
       consumed += Buffer.byteLength(line) + 1;
@@ -1141,7 +1148,7 @@ let shuttingDown = false;
 async function shutdown(signal: string) {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log(`\n[Tau] Shutting down (${signal}); terminating ${liveManager.sessions.size} Pi session(s)...`);
+  console.log(`\n[Tau] Shutting down (${signal}); disconnecting ${liveManager.sessions.size} agent view(s)...`);
   try { wss.close(); } catch {}
   agentOverview.stop();
   try { voiceWss.close(); } catch {}
@@ -1150,7 +1157,7 @@ async function shutdown(signal: string) {
   try { await liveManager.shutdown(); }
   catch (error) {
     exitCode = 1;
-    console.error(`[Tau] Child cleanup failed: ${errorMessage(error)}`);
+    console.error(`[Tau] View disconnect failed: ${errorMessage(error)}`);
   }
   httpsServer?.close();
   server.close(() => process.exit(exitCode));
@@ -1197,7 +1204,6 @@ export {
   getAvailableModels,
   makeId,
   PiRpcSession,
-  SessionLifecycleError,
   LiveSessionManager,
   liveManager,
   resolveSessionFile,
@@ -1239,7 +1245,6 @@ export {
   _setAuthForTest,
   _setCredentialsForTest,
   _issueSessionTokenForTest,
-  _setSpawnPiForTest,
   agentOverview,
   _setExecFileForTest,
   _clearModelListCacheForTest,
