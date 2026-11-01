@@ -6,7 +6,7 @@ import path from 'node:path';
 import { listDiscovery, muxDirectory, readDiscovery, ensurePrivateDirectory, type DiscoveryRecord, type OrchestrationRef } from '@phimacs/pimux/discovery';
 import { canonicalSessionPath, lookupClaim } from '@phimacs/pimux/ownership';
 import { processExists } from '@phimacs/pimux/process-identity';
-import { isRecord, PROTOCOL_VERSION } from '@phimacs/pimux/protocol';
+import { isReadOnlyCommand, isRecord, parseInputContext, PROTOCOL_VERSION, type InputContext } from '@phimacs/pimux/protocol';
 import { validateSocket, type RuntimeReceipt } from '@phimacs/pimux/runtime';
 import { LineSplitter } from '@phimacs/pimux/jsonl';
 import type { JsonRecord } from './types.js';
@@ -83,7 +83,7 @@ export async function probePimux(entry: PimuxEntry, timeoutMs = 2000): Promise<P
       if (!isRecord(record) || record.type !== 'pimux_hello') return finish('unreachable');
       const capabilities = record.capabilities;
       finish(record.protocol === PROTOCOL_VERSION && record.muxId === receipt.muxId && record.piPid === receipt.piPid
-        && Array.isArray(capabilities) && ['snapshot', 'stop', 'detached'].every(cap => capabilities.includes(cap)) ? 'reachable' : 'unreachable');
+        && Array.isArray(capabilities) && ['snapshot', 'stop', 'detached', 'contextual-input'].every(cap => capabilities.includes(cap)) ? 'reachable' : 'unreachable');
     }, 64 * 1024, () => finish('unreachable'));
     socket.on('data', (chunk: Buffer) => lines.push(chunk));
     socket.once('error', () => finish(pimuxOwnerAlive(entry) ? 'unreachable' : 'stale'));
@@ -115,6 +115,7 @@ export function pimuxCommand(entry: PimuxEntry, command: JsonRecord, timeoutMs =
     const socket = net.connect(receipt.socket);
     let settled = false, hello = false, sent = false;
     let generation: number | undefined;
+    let inputContext: InputContext | undefined;
     const done = (error?: Error, response?: JsonRecord) => {
       if (settled) return;
       settled = true;
@@ -129,15 +130,27 @@ export function pimuxCommand(entry: PimuxEntry, command: JsonRecord, timeoutMs =
       if (record.type === 'pimux_hello') {
         const capabilities = record.capabilities;
         if (record.protocol !== PROTOCOL_VERSION || record.muxId !== receipt.muxId || record.piPid !== receipt.piPid
-          || !Array.isArray(capabilities) || !['snapshot', 'stop', 'detached'].every(cap => capabilities.includes(cap))) {
+          || !Array.isArray(capabilities) || !['snapshot', 'stop', 'detached', 'contextual-input'].every(cap => capabilities.includes(cap))) {
           done(new Error('Runtime identity/protocol/capabilities mismatch')); return;
         }
         hello = true;
       } else if (record.type === 'pimux_snapshot' && hello && isRecord(record.session) && typeof record.session.file === 'string') {
         if (canonicalSessionPath(record.session.file) !== canonicalSessionPath(receipt.sessionFile)) return done(new Error('Runtime moved to another conversation'));
         generation = Number(record.generation);
+        inputContext = parseInputContext(record.inputContext);
       } else if (record.type === 'pimux_live' && hello && record.generation === generation && !sent) {
-        sent = true; socket.write(JSON.stringify({ ...command, id }) + '\n');
+        const outbound: JsonRecord = { ...command, id };
+        delete outbound.inputContext;
+        if (!isReadOnlyCommand(String(command.type))) {
+          const expected = Object.hasOwn(command, 'pimuxContext') ? parseInputContext(command.pimuxContext) : inputContext;
+          if (!inputContext || !expected || expected.contextId !== inputContext.contextId
+            || expected.sessionFile !== inputContext.sessionFile || expected.leafId !== inputContext.leafId) {
+            done(new Error('Runtime context is unknown or changed; command was not sent'));
+            return;
+          }
+          outbound.pimuxContext = { ...expected };
+        } else delete outbound.pimuxContext;
+        sent = true; socket.write(JSON.stringify(outbound) + '\n');
       } else if (sent && record.type === 'response' && record.id === id) done(undefined, record);
       else if (record.type === 'pimux_exit' || record.type === 'pimux_snapshot_failed') done(new Error('Runtime unavailable'));
     }, 128 * 1024 * 1024, () => done(new Error('Runtime record exceeds bound')));

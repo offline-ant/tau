@@ -361,6 +361,18 @@ writer. A failed frontend attach after commitment leaves the agent discoverable.
   first-answer dialog closure. New session replaces the conversation everywhere.
   Drafts/images/local pending input are quarantined under agent/file/leaf identity
   when context changes. Explicit Reuse is required; uncertain input is never resent.
+- **Input context:** each complete runtime snapshot supplies an opaque
+  `inputContext:{sessionFile,leafId,contextId}`. Tau publishes that object unchanged
+  as `session.runtimeContext`, with `session.inputReady`. A browser action captures
+  `{agentId,file,leafId,runtimeContext}` when it starts and supplies it as the RPC
+  `inputContext`. HTTP and WebSocket handlers reject missing, unknown or replaced
+  contexts; they never substitute a newer expectation. The owning router checks
+  the captured object again as `pimuxContext` before forwarding a mutation to Pi.
+  Ordinary streaming appends and same-branch refreshes retain the anchor, so valid
+  steering does not depend on a snapshot generation or the latest appended leaf.
+  A failed/pending snapshot disables mutation; reads and explicit Stop stay
+  available. Rejected or uncertain instructions remain requester-local for review,
+  never automatic replay.
 - **Queue recovery:** clearing/aborting affects the global Pi queue, including
   input from other clients. Only the requester receives acknowledged recovered
   text, bound to its original context. Other views never claim per-client recovery.

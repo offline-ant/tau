@@ -175,10 +175,10 @@ test('deleting a session: a live pimux refuses, a stale entry does not', async (
 function collectingAttachment() {
   const applied: JsonRecord[] = [];
   const attachment = new PimuxAttachment('mux', '/nowhere', (published: JsonRecord) => applied.push(published), { piPid: process.pid, sessionFile: null });
-  attachment.handle({ type: 'pimux_hello', protocol: 2, muxId: 'mux', piPid: process.pid, clientId: 1, capabilities: ['snapshot', 'stop', 'detached'] });
+  attachment.handle({ type: 'pimux_hello', protocol: 2, muxId: 'mux', piPid: process.pid, clientId: 1, capabilities: ['snapshot', 'stop', 'detached', 'contextual-input'] });
   return { applied, attachment };
 }
-const snapshotRecord = (generation: number, replay: number) => ({ type: 'pimux_snapshot', generation, replay, reason: 'request', session: { file: null, id: 'snapshot-session', name: null, cwd: PROJECT }, leafId: null, idle: true, thinkingLevel: 'off' });
+const snapshotRecord = (generation: number, replay: number) => ({ type: 'pimux_snapshot', generation, replay, reason: 'request', inputContext: { sessionFile: null, leafId: null, contextId: 'snapshot-context' }, session: { file: null, id: 'snapshot-session', name: null, cwd: PROJECT }, leafId: null, idle: true, thinkingLevel: 'off' });
 const replayed = { type: 'message_update', delta: 'stale' };
 
 for (const interruption of [
@@ -327,7 +327,9 @@ test('renames go through the Pi that writes the file; deleting a live file is re
   assert.ok(fs.existsSync(file));
   const { body } = await post('/api/live-sessions/resume', { filePath: file });
   assert.equal((await post('/api/sessions/delete', { filePath: file })).status, 409);
-  const tree = await handleRpcCommand({ type: 'navigate_tree', sessionId: (body.session as JsonRecord).id, entryId: 'u1' });
+  const selected = liveManager.get((body.session as JsonRecord).id);
+  const tree = await handleRpcCommand({ type: 'navigate_tree', sessionId: (body.session as JsonRecord).id, entryId: 'u1',
+    inputContext: { agentId: mux.muxId, file: selected.sessionFile, leafId: selected.attachment.leafId, runtimeContext: selected.attachment.inputContext } });
   assert.equal(tree.success, false);
   assert.match(tree.error, /does not advertise/);
   const listing = await (await fetch(`${base}/api/sessions/--project--`)).json() as { sessions: JsonRecord[] };

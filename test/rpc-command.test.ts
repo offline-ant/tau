@@ -40,6 +40,9 @@ interface RpcTestSession {
   send: (cmd: { id?: string; type?: string; [k: string]: unknown }) =>
     Promise<{ type: string; id?: string; success: boolean; data?: Record<string, unknown>; error?: string }>;
   referencesSessionFile: (file: string) => boolean;
+  attachment: { muxId: string; ready: boolean; leafId: string | null;
+    inputContext: { sessionFile: string | null; leafId: string | null; contextId: string } };
+  browserInputContext: (command: Record<string, unknown>) => unknown;
 }
 
 const PROJ = path.join(SESSIONS_DIR, '--tmp--proj');
@@ -58,6 +61,11 @@ beforeEach(() => {
   _setAuthForTest(true);
   _setExecFileForTest(null);
 });
+
+function contextFor(session: { sessionFile: string | null; attachment: { muxId: string; leafId: string | null; inputContext: unknown } | null }) {
+  return { agentId: session.attachment?.muxId ?? null, file: session.sessionFile,
+    leafId: session.attachment?.leafId ?? null, runtimeContext: session.attachment?.inputContext ?? null };
+}
 
 function injectSession(overrides: Partial<RpcTestSession> = {}): RpcTestSession {
   const session: RpcTestSession = {
@@ -89,6 +97,9 @@ function injectSession(overrides: Partial<RpcTestSession> = {}): RpcTestSession 
     }),
     send: async (cmd) => ({ type: 'response', id: cmd.id, success: true, data: {} }),
     referencesSessionFile: () => false,
+    attachment: { muxId: 'rpc-test-mux', ready: true, leafId: null,
+      inputContext: { sessionFile: SESSION_FILE, leafId: null, contextId: 'rpc-test-context' } },
+    browserInputContext(command) { return PiRpcSession.prototype.browserInputContext.call(this, command); },
     ...overrides,
   };
   liveManager.sessions.set(session.id, session);
@@ -163,7 +174,7 @@ test('set_session_name with sessionId renames through the live Pi, which owns th
   const sent: Array<{ type?: string; name?: string }> = [];
   const session = injectSession({ send: async (cmd) => { sent.push(cmd); return { type: 'response', id: cmd.id, success: true, data: {} }; } });
   const before = fs.readFileSync(SESSION_FILE, 'utf8');
-  const resp = await handleRpcCommand({ type: 'set_session_name', sessionId: session.id, name: 'Live title' });
+  const resp = await handleRpcCommand({ type: 'set_session_name', sessionId: session.id, name: 'Live title', inputContext: contextFor(session) });
   assert.equal(resp.success, true);
   assert.deepEqual(sent.map(({ type, name }) => ({ type, name })), [{ type: 'set_session_name', name: 'Live title' }]);
   assert.equal(fs.readFileSync(SESSION_FILE, 'utf8'), before, 'Tau never appends to a file a live Pi writes');
@@ -186,7 +197,7 @@ test('set_session_name with a filePath matching a live session renames through t
 
 test('set_session_name reports a live Pi refusing the rename', async () => {
   const session = injectSession({ send: async (cmd) => ({ type: 'response', id: cmd.id, success: false, error: 'nope' }) });
-  const resp = await handleRpcCommand({ type: 'set_session_name', sessionId: session.id, name: 'Refused' });
+  const resp = await handleRpcCommand({ type: 'set_session_name', sessionId: session.id, name: 'Refused', inputContext: contextFor(session) });
   assert.equal(resp.success, false);
   assert.match(resp.error, /nope/);
   assert.equal(session.sessionName, null);
@@ -250,7 +261,7 @@ test('live_session_snapshot_request returns a live_session_snapshot payload', as
 test('set_auto_compaction echoes the enabled flag without persisting state', async () => {
   // current implementation gates this behind the active-session check
   const session = injectSession();
-  const resp = await handleRpcCommand({ type: 'set_auto_compaction', sessionId: session.id, enabled: false });
+  const resp = await handleRpcCommand({ type: 'set_auto_compaction', sessionId: session.id, enabled: false, inputContext: contextFor(session) });
   assert.equal(resp.success, true);
   assert.equal(resp.data.enabled, false);
   // the echo persists nothing: get_state still reports the hardcoded default
@@ -266,7 +277,7 @@ test('native commands require an active live session', async () => {
 
 test('unknown command is rejected', async () => {
   const session = injectSession();
-  const resp = await handleRpcCommand({ type: 'bogus', sessionId: session.id });
+  const resp = await handleRpcCommand({ type: 'bogus', sessionId: session.id, inputContext: contextFor(session) });
   assert.equal(resp.success, false);
   assert.match(resp.error, /Unknown command: bogus/);
 });
@@ -274,7 +285,7 @@ test('unknown command is rejected', async () => {
 test('new_session moves the same shared runtime rather than creating a frontend-owned tab', async () => {
   const commands: string[] = [];
   const session = injectSession({ send: async command => { commands.push(String(command.type)); return { type: 'response', success: true, data: {} }; } });
-  const response = await handleRpcCommand({ type: 'new_session', sessionId: session.id });
+  const response = await handleRpcCommand({ type: 'new_session', sessionId: session.id, inputContext: contextFor(session) });
   assert.equal(response.success, true);
   assert.deepEqual(commands, ['new_session']);
 });
@@ -283,17 +294,17 @@ test('native commands are proxied to the child and success is preserved', async 
   const session = injectSession({
     send: async (cmd) => ({ type: 'response', id: cmd.id, success: true, data: { ok: 1 } }),
   });
-  const resp = await handleRpcCommand({ type: 'prompt', sessionId: session.id, message: 'hi' });
+  const resp = await handleRpcCommand({ type: 'prompt', sessionId: session.id, message: 'hi', inputContext: contextFor(session) });
   assert.equal(resp.success, true);
   assert.equal(resp.data.ok, 1);
 });
 
-test('Abort acknowledgement timeout reports failure and preserves the running state', async () => {
-  const session = new PiRpcSession(liveManager, { cwd: '/tmp' });
+test('Abort acknowledgement timeout reports failure and preserves the running state', async t => {
+  const { session } = await runtimeFixture(t);
   session.isStreaming = true;
   session.send = async () => { throw new Error('RPC command timed out: abort'); };
   liveManager.sessions.set(session.id, session);
-  const resp = await handleRpcCommand({ type: 'abort', sessionId: session.id });
+  const resp = await handleRpcCommand({ type: 'abort', sessionId: session.id, inputContext: contextFor(session) });
   assert.equal(resp.success, false);
   assert.match(resp.error, /timed out/);
   assert.equal(session.isStreaming, true);
@@ -305,7 +316,7 @@ test('UI reply acknowledges socket delivery without an RPC timer and membership 
   liveManager.sessions.set(session.id, session);
   await emit({ type: 'extension_ui_request', id: 'confirm-1', method: 'confirm' });
   await until(() => session.attachment?.dialogs.has('confirm-1'), 'dialog received');
-  const response = await handleRpcCommand({ type: 'extension_ui_response', id: 'confirm-1', sessionId: session.id, confirmed: false });
+  const response = await handleRpcCommand({ type: 'extension_ui_response', id: 'confirm-1', sessionId: session.id, confirmed: false, inputContext: contextFor(session) });
   assert.equal(response.success, true);
   assert.deepEqual(response.data, { delivered: true });
   assert.equal(session.pending.size, 0);
@@ -313,13 +324,13 @@ test('UI reply acknowledges socket delivery without an RPC timer and membership 
   await until(() => mux.commands.some(command => command.id === 'confirm-1' && command.confirmed === false), 'reply delivered');
   await emit({ type: 'pimux_dialog_closed', id: 'confirm-1', reason: 'answered' });
   await until(() => !session.attachment?.dialogs.has('confirm-1'), 'mux closure');
-  const stale = await handleRpcCommand({ type: 'extension_ui_response', id: 'confirm-1', sessionId: session.id, confirmed: true });
+  const stale = await handleRpcCommand({ type: 'extension_ui_response', id: 'confirm-1', sessionId: session.id, confirmed: true, inputContext: contextFor(session) });
   assert.equal(stale.success, false);
 });
 
 test('prompt acknowledgement timeout is not treated as acceptance', async () => {
   const session = injectSession({ send: async () => { throw new Error('RPC command timed out: prompt'); } });
-  const resp = await handleRpcCommand({ type: 'prompt', sessionId: session.id, message: 'hi' });
+  const resp = await handleRpcCommand({ type: 'prompt', sessionId: session.id, message: 'hi', inputContext: contextFor(session) });
   assert.equal(resp.success, false);
   assert.match(resp.error, /timed out/);
   assert.equal(resp.delivery, 'uncertain');
@@ -327,7 +338,7 @@ test('prompt acknowledgement timeout is not treated as acceptance', async () => 
 
 test('explicit prompt rejection is safe to retry', async () => {
   const session = injectSession({ send: async () => ({ type: 'response', success: false, error: 'Rejected', data: {} }) });
-  const resp = await handleRpcCommand({ type: 'prompt', sessionId: session.id, message: 'hi' });
+  const resp = await handleRpcCommand({ type: 'prompt', sessionId: session.id, message: 'hi', inputContext: contextFor(session) });
   assert.equal(resp.delivery, 'rejected');
   const missing = await handleRpcCommand({ type: 'prompt', sessionId: 'missing', message: 'hi' });
   assert.equal(missing.delivery, 'rejected');
@@ -337,7 +348,7 @@ test('immediate send failures are reported as errors, not swallowed', async () =
   const session = injectSession({
     send: async () => { throw new Error('Pi RPC session is not running'); },
   });
-  const resp = await handleRpcCommand({ type: 'prompt', sessionId: session.id, message: 'hi' });
+  const resp = await handleRpcCommand({ type: 'prompt', sessionId: session.id, message: 'hi', inputContext: contextFor(session) });
   assert.equal(resp.success, false);
   assert.match(resp.error, /not running/);
 });

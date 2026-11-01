@@ -25,7 +25,8 @@ import { ARGS, AUTH_CONFIGURED, HOST, HTTP_PORT, MIME_TYPES, PI_AGENT_DIR, PI_CO
 import { SESSION_COOKIE_NAME, SESSION_REFRESH_THRESHOLD_SECONDS, buildSessionCookie, issueSessionToken, parseCookies, verifySessionToken } from './auth.js';
 import { completeDirectories } from './path-completion.js';
 import { getAvailableModels, modelLabel, normalizeModel, parseModelSpecToModel, parsePiListModels, _clearModelListCacheForTest, _setExecFileForTest } from './model-utils.js';
-import { LiveSessionManager, PiRpcSession, SessionOpenError, assertNoSessionArgs, isGenericSessionName, liveManager, makeId } from './sessions.js';
+import { InputContextError, LiveSessionManager, PiRpcSession, SessionOpenError, assertNoSessionArgs, isGenericSessionName, liveManager, makeId } from './sessions.js';
+import { isReadOnlyCommand } from '@phimacs/pimux/protocol';
 import { pimuxCommand, pimuxEntryForFile, pimuxFiles, pimuxSharing } from './pimux.js';
 import { AgentOverview } from './agents.js';
 import { canonicalSessionPath, lookupClaim } from '@phimacs/pimux/ownership';
@@ -290,7 +291,8 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
   const id = command.id;
   const cmd = command.type;
   const success = (data?: unknown): RpcResponse => ({ type: 'response', command: cmd, success: true, id, ...(data !== undefined ? { data } : {}) });
-  const error = (message: string): RpcResponse => ({ type: 'response', command: cmd, success: false, error: message, id, ...(cmd === 'prompt' ? { delivery: 'rejected' } : {}) });
+  const isInstruction = cmd === 'prompt' || cmd === 'steer' || cmd === 'follow_up';
+  const error = (message: string): RpcResponse => ({ type: 'response', command: cmd, success: false, error: message, id, ...(isInstruction ? { delivery: 'rejected' } : {}) });
 
   // Backend-local commands do not require a live runtime connection.
   if (cmd === 'get_auth') return success({ configured: AUTH_CONFIGURED, enabled: authEnabled });
@@ -311,10 +313,16 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
     return success({ enabled: authEnabled });
   }
   if (cmd === 'get_available_models') return success({ models: await getAvailableModels() });
+  const session = command.sessionId ? liveManager.get(command.sessionId) : null;
+  let requestContext: ReturnType<PiRpcSession['browserInputContext']> | undefined;
+  if (session && !isReadOnlyCommand(String(cmd)) && cmd !== 'live_session_snapshot_request') {
+    try { requestContext = session.browserInputContext(command); }
+    catch (cause) { return error(errorMessage(cause)); }
+    command = { ...command, pimuxContext: requestContext.runtimeContext };
+  }
   if (cmd === 'set_session_name') {
     const name = (command.name || '').trim();
     if (!name) return error('Name cannot be empty');
-    const session = command.sessionId ? liveManager.get(command.sessionId) : null;
     if (command.sessionId && !session) return error('Live session not found');
     let resolvedFile = null;
     if (command.filePath) {
@@ -324,11 +332,17 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
     if (live) {
       // A live Pi writes its own file: rename through it, so its state and
       // every frontend sharing it agree, and the file has one writer.
+      let renameContext = live.attachment?.inputContext;
       try {
-        const resp = await live.send({ type: 'set_session_name', name }, { timeoutMs: 10000 });
+        const expected = requestContext ?? (command.inputContext !== undefined ? live.browserInputContext(command) : undefined);
+        renameContext = expected?.runtimeContext ?? renameContext;
+        if (resolvedFile && !live.referencesSessionFile(resolvedFile)) return error('Runtime serves another conversation; the rename was not sent');
+        const resp = await live.send({ type: 'set_session_name', name,
+          ...(renameContext ? { pimuxContext: renameContext } : {}) }, { timeoutMs: 10000 });
         if (resp.success === false) return error(String(resp.error || 'Pi refused the rename'));
       } catch (e) { return error(errorMessage(e)); }
-      updateLiveSessionName(live, name);
+      if (renameContext && live.attachment?.inputContext?.contextId === renameContext.contextId
+        && live.sessionFile === renameContext.sessionFile) updateLiveSessionName(live, name);
       return success({ name });
     }
     if (!resolvedFile) return error('sessionId or filePath required');
@@ -349,7 +363,6 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
     return success({ name });
   }
 
-  const session = command.sessionId ? liveManager.get(command.sessionId) : null;
   // Backend-local: move the session-tree leaf to an earlier entry (pi's
   // native RPC protocol has no leaf-move command, so tau drives the bundled
   // /tau-tree-navigate extension command in-process — see src/server/tree.ts).
@@ -359,7 +372,7 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
     const entryId = typeof command.entryId === 'string' ? command.entryId.trim() : '';
     if (!entryId) return error('entryId required');
     try {
-      const result = await navigateTree(session, entryId);
+      const result = await navigateTree(session, entryId, requestContext?.runtimeContext);
       return success({ editorText: result.editorText });
     } catch (e) { return error(errorMessage(e)); }
   }
@@ -369,7 +382,7 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
       const sf = command.filePath ? resolveSessionFile(command.filePath) : session?.sessionFile;
       if (!sf) throw new Error('No session file to export yet');
       const output = resolveExportOutputPath(command.outputPath || sf.replace(/\.jsonl$/, '.html'), sf);
-      const result = await exportSession(sf, output, session);
+      const result = await exportSession(sf, output, session, requestContext?.runtimeContext);
       return success({ path: result });
     } catch (e) { return error(errorMessage(e)); }
   }
@@ -401,9 +414,8 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
 
   // Session replacement moves every frontend of the same runtime.
   const native = new Set(['new_session', 'prompt', 'steer', 'follow_up', 'abort', 'compact', 'set_model', 'cycle_model', 'set_thinking_level', 'cycle_thinking_level', 'get_session_stats', 'get_tree', 'get_entries', 'clear_queue', 'extension_ui_response']);
-  if (!native.has(cmd ?? '')) return error(`Unknown command: ${cmd}`);
+  if (!native.has(cmd ?? '') && !isReadOnlyCommand(String(cmd))) return error(`Unknown command: ${cmd}`);
   if (cmd === 'clear_queue' && command.confirmGlobal !== true) return error('Clearing the queue removes input from every frontend; explicit confirmation is required.');
-  const requestContext = { file: session.sessionFile, leafId: session.attachment?.leafId, generation: session.attachment?.appliedGeneration };
 
   // While navigate_tree is moving the child's leaf (pi's stdin loop does not
   // serialize a new prompt behind a running extension command), a prompt
@@ -419,6 +431,8 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
   // session.thinkingLevel — yet touch(true)->broadcastUpdated would echo the
   // stale level to all clients (reverting a client's just-set optimistic
   // level). Record the level optimistically here and restore on pi failure.
+  const requestIsCurrent = () => !!requestContext && requestContext.file === session.sessionFile
+    && requestContext.runtimeContext.contextId === session.attachment?.inputContext?.contextId;
   const isSetThinkingLevel = cmd === 'set_thinking_level';
   let prevThinkingLevel: string | null = null;
   if (isSetThinkingLevel) {
@@ -432,15 +446,15 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
       : cmd === 'abort'
         ? await session.abort(command)
         : await session.send(command, { timeoutMs: cmd === 'prompt' ? 10000 : 60000 });
-    if (isSetThinkingLevel && resp.success === false && prevThinkingLevel !== null) {
+    if (isSetThinkingLevel && resp.success === false && prevThinkingLevel !== null && requestIsCurrent()) {
       session.thinkingLevel = prevThinkingLevel;
     }
-    if (cmd === 'clear_queue' && resp.success !== false) liveManager.broadcast({ type: 'event', sessionId: session.id, event: { type: 'shared_queue_cleared' } });
-    return { ...resp, success: resp.success !== false, ...(cmd === 'clear_queue' ? { recoveryContext: requestContext } : {}), ...(cmd === 'prompt' && resp.success === false ? { delivery: 'rejected' } : {}) };
+    if (cmd === 'clear_queue' && resp.success !== false && requestIsCurrent()) liveManager.broadcast({ type: 'event', sessionId: session.id, event: { type: 'shared_queue_cleared' } });
+    return { ...resp, success: resp.success !== false, ...(cmd === 'clear_queue' ? { recoveryContext: requestContext } : {}), ...(isInstruction && resp.success === false ? { delivery: resp.delivery === 'uncertain' ? 'uncertain' : 'rejected' } : {}) };
   } catch (e) {
-    if (isSetThinkingLevel && prevThinkingLevel !== null) session.thinkingLevel = prevThinkingLevel;
+    if (isSetThinkingLevel && prevThinkingLevel !== null && requestIsCurrent()) session.thinkingLevel = prevThinkingLevel;
     // A timeout or broken transport does not establish whether Pi ran a prompt.
-    return { ...error(errorMessage(e)), ...(cmd === 'prompt' ? { delivery: 'uncertain' } : {}) };
+    return { ...error(errorMessage(e)), ...(isInstruction ? { delivery: e instanceof InputContextError ? 'rejected' : 'uncertain' } : {}) };
   }
 }
 

@@ -34,6 +34,7 @@
  */
 
 import type { JsonRecord, RpcCommand, RpcResponse } from './types.js';
+import type { InputContext } from '@phimacs/pimux/protocol';
 
 /**
  * Name of the slash command registered by tau's bundled pi extension.
@@ -201,7 +202,7 @@ async function assertNavigateCommandAvailable(session: NavigableSession): Promis
  * (leaf verification fails) the clients are re-synced to the child's real
  * state before the error is reported.
  */
-export async function navigateTree(session: NavigableSession, entryId: string): Promise<{ editorText?: string }> {
+export async function navigateTree(session: NavigableSession, entryId: string, inputContext?: InputContext): Promise<{ editorText?: string }> {
   if (navigationsInFlight.has(session.id)) {
     throw new Error('Another tree navigation for this session is already in progress');
   }
@@ -235,7 +236,8 @@ export async function navigateTree(session: NavigableSession, entryId: string): 
     // ctx.isIdle() as the authoritative guard).
     assertNotStreaming(session);
     session.lastExtensionError = null;
-    const prompted = await session.send({ type: 'prompt', message: `/${NAVIGATE_COMMAND} ${entryId}` }, { timeoutMs: 30000 });
+    const prompted = await session.send({ type: 'prompt', message: `/${NAVIGATE_COMMAND} ${entryId}`,
+      ...(inputContext ? { pimuxContext: inputContext } : {}) }, { timeoutMs: 30000 });
     if (prompted.success === false) {
       throw new Error(`pi refused the tree-navigation command: ${prompted.error || 'unknown error'}`);
     }

@@ -3,6 +3,7 @@ import net from 'node:net';
 import path from 'node:path';
 import type { JsonRecord } from '../src/server/types.ts';
 import { readProcessIdentity } from '@phimacs/pimux/process-identity';
+import { isReadOnlyCommand, parseInputContext, type InputContext } from '@phimacs/pimux/protocol';
 
 /**
  * A pimux wrapper's socket side without Pi: it answers attach with hello and a
@@ -24,6 +25,8 @@ export class FakePimux {
   /** When set, every snapshot request fails with this error instead of being answered. */
   failSnapshots: string | null = null;
   leafId: string | null = null;
+  inputContext: InputContext | null = null;
+  beforeCommand?: (command: JsonRecord) => void;
   /** Records between `pimux_snapshot` and `pimux_live`. */
   replay: JsonRecord[] = [];
   idle = true;
@@ -76,7 +79,7 @@ export class FakePimux {
         this.handle(socket, command);
       }
     });
-    this.write(socket, { type: 'pimux_hello', protocol: this.entry.protocol, muxId: this.muxId, clientId: this.connections.size, capabilities: ['snapshot', 'stop', 'detached'], piPid: process.pid, socket: this.socketPath });
+    this.write(socket, { type: 'pimux_hello', protocol: this.entry.protocol, muxId: this.muxId, clientId: this.connections.size, capabilities: ['snapshot', 'stop', 'detached', 'contextual-input'], piPid: process.pid, socket: this.socketPath });
     this.snapshot(socket, 'attach');
   }
 
@@ -86,6 +89,15 @@ export class FakePimux {
       this.write(socket, { type: 'response', id: command.id, command: 'pimux_bootstrap', success: true, data: { generation } });
       this.snapshot(socket, 'request', generation);
       return;
+    }
+    this.beforeCommand?.(command);
+    if (!isReadOnlyCommand(String(command.type))) {
+      const expected = parseInputContext(command.pimuxContext);
+      if (!expected || !this.inputContext || expected.contextId !== this.inputContext.contextId
+        || expected.sessionFile !== this.inputContext.sessionFile || expected.leafId !== this.inputContext.leafId) {
+        this.write(socket, { type: 'response', id: command.id, command: command.type, success: false, delivery: 'rejected', error: 'Runtime input context changed' });
+        return;
+      }
     }
     if (this.withheld.has(String(command.type))) return;
     const response = this.responses[String(command.type)] ?? { success: true, data: {} };
@@ -97,8 +109,13 @@ export class FakePimux {
       this.write(socket, { type: 'pimux_snapshot_failed', generation, error: this.failSnapshots });
       return;
     }
+    const extraSession = this.extraSnapshot.session as JsonRecord | undefined;
+    const sessionFile = (extraSession?.file ?? (this.entry.session as JsonRecord | undefined)?.file ?? null) as string | null;
+    if (!this.inputContext || this.inputContext.sessionFile !== sessionFile || reason === 'session_changed' || reason === 'tree_changed') {
+      this.inputContext = { sessionFile, leafId: this.leafId, contextId: `branch-${this.muxId}-${generation}` };
+    }
     this.write(socket, {
-      type: 'pimux_snapshot', generation, reason,
+      type: 'pimux_snapshot', generation, reason, inputContext: this.inputContext,
       session: { file: this.entry.session && (this.entry.session as JsonRecord).file, id: `id-${this.muxId}`, name: null, cwd: this.entry.cwd },
       model: { provider: 'fx', id: 'one' }, thinkingLevel: 'off', idle: this.idle, leafId: this.leafId, entries: this.entries,
       run: { active: !this.idle, compacting: false, tailTruncated: false }, replay: this.replay.length, ...this.extraSnapshot,

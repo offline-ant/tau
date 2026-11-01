@@ -3,7 +3,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { startRuntime, stopRuntime, RuntimeOperationError, type ParentTask, type RuntimeReceipt, type StartRuntimeOptions, type TerminalReceipt } from '@phimacs/pimux/runtime';
 import { canonicalSessionPath } from '@phimacs/pimux/ownership';
-import { isRecord } from '@phimacs/pimux/protocol';
+import { isReadOnlyCommand, isRecord, parseInputContext, type InputContext } from '@phimacs/pimux/protocol';
 import { WebSocket } from 'ws';
 
 import type { AbortState, JsonRecord, LiveClient, ModelIdentity, PendingCommand, RpcCommand, RpcResponse, SessionSpawnOverrides } from './types.js';
@@ -71,6 +71,13 @@ export class SessionOpenError extends Error {
   }
 }
 
+/** A command refused before transport delivery can safely remain requester-local. */
+export class InputContextError extends Error {}
+
+function sameInputContext(left: InputContext, right: InputContext): boolean {
+  return left.contextId === right.contextId && left.sessionFile === right.sessionFile && left.leafId === right.leafId;
+}
+
 /** Runtime identity and origin placement for display; no frontend owns its lifetime. */
 export type AttachedOwner = { muxId: string; host: string | null; placement: string; name: string | null };
 
@@ -101,7 +108,7 @@ export class PiRpcSession {
   extraEnv: Record<string, string>;
   pending: Map<string, PendingCommand>;
   /** Timeout is not completion: IDs remain reserved until a real response/disconnect. */
-  private outstandingIds = new Set<string>();
+  private outstandingIds = new Map<string, InputContext | null>();
   /** Joins browsers selecting an attached tab at once into one pimux snapshot. */
   private bootstrapping: Promise<void> | null = null;
   terminating: boolean;
@@ -119,6 +126,7 @@ export class PiRpcSession {
   interactionRevision = 0;
   abortState: AbortState = 'idle';
   private abortPromise: Promise<RpcResponse> | null = null;
+  private abortInputContext: InputContext | null = null;
   private abortCommandId: string | null = null;
   private operationRevision = 0;
   private abortOperationRevision = 0;
@@ -178,6 +186,8 @@ export class PiRpcSession {
       capabilities: this.capabilities,
       runtime: this.runtimeReceipt,
       leafId: this.attachment?.leafId ?? null,
+      runtimeContext: this.attachment?.inputContext ?? null,
+      inputReady: !!this.attachment?.ready && !!this.attachment.inputContext && !this.terminating && !this.exited,
       abortState: this.abortState,
       attached: this.attachedOwner,
     };
@@ -318,6 +328,38 @@ export class PiRpcSession {
     return this.manager.runtime.stop(this.attachment.muxId, { operationId });
   }
 
+  /** Validate the browser's captured expectation, never replace it with current state. */
+  browserInputContext(command: RpcCommand) {
+    const input = command.inputContext;
+    const current = this.attachment?.inputContext;
+    if (!this.attachment?.ready || !current || !isRecord(input)
+      || input.agentId !== this.attachment.muxId || input.file !== this.sessionFile) {
+      throw new InputContextError('Input belongs to an unavailable or different conversation; review it before reuse');
+    }
+    const expected = parseInputContext(input.runtimeContext);
+    if (!expected || !sameInputContext(expected, current) || expected.sessionFile !== input.file) {
+      throw new InputContextError('Input belongs to another branch or an unknown context; review it before reuse');
+    }
+    return { agentId: this.attachment.muxId, file: this.sessionFile,
+      leafId: typeof input.leafId === 'string' ? input.leafId : null, runtimeContext: expected };
+  }
+
+  private contextualCommand(command: RpcCommand): RpcCommand {
+    const outbound = { ...command };
+    delete outbound.inputContext;
+    if (isReadOnlyCommand(String(command.type)) || String(command.type).startsWith('pimux_')) {
+      delete outbound.pimuxContext;
+      return outbound;
+    }
+    const current = this.attachment?.inputContext;
+    const expected = Object.hasOwn(command, 'pimuxContext') ? parseInputContext(command.pimuxContext) : current;
+    if (!this.attachment?.ready || !current || !expected || !sameInputContext(expected, current)) {
+      throw new InputContextError('Runtime input context changed or is not ready; command was not sent');
+    }
+    outbound.pimuxContext = { ...expected };
+    return outbound;
+  }
+
   send(command: RpcCommand, opts: { timeoutMs?: number } = {}) {
     return this.sendCommand(command, opts);
   }
@@ -326,13 +368,16 @@ export class PiRpcSession {
     const transport = this.transport;
     if (this.outstandingIds.size >= 256) return Promise.reject(new Error('Too many pending runtime commands; wait for their outcome'));
     if (!transport || !transport.writable || this.terminating || this.exited
-      || !this.attachment?.ready && command.type !== 'pimux_bootstrap') {
+      || !this.attachment?.ready && command.type !== 'pimux_bootstrap' && !isReadOnlyCommand(String(command.type))) {
       return Promise.reject(new Error('Pi RPC session is not running'));
     }
     const id = command.id || `cmd_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     if (this.outstandingIds.has(id)) return Promise.reject(new Error('Command ID is still in flight; do not retry an uncertain operation'));
-    this.outstandingIds.add(id);
-    const outbound = { ...command, id };
+    let contextual: RpcCommand;
+    try { contextual = this.contextualCommand(command); }
+    catch (error) { return Promise.reject(error); }
+    this.outstandingIds.set(id, this.attachment?.inputContext ? { ...this.attachment.inputContext } : null);
+    const outbound = { ...contextual, id };
     delete outbound.sessionId;
     const timeoutMs = opts.timeoutMs ?? 60000;
     return new Promise<RpcResponse>((resolve, reject) => {
@@ -363,7 +408,7 @@ export class PiRpcSession {
     if (!transport?.writable || this.terminating || !this.attachment?.ready) return Promise.reject(new Error('Pi RPC session is not snapshot-ready'));
     return new Promise<void>((resolve, reject) => {
       try {
-        transport.write(JSON.stringify(command) + '\n', (err) => err ? reject(err) : resolve());
+        transport.write(JSON.stringify(this.contextualCommand(command)) + '\n', (err) => err ? reject(err) : resolve());
       } catch (error) { reject(error); }
     });
   }
@@ -376,7 +421,8 @@ export class PiRpcSession {
     if (typeof request.expiresAt === 'number' && request.expiresAt <= Date.now()) {
       throw new Error('Dialog has expired');
     }
-    const outbound: RpcCommand = { type: 'extension_ui_response', id };
+    const outbound: RpcCommand = { type: 'extension_ui_response', id,
+      ...(Object.hasOwn(command, 'pimuxContext') ? { pimuxContext: command.pimuxContext } : {}) };
     if (command.cancelled === true || this.abortState !== 'idle') outbound.cancelled = true;
     else if (request.method === 'confirm' && typeof command.confirmed === 'boolean') outbound.confirmed = command.confirmed;
     else if (request.method !== 'confirm' && typeof command.value === 'string') {
@@ -394,6 +440,8 @@ export class PiRpcSession {
   }
 
   private cancelPendingDialogs() {
+    const current = this.attachment?.inputContext;
+    if (!current || !this.abortInputContext || !sameInputContext(current, this.abortInputContext)) return;
     for (const id of this.attachment?.dialogs.keys() ?? []) {
       void this.respondToDialog({ type: 'extension_ui_response', id, cancelled: true })
         .catch(() => this.diagnostic('cancellation_delivery_failed', id));
@@ -412,30 +460,39 @@ export class PiRpcSession {
   }
 
   abort(command: RpcCommand = {}, opts: { timeoutMs?: number } = {}): Promise<RpcResponse> {
-    if (!this.abortPromise) {
+    let contextual: RpcCommand;
+    try { contextual = this.contextualCommand({ ...command, type: 'abort' }); }
+    catch (error) { return Promise.reject(error); }
+    const context = parseInputContext(contextual.pimuxContext);
+    if (!context) return Promise.reject(new InputContextError('Abort requires an authoritative runtime context'));
+    if (!this.abortPromise || !this.abortInputContext || !sameInputContext(context, this.abortInputContext)) {
       this.abortState = 'stopping';
-      this.abortCommandId = command.id || makeId();
+      const abortId = command.id || makeId();
+      this.abortCommandId = abortId;
+      this.abortInputContext = context;
       this.abortOperationRevision = this.operationRevision;
       this.manager.broadcastUpdated(this.id);
       this.diagnostic('abort_sent');
-      // send() writes synchronously. Never wait for its acknowledgement before
-      // releasing hooks whose extensions forgot to pass the turn signal.
-      const native = this.send({ type: 'abort', id: this.abortCommandId }, opts);
+      // Delivery starts before dialog cancellation; neither retries on uncertainty.
+      const native = this.send({ ...contextual, id: abortId }, opts);
       this.cancelPendingDialogs();
-      this.abortPromise = native.then(resp => {
-        if (resp.success === true) this.completeAbort(this.abortCommandId ?? undefined);
-        else {
+      const operation: Promise<RpcResponse> = native.then(resp => {
+        if (resp.success === true) this.completeAbort(abortId);
+        else if (this.abortCommandId === abortId) {
           this.abortState = 'failed';
           this.diagnostic('abort_failed');
           this.manager.broadcastUpdated(this.id);
         }
         return resp;
       }, error => {
-        this.abortState = /^RPC command timed out:/.test(String(error instanceof Error ? error.message : error)) ? 'timed_out' : 'failed';
-        this.diagnostic(this.abortState === 'timed_out' ? 'abort_timed_out' : 'abort_failed');
-        this.manager.broadcastUpdated(this.id);
+        if (this.abortCommandId === abortId) {
+          this.abortState = /^RPC command timed out:/.test(String(error instanceof Error ? error.message : error)) ? 'timed_out' : 'failed';
+          this.diagnostic(this.abortState === 'timed_out' ? 'abort_timed_out' : 'abort_failed');
+          this.manager.broadcastUpdated(this.id);
+        }
         throw error;
-      }).finally(() => { this.abortPromise = null; });
+      }).finally(() => { if (this.abortPromise === operation) this.abortPromise = null; });
+      this.abortPromise = operation;
     }
     // Coalesced callers still receive their own command correlation ID.
     return this.abortPromise.then(resp => ({ ...resp, ...(command.id ? { id: command.id } : {}) }));
@@ -447,9 +504,14 @@ export class PiRpcSession {
     let msg;
     try { msg = JSON.parse(trimmed); } catch { console.warn('[Tau] Invalid runtime JSON record'); this.transport?.abandon(); return; }
     if (typeof msg !== 'object' || msg === null) return;
-    try { if (this.attachment?.handle(msg)) return; }
-    catch (error) {
+    try {
+      const wasReady = this.attachment?.ready;
+      const handled = this.attachment?.handle(msg);
+      if (wasReady !== this.attachment?.ready) this.manager.broadcastUpdated(this.id);
+      if (handled) return;
+    } catch (error) {
       this.attachment?.close(error instanceof Error ? error : new Error(String(error)));
+      this.manager.broadcastUpdated(this.id);
       this.transport?.abandon();
       return;
     }
@@ -466,6 +528,8 @@ export class PiRpcSession {
 
   private completeResponse(resp: PiRpcMessage) {
     const id = resp.id;
+    const tracked = !!id && this.outstandingIds.has(id);
+    const expected = id ? this.outstandingIds.get(id) : undefined;
     if (id) this.outstandingIds.delete(id);
     if (id && this.pending.has(id)) {
       const pending = this.pending.get(id);
@@ -478,6 +542,8 @@ export class PiRpcSession {
     if (resp.command === 'abort' && resp.success === true) this.completeAbort(resp.id);
     // Answers to Tau's own pimux requests concern this server, not browsers.
     if (String(resp.command ?? '').startsWith('pimux_') || resp.command === 'clear_queue') return;
+    const current = this.attachment?.inputContext;
+    if (tracked && (!expected || !current || !sameInputContext(expected, current))) return;
     this.updateStateFromResponse(resp);
     this.manager.broadcast({ type: 'event', sessionId: this.id, event: resp });
   }
@@ -487,6 +553,12 @@ export class PiRpcSession {
    * as ordinary events, so every browser shows the same conversation.
    */
   private applyPimuxSnapshot({ snapshot, replay }: AppliedSnapshot) {
+    const context = parseInputContext(snapshot.inputContext);
+    if (context && this.abortInputContext && !sameInputContext(context, this.abortInputContext)) {
+      this.abortState = 'idle';
+      this.abortCommandId = null;
+      this.abortInputContext = null;
+    }
     const session = snapshot.session;
     if (session) {
       this.sessionFile = session.file;

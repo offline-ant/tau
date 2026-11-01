@@ -14,7 +14,7 @@
  */
 
 import type { JsonRecord } from './types.js';
-import { DIALOG_METHODS, PROTOCOL_VERSION, type SnapshotData, type SessionIdentity } from '@phimacs/pimux/protocol';
+import { DIALOG_METHODS, PROTOCOL_VERSION, parseInputContext, type InputContext, type SnapshotData, type SessionIdentity } from '@phimacs/pimux/protocol';
 import { canonicalSessionPath } from '@phimacs/pimux/ownership';
 
 const SEQUENCE_INTERRUPTIONS = new Set(['pimux_gap', 'pimux_snapshot', 'pimux_snapshot_failed', 'pimux_exit', 'pimux_session_changed', 'pimux_tree_changed']);
@@ -24,6 +24,7 @@ export type PimuxSnapshotRecord = JsonRecord & SnapshotData & {
   reason?: string;
   run?: { active?: boolean; compacting?: boolean; tailTruncated?: boolean };
   replay: number;
+  inputContext: InputContext | null;
 };
 
 export type AppliedSnapshot = { snapshot: PimuxSnapshotRecord; replay: JsonRecord[]; dialogs: JsonRecord[] };
@@ -53,6 +54,7 @@ export class PimuxAttachment {
   private terminalError: Error | null = null;
   private lastFailure: { generation: number; error: Error } | null = null;
   ready = false;
+  inputContext: InputContext | null = null;
   leafId: string | null = null;
   session: SessionIdentity | null = null;
   /** Complete flat tree at the authoritative boundary, distinct from UI projection. */
@@ -69,7 +71,10 @@ export class PimuxAttachment {
   /** Consumes protocol and replay records; returns false for records the session handles itself. */
   handle(record: JsonRecord): boolean {
     if (this.collecting && SEQUENCE_INTERRUPTIONS.has(String(record.type))) this.collecting = null;
-    if (SEQUENCE_INTERRUPTIONS.has(String(record.type))) this.ready = false;
+    if (SEQUENCE_INTERRUPTIONS.has(String(record.type))) {
+      this.ready = false;
+      this.inputContext = null;
+    }
     if (this.collecting) {
       if (record.type === 'pimux_live') {
         if (record.generation === this.collecting.snapshot.generation && this.collecting.replay.length === this.collecting.snapshot.replay) this.finishSnapshot();
@@ -89,7 +94,7 @@ export class PimuxAttachment {
       case 'pimux_hello': {
         const capabilities = record.capabilities;
         if (record.protocol !== PROTOCOL_VERSION || record.muxId !== this.muxId || record.piPid !== this.expected.piPid
-          || !Array.isArray(capabilities) || !['snapshot', 'stop', 'detached'].every(cap => capabilities.includes(cap))) {
+          || !Array.isArray(capabilities) || !['snapshot', 'stop', 'detached', 'contextual-input'].every(cap => capabilities.includes(cap))) {
           throw new Error('Runtime protocol, identity or capabilities mismatch');
         }
         this.hello = true;
@@ -145,8 +150,14 @@ export class PimuxAttachment {
     this.leafId = snapshot.leafId;
     this.session = snapshot.session;
     this.snapshot = snapshot;
-    this.ready = true;
+    const context = parseInputContext(snapshot.inputContext);
+    this.inputContext = context?.sessionFile === snapshot.session.file ? context : null;
+    this.ready = this.inputContext !== null;
     this.onSnapshot({ snapshot, replay: replay.filter((record) => !isDialogRequest(record)), dialogs });
+    if (!this.ready) {
+      this.fail(snapshot.generation, new Error('Runtime snapshot has no authoritative input context'));
+      return;
+    }
     const satisfied = this.waiters.filter((waiter) => waiter.generation <= snapshot.generation);
     this.waiters = this.waiters.filter((waiter) => waiter.generation > snapshot.generation);
     for (const waiter of satisfied) { clearTimeout(waiter.timer); waiter.resolve(); }
@@ -155,7 +166,7 @@ export class PimuxAttachment {
   /** Resolves once a snapshot of `generation` or later has been published; generation 0 waits for the first. */
   waitFor(generation: number, timeoutMs = 35000): Promise<void> {
     if (this.terminalError) return Promise.reject(this.terminalError);
-    if (this.lastFailure && generation <= this.lastFailure.generation && this.appliedGeneration < generation) return Promise.reject(this.lastFailure.error);
+    if (this.lastFailure && generation <= this.lastFailure.generation && (!this.ready || this.appliedGeneration < generation)) return Promise.reject(this.lastFailure.error);
     if (this.ready && this.appliedGeneration >= generation && this.appliedGeneration >= 0) return Promise.resolve();
     return new Promise((resolve, reject) => {
       const waiter: Waiter = {
@@ -182,6 +193,7 @@ export class PimuxAttachment {
   close(error: Error) {
     this.terminalError = error;
     this.ready = false;
+    this.inputContext = null;
     this.collecting = null;
     for (const waiter of this.waiters) { clearTimeout(waiter.timer); waiter.reject(error); }
     this.waiters = [];

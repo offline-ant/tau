@@ -178,11 +178,12 @@ test('shared clear_queue requires global confirmation and recovery is sent only 
   t.after(() => liveManager.shutdown());
   const broadcasts: unknown[] = [];
   t.mock.method(liveManager, 'broadcast', (record: unknown) => broadcasts.push(record));
-  const rejected = await handleRpcCommand({ type: 'clear_queue', sessionId: session.id });
+  const inputContext = { agentId: mux.muxId, file: session.sessionFile, leafId: session.attachment!.leafId, runtimeContext: session.attachment!.inputContext };
+  const rejected = await handleRpcCommand({ type: 'clear_queue', sessionId: session.id, inputContext });
   assert.equal(rejected.success, false);
   assert.equal(mux.commands.some(command => command.type === 'clear_queue'), false);
   mux.responses.clear_queue = { success: true, data: { steering: ['shared input'], followUp: [] } };
-  const response = await handleRpcCommand({ type: 'clear_queue', sessionId: session.id, confirmGlobal: true });
+  const response = await handleRpcCommand({ type: 'clear_queue', sessionId: session.id, confirmGlobal: true, inputContext });
   assert.equal(response.success, true);
   assert.ok(response.recoveryContext);
   assert.deepEqual(response.data, { steering: ['shared input'], followUp: [] });
