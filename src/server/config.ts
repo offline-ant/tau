@@ -38,13 +38,6 @@ export function resolvePiCommand(args: TauArgs, env: NodeJS.ProcessEnv = process
 }
 
 export const PI_COMMAND = resolvePiCommand(ARGS);
-// Fork default: this workspace always runs tau with credentials configured, so
-// the default 0.0.0.0 bind is never an open session-spawning API. An
-// explicitly empty TAU_USER/TAU_PASS (or an empty value in settings.json) opts
-// out and leaves auth unconfigured.
-export const DEFAULT_USER = 'rs';
-export const DEFAULT_PASS = 'l';
-
 export function loadTauSettings(): TauSettings {
   let settings: TauSettingsFile['tau'] = {};
   try {
@@ -58,8 +51,8 @@ export function loadTauSettings(): TauSettings {
     hostnames: process.env.TAU_HOSTNAMES !== undefined
       ? process.env.TAU_HOSTNAMES.split(',').map((name) => name.trim()).filter(Boolean)
       : settings.hostnames ?? [],
-    user: process.env.TAU_USER ?? settings.user ?? DEFAULT_USER,
-    pass: process.env.TAU_PASS ?? settings.pass ?? DEFAULT_PASS,
+    user: process.env.TAU_USER ?? settings.user ?? '',
+    pass: process.env.TAU_PASS ?? settings.pass ?? '',
     authEnabled: settings.authEnabled,
     cookieSecret: process.env.TAU_COOKIE_SECRET || settings.cookieSecret || '',
     projectsDir: expandHome(ARGS['projects-dir'] || process.env.TAU_PROJECTS_DIR || settings.projectsDir || ''),
@@ -67,7 +60,15 @@ export function loadTauSettings(): TauSettings {
 }
 
 export const TAU_SETTINGS = loadTauSettings();
-export const AUTH_CONFIGURED = !!(TAU_SETTINGS.user && TAU_SETTINGS.pass);
+export const AUTH_CONFIGURED = typeof TAU_SETTINGS.user === 'string' && TAU_SETTINGS.user.length > 0
+  && typeof TAU_SETTINGS.pass === 'string' && TAU_SETTINGS.pass.length > 0;
+
+/** Validate before opening either listener; missing credentials never disable auth. */
+export function requireTauCredentials(settings: Pick<TauSettings, 'user' | 'pass'>): void {
+  if (typeof settings.user !== 'string' || !settings.user || typeof settings.pass !== 'string' || !settings.pass) {
+    throw new Error('Authentication requires a nonempty username and password. Set TAU_USER and TAU_PASS, or tau.user and tau.pass in settings.json. To explicitly run without authentication, set tau.authEnabled to false.');
+  }
+}
 /** HTTPS port: the only listener reachable from the network. */
 export const PORT = TAU_SETTINGS.port;
 export const HOST = TAU_SETTINGS.host;

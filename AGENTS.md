@@ -190,6 +190,13 @@ that carries events is down.
 `src/public/sw.ts` lists every module by hand (`test/service-worker.test.ts` checks
 it). Bump `CACHE_NAME` with each deployed change to `src/public`.
 
+Authentication is enabled unless `tau.authEnabled` is explicitly `false`.
+There are no default credentials: `listen()` validates a nonempty configured user
+and password before creating TLS assets or opening either listener. Empty
+`TAU_USER`/`TAU_PASS` override settings but never disable authentication. Keep the
+explicit opt-out and the configured runtime `set_auth` toggle; missing credentials
+must not produce an implicitly open server.
+
 Only the exact normalized `/api/health` skips authentication (`isPublicRequest`).
 Compare request paths after URL normalization, never by raw prefix.
 

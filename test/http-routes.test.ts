@@ -16,10 +16,10 @@ process.env.PI_CODING_AGENT_SESSION_DIR = path.join(process.env.PI_CODING_AGENT_
 // Configure a projects dir so /api/projects has something to list.
 const PROJECTS_DIR = path.join(process.env.PI_CODING_AGENT_DIR, 'projects');
 process.env.TAU_PROJECTS_DIR = PROJECTS_DIR;
-// These routes are exercised unauthenticated; this fork configures default
-// credentials, so opt out explicitly with empty values.
+// These routes intentionally exercise the explicitly unauthenticated mode.
 process.env.TAU_USER = '';
 process.env.TAU_PASS = '';
+fs.writeFileSync(path.join(process.env.PI_CODING_AGENT_DIR, 'settings.json'), JSON.stringify({ tau: { authEnabled: false } }));
 
 // Load the server after the env is in place: the module reads it at load
 // time, and ESM hoists static imports ahead of this body.

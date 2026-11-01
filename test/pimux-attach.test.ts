@@ -15,6 +15,7 @@ process.env.PI_CODING_AGENT_SESSION_DIR = path.join(process.env.PI_CODING_AGENT_
 process.env.PIMUX_DIR = path.join(process.env.PI_CODING_AGENT_DIR, 'mux');
 process.env.TAU_USER = '';
 process.env.TAU_PASS = '';
+fs.writeFileSync(path.join(process.env.PI_CODING_AGENT_DIR, 'settings.json'), JSON.stringify({ tau: { authEnabled: false } }));
 
 const { server, liveManager, SESSIONS_DIR, _setSpawnPiForTest, handleRpcCommand } = (await import('../bin/tau.js')) as any;
 const { AgentOverview } = (await import('../bin/agents.js')) as any;

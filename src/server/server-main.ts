@@ -22,7 +22,7 @@ import type { AddressInfo, Socket } from 'node:net';
 import type { TLSSocket } from 'node:tls';
 import type { WebSocket as WsType } from 'ws';
 import type { JsonRecord, RpcCommand, RpcResponse, StatusError } from './types.js';
-import { ARGS, AUTH_CONFIGURED, HOST, HTTP_PORT, MIME_TYPES, PI_AGENT_DIR, PI_COMMAND, PORT, SESSIONS_DIR, STATIC_DIR, TAU_SETTINGS, TLS_DIR, USER_HOME, expandHome, loadTauSettings, parseArgs, resolvePiCommand, saveTauSetting } from './config.js';
+import { ARGS, AUTH_CONFIGURED, HOST, HTTP_PORT, MIME_TYPES, PI_AGENT_DIR, PI_COMMAND, PORT, SESSIONS_DIR, STATIC_DIR, TAU_SETTINGS, TLS_DIR, USER_HOME, expandHome, loadTauSettings, parseArgs, requireTauCredentials, resolvePiCommand, saveTauSetting } from './config.js';
 import { SESSION_COOKIE_NAME, SESSION_REFRESH_THRESHOLD_SECONDS, buildSessionCookie, issueSessionToken, parseCookies, verifySessionToken } from './auth.js';
 import { completeDirectories } from './path-completion.js';
 import { getAvailableModels, modelLabel, normalizeModel, parseModelSpecToModel, parsePiListModels, _clearModelListCacheForTest, _setExecFileForTest } from './model-utils.js';
@@ -38,10 +38,11 @@ import { NAVIGATE_COMMAND, NAVIGATION_MARKER_TYPE, entriesById, isTreeNavigation
 
 type TauWs = WsType & { isAlive?: boolean };
 
-let authEnabled = AUTH_CONFIGURED && TAU_SETTINGS.authEnabled !== false;
+let authEnabled = TAU_SETTINGS.authEnabled !== false;
 
 function checkBasicAuth(req: IncomingMessage) {
   if (!authEnabled) return true;
+  if (!AUTH_CONFIGURED) return false;
   const header = req.headers.authorization;
   if (!header || !header.startsWith('Basic ')) return false;
   const decoded = Buffer.from(header.slice(6), 'base64').toString();
@@ -1099,6 +1100,7 @@ function listenOn(target: http.Server, port: number, host: string, attemptsLeft 
 }
 
 async function listen() {
+  if (authEnabled) requireTauCredentials(TAU_SETTINGS);
   const tls = ensureTlsCertificate(TLS_DIR, TAU_SETTINGS.hostnames);
   httpsServer = https.createServer({ key: tls.key, cert: tls.cert }, serveStaticFile);
   httpsServer.on('upgrade', handleUpgrade);
