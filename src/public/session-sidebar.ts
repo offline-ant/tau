@@ -58,6 +58,12 @@ export class SessionSidebar {
   _searchRequest = 0;
   favourites: string[];
   contextMenu: HTMLElement | null;
+  private generation = 0;
+  private nextSessionRequest = 0;
+  private sessionRequests = new Map<string, number>();
+  private projectsLoading = false;
+  private projectsError: string | null = null;
+  private sessionErrors = new Map<string, string>();
 
   constructor(
     container: HTMLElement,
@@ -92,59 +98,111 @@ export class SessionSidebar {
   // ═══════════════════════════════════════
 
   async loadProjects() {
-    try {
-      this.container.innerHTML = Array.from({ length: 6 }, () =>
-        '<div class="session-skeleton"><div class="session-skeleton-title"></div><div class="session-skeleton-meta"></div></div>'
-      ).join('');
-      const res = await fetch('/api/sessions');
-      const data = await res.json();
-      this.projects = data.projects || [];
-      this.sessionsByDir.clear();
-      this.render();
-      if (this.searchQuery) await Promise.all(this.projects.map(project => this.loadSessions(project.dirName)));
-      else await this.loadFavouriteProjects();
-    } catch (error) {
-      console.error('[Sidebar] Failed to load projects:', error);
-      this.container.innerHTML = '<div class="session-loading">Failed to load sessions</div>';
-    }
+    await this.updateProjects(true);
   }
 
   /** Picks up sessions that appeared or changed, in place: no skeleton, and open lists stay open. */
   async refresh() {
     if (this.contextMenu || this.container.querySelector('.session-rename-input')) return;
+    await this.updateProjects(false);
+  }
+
+  private async updateProjects(reload: boolean) {
+    const generation = ++this.generation;
+    // A new summary also supersedes every list requested under the old summary.
+    this.sessionRequests.clear();
+    this.loading.clear();
+    this.projectsLoading = true;
+    this.projectsError = null;
+    if (reload) {
+      this.container.innerHTML = Array.from({ length: 6 }, () =>
+        '<div class="session-skeleton"><div class="session-skeleton-title"></div><div class="session-skeleton-meta"></div></div>'
+      ).join('');
+    } else this.render();
     try {
-      const data = await (await fetch('/api/sessions')).json();
-      const lists = await Promise.all(Array.from(this.sessionsByDir.keys(), async (dirName) => {
-        const list = await (await fetch(`/api/sessions/${encodeURIComponent(dirName)}`)).json();
-        return [dirName, list.sessions || []] as const;
-      }));
-      this.projects = data.projects || [];
-      for (const [dirName, sessions] of lists) this.sessionsByDir.set(dirName, sessions);
+      const res = await fetch('/api/sessions');
+      if (!res.ok) throw new Error('Could not load projects');
+      const data = await res.json();
+      if (generation !== this.generation) return;
+      if (!Array.isArray(data.projects)) throw new Error('Invalid project list');
+      this.projects = data.projects;
+      const dirs = new Set(this.projects.map(project => project.dirName));
+      for (const dir of this.sessionsByDir.keys()) {
+        if (reload || !dirs.has(dir)) this.sessionsByDir.delete(dir);
+      }
+      for (const set of [this.expanded, this.expandedProjects]) {
+        for (const dir of set) if (!dirs.has(dir)) set.delete(dir);
+      }
+      for (const dir of this.sessionErrors.keys()) {
+        if (!dirs.has(dir)) this.sessionErrors.delete(dir);
+      }
+      this.projectsLoading = false;
+      const favourites = this.favouriteProjectDirs();
+      const needed = this.projects.filter(project => this.searchQuery || this.expanded.has(project.dirName)
+        || favourites.has(project.dirName) || (!reload && this.sessionsByDir.has(project.dirName)));
       this.render();
+      if (generation !== this.generation) return;
+      await Promise.all(needed.map(project => this.loadSessions(project.dirName, !reload)));
     } catch {
-      /* Tau went away; the reconnect refreshes again. */
+      if (generation !== this.generation) return;
+      this.projectsLoading = false;
+      this.projectsError = 'Could not load projects.';
+      this.render();
     }
   }
 
-  async loadSessions(dirName: string) {
-    if (this.sessionsByDir.has(dirName) || this.loading.has(dirName)) return;
+  /** A forced refresh supersedes this project's pending request without dropping usable rows. */
+  async loadSessions(dirName: string, refresh = false) {
+    if (this.projectsLoading || !this.projects.some(project => project.dirName === dirName)) return;
+    if (!refresh && (this.loading.has(dirName) || (this.sessionsByDir.has(dirName) && !this.sessionErrors.has(dirName)))) return;
+    const generation = this.generation;
+    const request = ++this.nextSessionRequest;
+    this.sessionRequests.set(dirName, request);
+    const isCurrent = () => generation === this.generation && this.sessionRequests.get(dirName) === request
+      && this.projects.some(project => project.dirName === dirName);
     this.loading.add(dirName);
+    this.sessionErrors.delete(dirName);
+    this.render();
     try {
       const res = await fetch(`/api/sessions/${encodeURIComponent(dirName)}`);
+      if (!res.ok) throw new Error('Could not load sessions');
       const data = await res.json();
-      this.sessionsByDir.set(dirName, data.sessions || []);
-    } catch (error) {
-      console.error(`[Sidebar] Failed to load sessions for ${dirName}:`, error);
+      if (!isCurrent()) return;
+      if (!Array.isArray(data.sessions)) throw new Error('Invalid session list');
+      this.sessionsByDir.set(dirName, data.sessions);
+    } catch {
+      if (isCurrent()) this.sessionErrors.set(dirName, 'Could not load sessions.');
     } finally {
-      this.loading.delete(dirName);
-      this.render();
+      if (isCurrent()) {
+        this.sessionRequests.delete(dirName);
+        this.loading.delete(dirName);
+        this.render();
+      }
     }
   }
 
-  /** Favourites are shown up front, so their projects are the one thing loaded eagerly. */
+  private cancelSessionLoad(dirName: string) {
+    this.sessionRequests.delete(dirName);
+    this.loading.delete(dirName);
+  }
+
+  /** A completed mutation must not be undone by an older list response. */
+  private invalidateSessionList(filePath: string) {
+    const dir = filePath.split('/').at(-2);
+    if (!dir || !this.loading.has(dir)) return;
+    this.cancelSessionLoad(dir);
+    if (this.sessionsByDir.has(dir)) this.render();
+    else void this.loadSessions(dir);
+  }
+
+  private favouriteProjectDirs() {
+    return new Set(this.favourites.map(filePath => filePath.split('/').at(-2)));
+  }
+
+  /** Only favourites belonging to current projects can cause eager list requests. */
   async loadFavouriteProjects() {
-    const dirs = new Set(this.favourites.map(filePath => filePath.split('/').slice(-2)[0]));
-    await Promise.all(Array.from(dirs).map(dir => this.loadSessions(dir)));
+    const dirs = this.favouriteProjectDirs();
+    await Promise.all(this.projects.filter(project => dirs.has(project.dirName)).map(project => this.loadSessions(project.dirName)));
   }
 
   favouriteSessions() {
@@ -344,7 +402,8 @@ export class SessionSidebar {
         item.classList.toggle('hidden', !matches);
         if (matches) hasVisible = true;
       });
-      group.style.display = hasVisible ? '' : 'none';
+      // Failed or pending title loads must remain visible so search can be retried.
+      group.style.display = hasVisible || group.querySelector('.session-loading') ? '' : 'none';
     });
   }
 
@@ -409,6 +468,7 @@ export class SessionSidebar {
       title.textContent = name;
       title.setAttribute('title', name);
     });
+    this.invalidateSessionList(filePath);
     this.applySearch();
     this.scheduleMessageSearch();
   }
@@ -536,6 +596,7 @@ export class SessionSidebar {
         this.clearActive();
         this.onSessionSelect(null);
       }
+      this.invalidateSessionList(session.filePath);
       this.render();
     } catch (e) {
       console.error('[Sidebar] Delete failed:', e);
@@ -625,12 +686,7 @@ export class SessionSidebar {
     if (isExpanded) {
       const sessionsDiv = document.createElement('div');
       sessionsDiv.className = 'project-sessions';
-      const sessions = this.sessionsByDir.get(project.dirName);
-      if (!sessions) {
-        sessionsDiv.innerHTML = '<div class="session-loading">Loading sessions…</div>';
-      } else {
-        this.fillProjectSessions(sessionsDiv, project);
-      }
+      this.fillProjectSessions(sessionsDiv, project);
       group.appendChild(sessionsDiv);
     }
 
@@ -638,23 +694,42 @@ export class SessionSidebar {
   }
 
   toggleProject(project: SidebarProject) {
+    if (!this.projects.some(current => current.dirName === project.dirName)) return;
     if (this.expanded.has(project.dirName)) {
       this.expanded.delete(project.dirName);
+      if (!this.searchQuery && !this.favouriteProjectDirs().has(project.dirName)) this.cancelSessionLoad(project.dirName);
       this.render();
       return;
     }
     this.expanded.add(project.dirName);
     this.render();
-    this.loadSessions(project.dirName);
+    void this.loadSessions(project.dirName);
+  }
+
+  private buildRetryState(message: string, retry: () => void) {
+    const status = document.createElement('div');
+    status.className = 'session-loading';
+    status.setAttribute('role', 'status');
+    status.append(document.createTextNode(`${message} `));
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'session-retry-btn';
+    button.textContent = 'Retry';
+    button.addEventListener('click', event => { event.stopPropagation(); retry(); });
+    status.appendChild(button);
+    return status;
   }
 
   render() {
+    this.container.innerHTML = '';
+    if (this.projectsError) {
+      this.container.appendChild(this.buildRetryState(this.projectsError, () => void this.loadProjects()));
+    }
     if (this.projects.length === 0) {
-      this.container.innerHTML = '<div class="session-loading">No sessions found</div>';
+      if (!this.projectsError) this.container.innerHTML = '<div class="session-loading">No sessions found</div>';
+      this.onRendered?.();
       return;
     }
-
-    this.container.innerHTML = '';
 
     const favSessions = this.favouriteSessions();
     if (favSessions.length > 0) {
@@ -690,21 +765,33 @@ export class SessionSidebar {
     sessionsDiv.innerHTML = '';
     const { visible, limited } = this.visibleSessions(project);
     for (const session of visible) sessionsDiv.appendChild(this.buildSessionItem(session, project));
-    if (!limited || this.searchQuery) return;
-
-    const expanded = this.expandedProjects.has(project.dirName);
-    const total = (this.sessionsByDir.get(project.dirName) || []).length;
-    const toggle = document.createElement('button');
-    toggle.type = 'button';
-    toggle.className = `project-more-btn${expanded ? ' expanded' : ''}`;
-    toggle.innerHTML = `<span class="chevron">▼</span><span>${expanded ? 'Show fewer' : `Show all ${total}`}</span>`;
-    toggle.addEventListener('click', () => {
-      if (expanded) this.expandedProjects.delete(project.dirName);
-      else this.expandedProjects.add(project.dirName);
-      this.fillProjectSessions(sessionsDiv, project);
-      this.onRendered?.();
-    });
-    sessionsDiv.appendChild(toggle);
+    const sessions = this.sessionsByDir.get(project.dirName);
+    if (limited && !this.searchQuery) {
+      const expanded = this.expandedProjects.has(project.dirName);
+      const toggle = document.createElement('button');
+      toggle.type = 'button';
+      toggle.className = `project-more-btn${expanded ? ' expanded' : ''}`;
+      toggle.innerHTML = `<span class="chevron">▼</span><span>${expanded ? 'Show fewer' : `Show all ${sessions?.length || 0}`}</span>`;
+      toggle.addEventListener('click', () => {
+        if (!this.projects.some(current => current.dirName === project.dirName)) return;
+        if (expanded) this.expandedProjects.delete(project.dirName);
+        else this.expandedProjects.add(project.dirName);
+        this.fillProjectSessions(sessionsDiv, project);
+        this.onRendered?.();
+      });
+      sessionsDiv.appendChild(toggle);
+    }
+    const error = this.sessionErrors.get(project.dirName);
+    if (error) {
+      sessionsDiv.appendChild(this.buildRetryState(error, () => void this.loadSessions(project.dirName, true)));
+    } else if (this.loading.has(project.dirName) || (!sessions && this.projectsLoading)) {
+      const status = document.createElement('div');
+      status.className = 'session-loading';
+      status.textContent = sessions ? 'Updating sessions…' : 'Loading sessions…';
+      sessionsDiv.appendChild(status);
+    } else if (!sessions) {
+      sessionsDiv.appendChild(this.buildRetryState('Sessions not loaded.', () => void this.loadSessions(project.dirName)));
+    }
   }
 
   formatTime(isoTimestamp?: string) {
