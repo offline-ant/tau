@@ -17,11 +17,7 @@ setupHistoryE2E();
 
 // Text of an assistant message that sits outside its thinking block.
 async function textOutsideThinking(message: ReturnType<Page['locator']>) {
-  return message.locator('.message-content').evaluate((el) => {
-    const copy = el.cloneNode(true) as HTMLElement;
-    copy.querySelectorAll('.thinking-block').forEach((block) => block.remove());
-    return copy.textContent?.trim() || '';
-  });
+  return (await message.locator('.assistant-block-item[data-label="text"] .assistant-step-content').allTextContents()).join('').trim();
 }
 
 type AssistantContent = Extract<Extract<JsonAgentSessionEvent, { type: 'message_end' }>['message'], { role: 'assistant' }>['content'];
@@ -49,6 +45,8 @@ for (const { label, textBefore, textAfter, body } of THINKING_CASES) {
     const text = (delta: string) => broadcast({ type: 'message_update', usage: assistant.usage,
       assistantMessageEvent: { type: 'text_delta', contentIndex: content.length, delta } });
 
+    broadcast({ type: 'agent_start' });
+    broadcast({ type: 'message_start', message: { role: 'user', content: 'start a new reasoning turn', timestamp: Date.now() } });
     broadcast({ type: 'message_start', message: assistant });
     if (textBefore) {
       text(textBefore);
@@ -61,7 +59,7 @@ for (const { label, textBefore, textAfter, body } of THINKING_CASES) {
     content.push({ type: 'thinking', thinking });
     const message = page.locator('#messages > .message.assistant').last();
     await page.waitForFunction((expected: string) =>
-      document.querySelector('.streaming-thinking .thinking-content')?.textContent === expected, thinking);
+      document.querySelector('.assistant-step-content.thinking-block.streaming .thinking-content')?.textContent === expected, thinking);
     assert.equal(await textOutsideThinking(message), textBefore || '', 'thinking leaked into the main text while streaming');
 
     if (textAfter) {
@@ -71,7 +69,7 @@ for (const { label, textBefore, textAfter, body } of THINKING_CASES) {
       content.push({ type: 'toolCall', id: 'thinking-only-call', name: 'bash', arguments: { command: 'ls' } });
     }
     broadcast({ type: 'message_end', message: { ...assistant, content, stopReason: textAfter ? 'stop' : 'toolUse' } });
-    await page.waitForFunction(() => document.querySelectorAll('.message-content.streaming').length === 0);
+    await page.waitForFunction(() => document.querySelectorAll('.assistant-step-content.streaming').length === 0);
 
     assert.equal(await message.locator('.thinking-block').count(), 1);
     assert.equal(await message.locator('.thinking-block .thinking-content').textContent(), thinking);

@@ -1,24 +1,13 @@
+import { runtimeEnvironment, projects, installFakeRuntime, closeFakeRuntime, launchBrowser, listenFakeServer, liveManager } from './fake-browser-runtime.ts';
 import { test, before, after } from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
-import { EventEmitter } from 'node:events';
-import { PassThrough } from 'node:stream';
-import { chromium } from 'playwright';
 import type { Browser, Page } from 'playwright';
 
-// The real browser and Tau server, with session files written to disk and Pi
-// replaced at its stdio boundary. The "big" project has more than 10 sessions.
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-sidebar-e2e-'));
-const projects = path.join(tmp, 'projects');
-const sessionsDir = path.join(tmp, 'sessions');
-process.env.TAU_HOST = '127.0.0.1';
-process.env.PI_CODING_AGENT_DIR = tmp;
-process.env.PI_CODING_AGENT_SESSION_DIR = sessionsDir;
-process.env.TAU_PROJECTS_DIR = projects;
-const { server, computeUrls, liveManager, _setSpawnPiForTest, _setExecFileForTest } = (await import('../../bin/tau.js')) as any;
+// Real HTTP, browser and protocol-2 sockets, with synthetic session history.
+const sessionsDir = runtimeEnvironment.sessions;
 
 const BIG = path.join(projects, 'big');
 const SMALL = path.join(projects, 'small');
@@ -40,38 +29,14 @@ function writeSession(projectPath: string, name: string, title: string, ageSecon
     { type: 'message', message: { role: 'assistant', content: 'reply' } },
     { type: 'message', message: { role: 'user', content: 'follow up' } },
   ];
-  fs.writeFileSync(file, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+  fs.writeFileSync(file, lines.map((entry, index) => JSON.stringify(index === 0 ? entry : { ...entry, id: `entry-${index}`, parentId: index === 1 ? null : `entry-${index - 1}` })).join('\n') + '\n');
   const when = new Date(Date.now() - ageSeconds * 1000);
   fs.utimesSync(file, when, when);
   return file;
 }
 
 before(async () => {
-  _setSpawnPiForTest((_command: string, args: string[]) => {
-    const child: any = new EventEmitter();
-    child.stdin = new PassThrough();
-    child.stdout = new PassThrough();
-    child.stderr = new PassThrough();
-    child.pid = 12345;
-    child.kill = () => { queueMicrotask(() => child.emit('exit', 0)); };
-    const sessionIndex = args.indexOf('--session');
-    const sessionFile = sessionIndex >= 0 ? args[sessionIndex + 1] : null;
-    let buffer = '';
-    child.stdin.on('data', (chunk: Buffer) => {
-      buffer += chunk.toString();
-      while (buffer.includes('\n')) {
-        const end = buffer.indexOf('\n');
-        const command = JSON.parse(buffer.slice(0, end));
-        buffer = buffer.slice(end + 1);
-        child.stdout.write(JSON.stringify({
-          type: 'response', id: command.id, command: command.type, success: true,
-          data: command.type === 'get_state' ? { sessionFile, isStreaming: false } : {},
-        }) + '\n');
-      }
-    });
-    return child;
-  });
-  _setExecFileForTest((_file: string, _args: string[], _opts: object, cb: (err: Error | null, stdout: string, stderr: string) => void) => cb(null, '', ''));
+  installFakeRuntime();
   fs.mkdirSync(BIG, { recursive: true });
   fs.mkdirSync(SMALL, { recursive: true });
   fs.mkdirSync(TRASH, { recursive: true });
@@ -79,14 +44,9 @@ before(async () => {
   for (let i = 0; i < BIG_COUNT; i++) writeSession(BIG, `big-${i}`, `big session ${i}`, 60 + i);
   for (let i = 0; i < TRASH_COUNT; i++) writeSession(TRASH, `trash-${i}`, `trash session ${i}`, 600 + i);
   for (let i = 0; i < 2; i++) writeSession(SMALL, `small-${i}`, `small session ${i}`, 10 + i);
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => {
-    const port = server.address().port;
-    computeUrls(port);
-    base = `http://127.0.0.1:${port}`;
-    resolve();
-  }));
+  base = await listenFakeServer();
   try {
-    browser = await chromium.launch();
+    browser = await launchBrowser();
   } catch (e) {
     browserUnavailable = `Playwright browser unavailable (${(e as Error).message.split('\n')[0]}). Run via: npm run test:e2e`;
   }
@@ -94,11 +54,7 @@ before(async () => {
 
 after(async () => {
   if (browser) await browser.close();
-  await liveManager.shutdown();
-  _setSpawnPiForTest(null);
-  _setExecFileForTest(null);
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-  fs.rmSync(tmp, { recursive: true, force: true });
+  await closeFakeRuntime();
 });
 
 async function openSidebar(t: TestContext): Promise<Page | null> {
@@ -111,7 +67,11 @@ async function openSidebar(t: TestContext): Promise<Page | null> {
   page.on('pageerror', (error: Error) => errors.push(error.message));
   t.after(() => assert.deepEqual(errors, [], 'browser must not throw'));
   await page.goto(base);
-  await page.waitForSelector('.project-group .session-item');
+  await page.waitForSelector('.project-group .project-header');
+  for (const name of ['big', 'small', 'trash']) {
+    await group(page, name).locator('.project-header').click();
+    await group(page, name).locator('.session-item').first().waitFor();
+  }
   return page;
 }
 
@@ -122,7 +82,7 @@ test('a project with more than 10 sessions shows the 10 newest, and a project wi
   const page = await openSidebar(t);
   if (!page) return;
   const shown = await titles(page, 'big');
-  assert.deepEqual(shown, Array.from({ length: 10 }, (_, i) => `big session ${i}`));
+  assert.deepEqual(shown, Array.from({ length: 10 }, (_, i) => `Big session ${i}`));
   // The badge counts every session, not only the ones shown.
   assert.equal(await group(page, 'big').locator('.project-count').textContent(), String(BIG_COUNT));
   assert.equal(await group(page, 'big').locator('.project-more-btn span:last-child').textContent(), `Show all ${BIG_COUNT}`);
@@ -163,10 +123,14 @@ test('live-tab selection, reload, and closing tabs keep the open session listed'
   await oldest.click();
   await activeTitle.filter({ hasText: 'big session 12' }).waitFor();
   assert.deepEqual(await titles(page, 'big'), [
-    ...Array.from({ length: 10 }, (_, i) => `big session ${i}`), 'big session 12',
+    ...Array.from({ length: 10 }, (_, i) => `Big session ${i}`), 'Big session 12',
   ]);
 
   await page.reload();
+  await group(page, 'big').locator('.project-header').waitFor();
+  if (await group(page, 'big').locator('.project-header').evaluate(element => element.classList.contains('collapsed'))) {
+    await group(page, 'big').locator('.project-header').click();
+  }
   await activeTitle.filter({ hasText: 'big session 12' }).waitFor();
   assert.equal((await titles(page, 'big')).length, 11);
 
@@ -189,7 +153,7 @@ test('searching finds sessions beyond the 10 shown, and clearing the search limi
   if (!page) return;
   await page.fill('#session-search-input', 'big session 12');
   const visible = group(page, 'big').locator('.session-item:not(.hidden) .session-title');
-  assert.deepEqual(await visible.allTextContents(), ['big session 12']);
+  assert.deepEqual(await visible.allTextContents(), ['Big session 12']);
 
   await page.fill('#session-search-input', '');
   assert.equal((await titles(page, 'big')).length, 10);
@@ -236,9 +200,9 @@ test('deleting a session in a limited project brings in the next older one', asy
   assert.equal((await titles(page, 'trash')).length, 10);
   await group(page, 'trash').locator('.session-item').first().click({ button: 'right' });
   await page.click('.context-menu-item:has-text("Delete")');
-  await page.waitForFunction(() => !document.body.textContent?.includes('trash session 0'));
+  await page.waitForFunction(() => !document.body.textContent?.includes('Trash session 0'));
   const shown = await titles(page, 'trash');
-  assert.deepEqual(shown, Array.from({ length: 10 }, (_, i) => `trash session ${i + 1}`));
+  assert.deepEqual(shown, Array.from({ length: 10 }, (_, i) => `Trash session ${i + 1}`));
   // Ten sessions are left, so the toggle is gone.
   assert.equal(await group(page, 'trash').locator('.project-more-btn').count(), 0);
 });
