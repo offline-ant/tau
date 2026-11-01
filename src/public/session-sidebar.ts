@@ -372,8 +372,8 @@ export class SessionSidebar {
   applySearch() {
     if (!this.searchQuery) {
       this.container.querySelectorAll('.session-item').forEach(el => el.classList.remove('hidden'));
-      this.container.querySelectorAll('.project-group').forEach(el => el.style.display = '');
-      const favSection = this.container.querySelector('.favourites-group');
+      this.container.querySelectorAll<HTMLElement>('.project-group').forEach(el => el.style.display = '');
+      const favSection = this.container.querySelector<HTMLElement>('.favourites-group');
       if (favSection) favSection.style.display = '';
       // Remove full-text results
       const searchGroup = this.container.querySelector('.search-results-group');
@@ -382,7 +382,7 @@ export class SessionSidebar {
     }
 
     // Search favourites section
-    const favSection = this.container.querySelector('.favourites-group');
+    const favSection = this.container.querySelector<HTMLElement>('.favourites-group');
     if (favSection) {
       let hasVisible = false;
       favSection.querySelectorAll('.session-item').forEach(item => {
@@ -394,7 +394,7 @@ export class SessionSidebar {
       favSection.style.display = hasVisible ? '' : 'none';
     }
 
-    this.container.querySelectorAll('.project-group').forEach(group => {
+    this.container.querySelectorAll<HTMLElement>('.project-group').forEach(group => {
       let hasVisible = false;
       group.querySelectorAll('.session-item').forEach(item => {
         const title = (item.querySelector('.session-title')?.textContent || '').toLowerCase();
@@ -431,7 +431,7 @@ export class SessionSidebar {
       this.render();
       return;
     }
-    this.container.querySelectorAll('.session-item').forEach(el => {
+    this.container.querySelectorAll<HTMLElement>('.session-item').forEach(el => {
       el.classList.toggle('active', el.dataset.filePath === filePath);
     });
   }
@@ -461,7 +461,7 @@ export class SessionSidebar {
         if (session.filePath === filePath) session.name = name;
       }
     }
-    this.container.querySelectorAll('.session-item').forEach(el => {
+    this.container.querySelectorAll<HTMLElement>('.session-item').forEach(el => {
       if (el.dataset.filePath !== filePath) return;
       const title = el.querySelector('.session-title');
       if (!title) return;
@@ -586,7 +586,8 @@ export class SessionSidebar {
       this._searchResults = this._searchResults?.filter(result => result.filePath !== session.filePath) ?? null;
       const sessions = this.sessionsByDir.get(project.dirName);
       if (sessions) this.sessionsByDir.set(project.dirName, sessions.filter(s => s.filePath !== session.filePath));
-      project.count = Math.max(0, project.count - 1);
+      const currentProject = this.projects.find(current => current.dirName === project.dirName);
+      if (currentProject) currentProject.count = Math.max(0, currentProject.count - 1);
       const favIdx = this.favourites.indexOf(session.filePath);
       if (favIdx >= 0) {
         this.favourites.splice(favIdx, 1);

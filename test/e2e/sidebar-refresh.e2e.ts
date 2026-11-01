@@ -47,14 +47,14 @@ async function fixture(t: TestContext) {
     const { SessionSidebar } = await import(moduleUrl) as typeof SidebarModule;
     const queue: Request[] = [], waiters: Array<(request: Request) => void> = [];
     const urls: string[] = [], loads: Promise<void>[] = [], selected: Array<SidebarModule.SidebarSession | null> = [];
-    const response = (data: unknown, status = 200) => ({ ok: status < 400, json: async () => data }) as Response;
+    const response = (data: unknown, status = 200) => Response.json(data, { status });
     window.fetch = input => new Promise<Response>((resolve, reject) => {
       const url = String(input);
       urls.push(url);
       const request: Request = {
         url, reply: (data, status) => resolve(response(data, status)),
         fail: () => reject(new Error('Synthetic network failure')),
-        badJson: () => resolve({ ok: true, json: async () => { throw new Error('Synthetic invalid JSON'); } } as Response),
+        badJson: () => resolve(new Response('Synthetic invalid JSON')),
       };
       const waiter = waiters.shift();
       if (waiter) waiter(request); else queue.push(request);
@@ -312,3 +312,48 @@ test('older pending lists cannot undo session names or successful deletion', { t
   assert.equal(result.name, 'Renamed'); assert.equal(result.rows, 11); assert.equal(result.deleted, true);
   assert.equal(result.active, null); assert.deepEqual(result.favourites, []); assert.deepEqual(result.selected, [null]); assert.deepEqual(result.loading, []);
 });
+
+for (const scenario of ['replacement', 'zero', 'removal'] as const) {
+  test(`deletion after summary ${scenario} updates only current metadata and cannot resurrect stale lists`, { timeout: 15000 }, async t => {
+    const page = await fixture(t);
+    const result = await page.evaluate(async scenario => {
+      const h = window.sidebarTest, s = h.sidebar;
+      s.expanded.add('a'); s.expandedProjects.add('a'); s.favourites = ['/sessions/a/0.jsonl'];
+      const initial = s.loadProjects();
+      (await h.next('/api/sessions')).reply({ projects: [{ ...h.project('a'), count: 1 }] });
+      (await h.next('/api/sessions/a')).reply({ sessions: h.sessions('a', 'Original') }); await initial;
+      s.setActive('/sessions/a/0.jsonl');
+      const captured = s.projects[0];
+      const old = s.loadSessions('a', true), oldList = await h.next('/api/sessions/a');
+      const deletion = s.deleteSession(s.sessionsByDir.get('a')![0], captured);
+      const post = await h.next('/api/sessions/delete');
+      const refresh = s.refresh();
+      const replacement = scenario === 'removal' ? { ...h.project('b'), count: 7 }
+        : { ...h.project('a'), count: scenario === 'zero' ? 0 : 5 };
+      (await h.next('/api/sessions')).reply({ projects: [replacement] });
+      let refreshedList: Request | undefined;
+      if (scenario === 'removal') await refresh;
+      else refreshedList = await h.next('/api/sessions/a');
+      post.reply({}); await deletion;
+      const afterDelete = s.projects.map(project => [project.dirName, project.count]);
+      const renders = h.renders;
+      oldList.reply({ sessions: h.sessions('a', 'Stale before refresh') });
+      refreshedList?.reply({ sessions: h.sessions('a', 'Stale before delete') });
+      await Promise.all([old, refresh]);
+      return {
+        afterDelete, finalCounts: s.projects.map(project => [project.dirName, project.count]), capturedCount: captured.count,
+        cache: [...s.sessionsByDir.keys()], deleted: !s.sessionsByDir.get('a')?.some(session => session.filePath === '/sessions/a/0.jsonl'),
+        countLabel: s.container.querySelector('.project-count')?.textContent, noLateRender: renders === h.renders,
+        loading: [...s.loading], active: s.activeSessionFile, favourites: s.favourites, selected: h.selected,
+      };
+    }, scenario);
+    const expected = scenario === 'removal' ? [['b', 7]] : [['a', scenario === 'zero' ? 0 : 4]];
+    assert.deepEqual(result.afterDelete, expected); assert.deepEqual(result.finalCounts, expected);
+    assert.equal(result.capturedCount, 1);
+    assert.deepEqual(result.cache, scenario === 'removal' ? [] : ['a']);
+    assert.equal(result.countLabel, String(expected[0][1]));
+    assert.equal(result.deleted, true); assert.equal(result.noLateRender, true);
+    assert.deepEqual(result.loading, []); assert.equal(result.active, null);
+    assert.deepEqual(result.favourites, []); assert.deepEqual(result.selected, [null]);
+  });
+}
