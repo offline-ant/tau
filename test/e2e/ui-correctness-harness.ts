@@ -90,26 +90,35 @@ export async function openUI(browser: Browser, initial = [session('a'), session(
         return response;
       } catch (error) { finished(); throw error; }
     };
+    let instancePoll: (() => void) | undefined;
     let nextInterval = 100000;
     const originalInterval = window.setInterval.bind(window), originalClear = window.clearInterval.bind(window);
     window.setInterval = ((fn: () => void, ms: number) => {
       if (ms !== 3000 && ms !== 10000) return originalInterval(fn, ms);
       const id = nextInterval++;
       if (ms === 3000) intervals.set(id, fn);
+      else instancePoll = fn;
       return id;
     }) as typeof window.setInterval;
     window.clearInterval = (id) => { if (typeof id === 'number') intervals.delete(id); originalClear(id); };
     window.confirm = text => { confirmations.push(text || ''); return true; };
     let socket: Socket;
+    let initialConnection = true;
     class Socket {
       static OPEN = 1; static CONNECTING = 0; static CLOSING = 2; static CLOSED = 3;
       readyState = 0;
       onopen: ((event: Event) => void) | null = null;
       onmessage: ((event: { data: string }) => void) | null = null;
+      onclose: ((event: CloseEvent) => void) | null = null;
       constructor() {
         socket = this;
-        setTimeout(() => { this.readyState = 1; this.onopen?.(new Event('open'));
-          this.onmessage?.({ data: JSON.stringify({ type: 'state', liveSessions: sessions, agents: [] }) }); }, 0);
+        // Only the first connection opens automatically. Tests control every
+        // restart boundary, independently of the client's reconnect backoff.
+        if (initialConnection) {
+          initialConnection = false;
+          setTimeout(() => { this.readyState = 1; this.onopen?.(new Event('open'));
+            this.onmessage?.({ data: JSON.stringify({ type: 'state', liveSessions: sessions, agents: [] }) }); }, 0);
+        }
       }
       send(text: string) { sent.push(JSON.parse(text)); }
       close() { this.readyState = 3; }
@@ -117,6 +126,10 @@ export async function openUI(browser: Browser, initial = [session('a'), session(
     Object.defineProperty(window, 'WebSocket', { value: Socket });
     Object.assign(window, { fixtureCompletedReads: completedReads, fixtureSent: sent, fixtureConfirmations: confirmations,
       fixtureEmit: (message: unknown) => socket.onmessage?.({ data: JSON.stringify(message) }),
+      fixtureDisconnect: () => { socket.readyState = Socket.CLOSED; socket.onclose?.(new CloseEvent('close', { code: 1006 })); },
+      fixtureReconnect: (message: unknown) => { socket.readyState = Socket.OPEN; socket.onopen?.(new Event('open'));
+        socket.onmessage?.({ data: JSON.stringify(message) }); },
+      fixturePollInstances: () => { void instancePoll?.(); },
       fixturePoll: () => { for (const fn of intervals.values()) fn(); }, fixturePollCount: () => intervals.size });
   }, initial);
   await page.goto('https://tau.invalid/');
@@ -132,6 +145,11 @@ export async function openUI(browser: Browser, initial = [session('a'), session(
         reject() { entry.reply.resolve({ abort: true }); return entry.done.promise; } };
     },
     async emit(message: unknown) { await page.evaluate(value => Reflect.get(window, 'fixtureEmit')(value), message); },
+    async disconnect() { await page.evaluate(() => Reflect.get(window, 'fixtureDisconnect')()); },
+    async reconnect(sessions: LiveSession[] = [], agents: unknown[] = []) {
+      await page.evaluate(value => Reflect.get(window, 'fixtureReconnect')(value), { type: 'state', liveSessions: sessions, agents });
+    },
+    async pollInstances() { await page.evaluate(() => Reflect.get(window, 'fixturePollInstances')()); },
     async stored(name: string) {
       if (!await page.locator('.project-group .session-item').count()) await page.locator('.project-group .project-header').click();
       await page.locator('.project-group .session-item', { has: page.locator('.session-title', { hasText: new RegExp(`^${name}$`) }) }).click();

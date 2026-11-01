@@ -96,3 +96,36 @@ test('native registry reconciliation follows the same focus ownership rule', asy
     assert.equal((await focused(view)).id, 'message-input');
   } finally { await view.close(); }
 });
+
+for (const method of ['input', 'editor'] as const) {
+  test(`a delayed ${method} focus callback cannot steal a newer composer keystroke`, async () => {
+    const view = await openUI(browser);
+    try {
+      await view.page.evaluate(() => {
+        const original = window.setTimeout.bind(window);
+        const callbacks: Array<() => void> = [];
+        window.setTimeout = ((handler: TimerHandler, delay?: number, ...args: unknown[]) => {
+          if (delay === 100 && typeof handler === 'function') {
+            callbacks.push(() => handler(...args));
+            return 200000 + callbacks.length;
+          }
+          return original(handler, delay, ...args);
+        }) as typeof window.setTimeout;
+        Object.assign(window, { fixtureRunFocusCallbacks() {
+          window.setTimeout = original;
+          for (const callback of callbacks.splice(0)) callback();
+        } });
+      });
+      await view.emit(event({ ...request('input-dialog'), method }));
+      // Run any deferred focus at the exact point after the human has chosen
+      // the composer and before their Enter key, rather than waiting on a clock.
+      await view.page.locator('#message-input').fill('keep this instruction queued');
+      await view.page.evaluate(() => Reflect.get(window, 'fixtureRunFocusCallbacks')());
+      assert.equal((await focused(view)).id, 'message-input');
+      await view.page.keyboard.press('Enter');
+      await view.page.locator('#queued-messages .queued-msg', { hasText: 'keep this instruction queued' }).waitFor();
+      assert.equal(view.requests.filter(item => item.body?.type === 'extension_ui_response').length, 0);
+      assert.deepEqual(await view.page.evaluate(() => Reflect.get(window, 'fixtureSent')), []);
+    } finally { await view.close(); }
+  });
+}

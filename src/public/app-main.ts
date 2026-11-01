@@ -204,7 +204,7 @@ const launcherPanel = setupLauncherPanel({
       });
       const data = await res.json();
       if (data.session) {
-        rememberOpenedSession(data.session, selection);
+        rememberOpenedSession(data.session);
         if (selection === viewSelection) await selectLiveSession(data.session.id, true, selection);
       }
     } catch (e) {
@@ -233,6 +233,9 @@ let viewingActiveSession = false; // Whether we're viewing a live backend Tau ta
 let hasReceivedInitialServerState = false;
 let liveInstances: LiveInstance[] = []; // Sidebar live indicators derived from backend live sessions
 let liveSessions: LiveSession[] = [];
+// HTTP lists cannot replace a tab list changed by socket events or another read.
+let liveSessionsRevision = 0;
+let connectionRevision = 0;
 let activeLiveSessionId = localStorage.getItem('tau-active-live-session-id') || null;
 let voiceInput: VoiceInput | null = null;
 let takeRequest: { id: string; sessionId: string } | null = null;
@@ -430,6 +433,7 @@ function showNewMessageBadge() {
 // ═══════════════════════════════════════
 
 wsClient.addEventListener('connected', () => {
+  ++connectionRevision;
   updateConnectionStatus('connected');
   // Fetch model context window size for token % display
   setTimeout(fetchContextWindow, 1000);
@@ -440,6 +444,11 @@ wsClient.addEventListener('connected', () => {
 });
 
 wsClient.addEventListener('disconnected', () => {
+  ++connectionRevision;
+  // HTTP polling or an old tab's 404 can arrive before the replacement
+  // server's first state. Remember the runtime while its tab still exists.
+  const selected = viewingActiveSession ? liveSessions.find(session => session.id === activeLiveSessionId) : null;
+  if (selected?.attached) reattachMuxId ??= selected.attached.muxId;
   updateConnectionStatus('disconnected');
   // Their acknowledgements went to this socket and can never arrive.
   unsentInput.keepInFlight();
@@ -566,8 +575,7 @@ wsClient.addEventListener('stateUpdate', (e: Event) => {
   // A restarted Tau has no tabs: the shared agents behind them may well run on.
   const remaining = new Set((detail.liveSessions || []).map(session => session.id));
   for (const session of liveSessions.filter(item => !remaining.has(item.id))) {
-    if (session.id === activeLiveSessionId && session.attached) reattachMuxId ??= session.attached.muxId;
-    keepUnsentInput(session);
+    if (viewingActiveSession && session.id === activeLiveSessionId && session.attached) reattachMuxId ??= session.attached.muxId;
   }
   setLiveSessions(detail.liveSessions || []);
   agentsPanel.update(detail.agents || []);
@@ -599,8 +607,15 @@ wsClient.addEventListener('stateUpdate', (e: Event) => {
   if (!firstState && reattachMuxId) {
     const muxId = reattachMuxId;
     reattachMuxId = null;
-    if (detail.agents?.some(agent => agent.muxId === muxId)) void agentsPanel.open(muxId);
-    else agentsPanel.show();
+    if (!liveSessions.some(session => session.id === activeLiveSessionId && session.attached?.muxId === muxId)) {
+      // The overview can lag behind the runtime we already know.
+      const selection = beginViewSelection(false);
+      void attachSharedAgent(muxId, selection).then(opened => {
+        if (selection !== viewSelection) return;
+        if (opened) { agentsPanel.hide(); focusComposer(); }
+        else agentsPanel.show();
+      });
+    }
   }
 });
 
@@ -638,8 +653,7 @@ wsClient.addEventListener('liveSessionClosed', (e: Event) => {
   const detail = (e as CustomEvent<{ sessionId: string; reason?: string; message?: string; notice?: boolean }>).detail;
   const session = liveSessions.find(s => s.id === detail.sessionId);
   if (session) {
-    if (detail.reason === 'server_shutdown' && session.id === activeLiveSessionId) reattachMuxId ??= session.attached?.muxId || null;
-    keepUnsentInput(session);
+    if (detail.reason === 'server_shutdown' && viewingActiveSession && session.id === activeLiveSessionId) reattachMuxId ??= session.attached?.muxId || null;
   }
   handleLiveSessionClosed(detail.sessionId, detail.message, detail.notice);
   scheduleSidebarRefresh();
@@ -772,6 +786,9 @@ const newLiveSessionProjects = document.getElementById('new-live-session-project
 const newLiveSessionSubmit = document.getElementById('new-live-session-submit')!;
 
 function setLiveSessions(sessions: LiveSession[]) {
+  ++liveSessionsRevision;
+  const remaining = new Set(sessions.map(session => session.id));
+  for (const removed of liveSessions.filter(session => !remaining.has(session.id))) keepUnsentInput(removed);
   for (const session of sessions) observeInputContext(session);
   liveSessions = sessions || [];
   liveInstances = liveSessions.map(s => ({ sessionFile: s.sessionFile, cwd: s.cwd, port: location.port }));
@@ -790,6 +807,9 @@ function clearActiveSessionHeader() {
 
 function handleLiveSessionClosed(closedId: string, message?: string, notice = false) {
   if (!closedId) return;
+  const session = liveSessions.find(session => session.id === closedId);
+  if (session) keepUnsentInput(session);
+  ++liveSessionsRevision;
   appliedGenerations.delete(closedId);
   contextGenerations.delete(closedId);
   inputContexts.delete(closedId);
@@ -857,6 +877,7 @@ function handleLiveSessionClosed(closedId: string, message?: string, notice = fa
 
 function upsertLiveSession(session: LiveSession) {
   if (!session) return;
+  ++liveSessionsRevision;
   observeInputContext(session);
   sessionStateRevisions.set(session.id, (sessionStateRevisions.get(session.id) || 0) + 1);
   const idx = liveSessions.findIndex(s => s.id === session.id);
@@ -882,8 +903,10 @@ function upsertLiveSession(session: LiveSession) {
 }
 
 /** A late open can add a background tab, but cannot roll back a tab already known here. */
-function rememberOpenedSession(session: LiveSession, selection: number) {
-  if (selection === viewSelection || !liveSessions.some(current => current.id === session.id)) upsertLiveSession(session);
+function rememberOpenedSession(session: LiveSession) {
+  // An open response can have been captured before a socket snapshot, even
+  // when this is still the chosen view. Its metadata is only a fallback.
+  if (!liveSessions.some(current => current.id === session.id)) upsertLiveSession(session);
 }
 
 function getMostRecentLiveSession() {
@@ -1006,12 +1029,26 @@ async function selectLiveSession(id: string, resumeQueue = true, selection = beg
   renderQueuedMessages();
   applyActiveSessionMetadata(session);
   restoreUnsentInput();
+  // Selection and its context become interactive together. A socket snapshot
+  // may already be authoritative while the HTTP refresh is still in flight.
+  updateLiveSessionInputState();
   currentMessageSteps.clear();
   pendingAssistantError = null;
   retryStatusElement = null;
   state.reset();
   state.setStreaming(!!session.isStreaming);
   clearConversation();
+  if (wsClient.ws?.readyState !== WebSocket.OPEN) {
+    // Tau-local tab IDs do not survive a server restart. Selecting one while
+    // disconnected records the stable target, not an HTTP read of its old ID.
+    reattachMuxId ??= session.attached?.muxId || null;
+    keepUnsentInput(session);
+    messageRenderer.renderNotice('Disconnected; waiting to restore the selected conversation.');
+    updateLiveSessionInputState();
+    updateUI();
+    return;
+  }
+  const requestedAtConnection = connectionRevision;
   const requestedAtRevision = sessionStateRevisions.get(id) || 0;
   // A shared tab's snapshot request makes the server publish a fresh pimux
   // boundary over the WebSocket; only a WebSocket snapshot rendered in this
@@ -1020,7 +1057,7 @@ async function selectLiveSession(id: string, resumeQueue = true, selection = beg
   try {
     const res = await fetch(`/api/live-sessions/${encodeURIComponent(id)}/snapshot`);
     const data = await res.json();
-    if (selection !== viewSelection || id !== activeLiveSessionId || !viewingActiveSession) return;
+    if (selection !== viewSelection || requestedAtConnection !== connectionRevision || id !== activeLiveSessionId || !viewingActiveSession) return;
     if (!res.ok || data.error) {
       // A shared tab whose snapshot failed is still attached; only a missing tab is gone.
       if (res.status === 404) handleLiveSessionClosed(id);
@@ -1032,7 +1069,7 @@ async function selectLiveSession(id: string, resumeQueue = true, selection = beg
       if (typeof data.generation === 'number') appliedGenerations.set(id, data.generation);
     }
   } catch (e) {
-    if (selection !== viewSelection || id !== activeLiveSessionId || !viewingActiveSession) return;
+    if (selection !== viewSelection || requestedAtConnection !== connectionRevision || id !== activeLiveSessionId || !viewingActiveSession) return;
     messageRenderer.renderError((e instanceof Error ? e.message : '') || 'Failed to load live session snapshot');
     return;
   }
@@ -1060,7 +1097,6 @@ async function closeLiveSession(id: string) {
   try {
     const response = await fetch(`/api/live-sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
     if (!response.ok && response.status !== 404) throw new Error('Could not disconnect the tab');
-    keepUnsentInput(session);
     handleLiveSessionClosed(id);
   } catch {
     if (selection === viewSelection) flashStatusError('Failed to disconnect the tab. The agent was not stopped.');
@@ -1217,7 +1253,7 @@ newLiveSessionForm?.addEventListener('submit', async (e) => {
     });
     const data = await res.json();
     if (!res.ok || data.error) throw new Error(data.error || 'Failed to create Tau tab');
-    rememberOpenedSession(data.session, selection);
+    rememberOpenedSession(data.session);
     if (selection !== viewSelection) return;
     closeNewLiveSessionModal();
     newLiveSessionModel.value = '';
@@ -2459,32 +2495,41 @@ function focusComposer() {
   if (!isMobile() && !dialogHandler.currentRequest) messageInput.focus();
 }
 
+/** Opening a known runtime does not depend on the overview's discovery cadence. */
+async function attachSharedAgent(muxId: string, selection = beginViewSelection()): Promise<boolean> {
+  try {
+    let target = liveSessions.find(session => session.attached?.muxId === muxId);
+    if (!target) {
+      const res = await fetch('/api/live-sessions/attach', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ muxId }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error || !data.session || data.session.attached?.muxId !== muxId) throw new Error(data.error || 'Could not open the agent');
+      rememberOpenedSession(data.session);
+      target = liveSessions.find(session => session.id === data.session.id)!;
+    }
+    // Attaching can take seconds; whatever the user opened meanwhile stays.
+    if (selection !== viewSelection) return false;
+    await selectLiveSession(target.id, true, selection);
+    return selection === viewSelection && viewingActiveSession && activeLiveSessionId === target.id;
+  } catch (error) {
+    if (selection === viewSelection) flashStatusError(error instanceof Error ? error.message : 'Could not open the agent', 8000);
+    return false;
+  }
+}
+
 // Agent overview: tapping a shared agent attaches a Tau tab to it, or selects
-// the tab already attached.
+// the tab already attached. Reconnect uses the same operation directly.
 const agentsPanel = setupAgentsPanel({
   button: document.getElementById('agents-btn')!,
   focusComposer,
   async open(agent) {
     if (agent.tabId && liveSessions.some(s => s.id === agent.tabId)) {
-      await selectLiveSession(agent.tabId);
-      return true;
+      const selection = beginViewSelection();
+      await selectLiveSession(agent.tabId, true, selection);
+      return selection === viewSelection;
     }
-    const view = beginViewSelection();
-    try {
-      const res = await fetch('/api/live-sessions/attach', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ muxId: agent.muxId }),
-      });
-      const data = await res.json();
-      if (!res.ok || data.error || !data.session) throw new Error(data.error || 'Could not open the agent');
-      rememberOpenedSession(data.session, view);
-      // Attaching can take seconds; whatever the user opened meanwhile stays.
-      if (viewSelection !== view) return false;
-      await selectLiveSession(data.session.id);
-      return true;
-    } catch (error) {
-      if (viewSelection === view) flashStatusError(error instanceof Error ? error.message : 'Could not open the agent', 8000);
-      return false;
-    }
+    return attachSharedAgent(agent.muxId);
   },
 });
 
@@ -2815,7 +2860,7 @@ async function switchSession(sessionFile: string | null | undefined, session: Si
           body: JSON.stringify({ filePath: sessionFile }),
         });
         const data = await res.json();
-        if (res.ok && !data.error && data.session) rememberOpenedSession(data.session, selection);
+        if (res.ok && !data.error && data.session) rememberOpenedSession(data.session);
         if (selection !== viewSelection) return;
         if (!res.ok || data.error) {
           clearConversation();
@@ -2935,17 +2980,17 @@ function updateLiveSessionIndicators() {
 
 // Refresh live-session list for sidebar indicators if WS missed an update
 async function pollInstances() {
-  const requestedAtRevisions = new Map(sessionStateRevisions);
+  const requestedAtConnection = connectionRevision;
+  const requestedAtRevision = liveSessionsRevision;
   try {
     const res = await fetch('/api/live-sessions');
     if (res.ok) {
       const data = await res.json();
+      // Protect membership as well as row metadata: an old empty list must
+      // neither delete a newly attached tab nor resurrect a closed one.
+      if (requestedAtConnection !== connectionRevision || requestedAtRevision !== liveSessionsRevision) return;
       const wasActive = activeLiveSessionId;
-      const sessions = (data.sessions || []).map((session: LiveSession) =>
-        requestedAtRevisions.get(session.id) !== sessionStateRevisions.get(session.id)
-          ? liveSessions.find(current => current.id === session.id) || session
-          : session);
-      setLiveSessions(sessions);
+      setLiveSessions(data.sessions || []);
       const activeSession = wasActive ? liveSessions.find(s => s.id === wasActive) : null;
       if (wasActive && !activeSession) {
         handleLiveSessionClosed(wasActive);

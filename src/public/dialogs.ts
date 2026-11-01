@@ -139,9 +139,6 @@ export class DialogHandler {
     };
 
     this.showDialog(dialog, timeout, id, sessionId, request);
-    
-    // Focus input after a short delay
-    setTimeout(() => input.focus(), 100);
   }
 
   showEditor(request: DialogRequest) {
@@ -173,9 +170,6 @@ export class DialogHandler {
     };
 
     this.showDialog(dialog, timeout, id, sessionId, request);
-    
-    // Focus textarea after a short delay
-    setTimeout(() => textarea.focus(), 100);
   }
 
   showNotification(request: DialogRequest) {
@@ -221,7 +215,7 @@ export class DialogHandler {
       if (moveListFocus(e, options)) return;
       if (options.includes(e.target as HTMLElement)) activateRow(e, e.target as HTMLElement);
     });
-    dialogElement.querySelector<HTMLElement>('.dialog-option, button')?.focus();
+    dialogElement.querySelector<HTMLElement>('.dialog-option, input, textarea, button')?.focus();
 
     // Pi and Tau own expiry. Use the original absolute deadline, never a
     // fresh timeout when a snapshot or tab switch renders the request again.
