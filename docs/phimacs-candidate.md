@@ -18,6 +18,21 @@ file dependencies require the included vendor directory to be extracted before
 hydration. The complete release hydrates these locked inputs and ships the whole
 runtime tree; it must not advertise a bare npm-global install of this input pack.
 
+The pimux archive includes the cross-process claim transaction, the bootstrap
+that waits for durable child ownership before Pi execution, and contextual input
+admission. Every mutating RPC command carries the exact `pimuxContext` captured
+from an authoritative snapshot after its matching live boundary. The router
+rejects stale, missing or unknown contexts instead of substituting the current
+file or branch. Sound is rebuilt from its pinned source and retains the same
+verified archive bytes when those inputs are unchanged.
+
+Rebuild the generic inputs with their explicit compile scripts, followed by
+`npm pack --ignore-scripts`. Record the resulting archive hash and source revision
+in `vendor/manifest.json`; replace the local dependency path and refresh the lock
+with `npm install --package-lock-only --ignore-scripts --offline --no-audit`.
+Review the lock diff so an internal archive update does not change unrelated
+package versions.
+
 Use `npm ci --ignore-scripts`, then explicit TypeScript compilation and the two
 asset-copy scripts. There is no install-time `prepare` hook. The runtime Pi SDK is
 exactly 1.4.0; pimux and sound share that physical host package. An installed-prefix

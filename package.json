@@ -84,7 +84,7 @@
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "1.4.0",
-    "@phimacs/pimux": "file:vendor/phimacs-pimux-0.1.0-b42fc6c.tgz",
+    "@phimacs/pimux": "file:vendor/phimacs-pimux-0.1.0-afbfc9e.tgz",
     "pi-sound": "file:vendor/pi-sound-0.1.0.tgz",
     "ws": "8.21.3"
   },

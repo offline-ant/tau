@@ -4,10 +4,10 @@
     {
       "name": "@phimacs/pimux",
       "version": "0.1.0",
-      "file": "phimacs-pimux-0.1.0-b42fc6c.tgz",
-      "sha256": "16dd280cffdafcc5657ac6f07f6934c8c02cc14bddc827aefb8a9b1a0fd08b6c",
+      "file": "phimacs-pimux-0.1.0-afbfc9e.tgz",
+      "sha256": "a721bc5ad6677c8c973943f0ae0b18b1b2afaf07135bcbefe5c04c3fa26a3bfa",
       "sourceRepository": "https://github.com/offline-ant/phimacs",
-      "sourceRevision": "b42fc6cc0c68a025eeba6d4aa8e6941749a16c39",
+      "sourceRevision": "afbfc9e35de84ade2ba5604c708e9bdc5f6e6a8d",
       "sourceDirectory": "packages/pimux",
       "license": "MIT"
     },
