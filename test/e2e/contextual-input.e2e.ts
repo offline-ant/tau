@@ -146,7 +146,7 @@ for (const metadata of [{ runtimeContext: null, inputReady: true }, { runtimeCon
       assert.equal(await view.page.locator('#command-btn').isEnabled(), true, 'safe reads and explicit stop remain reachable');
       const kept = `${await view.page.locator('#message-input').inputValue()} ${await view.page.locator('#recovered-input').innerText()}`;
       assert.match(kept, /keep me for review/);
-      await view.command('Stop agent everywhere');
+      await view.command('Close agent');
       await view.flush();
       assert.equal(view.requests.filter(item => item.path.endsWith('/stop')).length, 1);
       assert.deepEqual(await view.page.evaluate(() => Reflect.get(window, 'fixtureSent')), []);

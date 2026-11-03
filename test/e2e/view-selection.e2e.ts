@@ -115,8 +115,10 @@ for (const manualChoice of [false, true]) {
         placement: 'root', host: 'emacs', sessionFile: '/synthetic/a.jsonl', model: null, parentId: null, tabId: null };
       await view.emit({ type: 'state', liveSessions: [session('b')], agents: [agent] });
       if (attach) {
-        await attach.called; await attach.resolve({ session: session('a') });
-        await view.page.locator('.live-tab.active[data-session-id="a"]').waitFor();
+        const restored = session('a-restored', { attached: session('a').attached, sessionFile: '/synthetic/a.jsonl', runtimeContext: session('a').runtimeContext });
+        view.live.delete('a'); view.live.set(restored.id, restored);
+        await attach.called; await attach.resolve({ session: restored });
+        await view.page.locator('.live-tab.active[data-session-id="a-restored"]').waitFor();
       } else {
         await view.flush();
         assert.equal(await view.page.locator('.live-tab.active').getAttribute('data-session-id'), 'b');

@@ -15,8 +15,9 @@ a Pi extension that ran inside the Pi TUI into a standalone Node.js web server.
 The original Tau project was retired on 2026-09-30 and is no longer maintained.
 This private integration candidate keeps upstream maintenance and the fork's
 browser/orchestration features. One detached pimux owns each Pi RPC agent; Tau
-and Pilish are equal Unix-socket clients. Closing a tab or restarting Tau only
-disconnects its views. Explicit **Stop agent everywhere** ends the agent.
+and Pilish are equal Unix-socket clients. The tab × and **Close agent** end the
+agent in every frontend without confirmation. Closing the browser or restarting
+Tau only disconnects its views.
 
 ## Key differences from `5e2bce39`
 
@@ -62,11 +63,14 @@ This is an unpublished Phimacs candidate, not the upstream npm package. It needs
 Linux, Node 24 and its exact Pi 1.4.0 host. The release installs the complete tested
 runtime; it does not use or modify an unrelated global Pi.
 
-For candidate development, audited compiled pimux and generic sound archives are
-included in `vendor/` and locked with integrity hashes. Run
+For candidate development, reviewed compiled pimux, orchestration and generic sound
+archives are included in `vendor/` and locked with integrity hashes. Run
 `npm ci --ignore-scripts`, then the explicit compilation commands below. Installing
-never builds or downloads assets through a lifecycle script. Public redistribution
-remains gated on the complete release matrix and the upstream license clarification.
+never builds or downloads assets through a lifecycle script. Orchestration supplies
+`pi-orchestration/worker-task` and the `phimacs-task-status` executable. See the
+[candidate input record](docs/phimacs-candidate.md) for retained source provenance
+and pending final archival. Public redistribution remains gated on the complete
+release matrix and the upstream license clarification.
 
 ## Usage
 
@@ -349,14 +353,31 @@ writer. A failed frontend attach after commitment leaves the agent discoverable.
 - **Attach:** `POST /api/live-sessions/attach {"muxId":"…"}` opens an equal view.
   Every selection/reconnect requests a complete snapshot. Only its own
   `pimux_live` publishes a generation; superseded partial sequences are discarded.
-- **Disconnect:** `DELETE /api/live-sessions/:id`, closing a tab and Tau shutdown
-  disconnect views only. A runtime with zero clients continues already accepted
-  work and may incur provider usage. A lost connection never infers a restart.
-- **Stop:** confirmed `POST /api/live-sessions/:id/stop` or
-  `POST /api/agents/:muxId/stop` accepts `{confirm:true,operationId?}`. It returns
-  an identity-bound `receipt.state:"stopped"` after actual owned Pi exit. Retained
-  receipts reconcile lost acknowledgements against that runtime, not a new owner.
-  Idle agents have the same explicit stop action. No client signals a raw Pi PID.
+  File-based reconnect refuses a replacement snapshot serving another conversation.
+  Peer reconnects preserve the selected runtime unless the user selects another view.
+- **Close:** the tab × and palette **Close agent** use
+  `POST /api/live-sessions/:id/stop`; `POST /api/agents/:muxId/stop` addresses a
+  known runtime directly. Both accept `{operationId?}` without a confirmation flag,
+  including while idle or busy. An identity-bound `receipt.state:"stopped"` means
+  the owned Pi actually exited. Retained receipts reconcile lost acknowledgements
+  against that runtime, not a new owner. Root exit removes every browser view;
+  failures retain the tab and report an error. No client signals a raw Pi PID.
+  Worker Close verifies its exact pending parent-task binding and advertised
+  `/worker-cancel` extension before requesting cancellation. It requires matching
+  `complete` evidence from `pi-orchestration/worker-task` plus the runtime receipt.
+  Dispatch, runtime exit and pending or failed task cleanup do not remove the view.
+  Reads use the captured socket namespace, including on reconnect. A disconnected
+  worker without terminal evidence refuses Close immediately and asks for reconnect.
+  Pending Close blocks ordinary prompts and local queue dispatch without discarding
+  input; cancellation remains available. Named Close errors survive navigation.
+  Successful task cleanup preserves abnormal worker exit diagnostics in both the
+  stop response and retirement broadcast.
+- **Frontend loss:** browser closure and Tau shutdown only disconnect. Internal
+  `DELETE /api/live-sessions/:id` disconnects without stopping its runtime;
+  worker cleanup retains an unavailable view until final task cleanup is acknowledged.
+  It is not an alternative user-facing Close action. Zero-client runtimes continue
+  accepted work and may incur usage. A lost runtime socket retains an unavailable
+  tab with an error, never claims Pi exited, and never infers a restart or replay.
 - **Input:** busy sends steer; all clients see authoritative Pi-held queues and
   first-answer dialog closure. New session replaces the conversation everywhere.
   Drafts/images/local pending input are quarantined under agent/file/leaf identity
@@ -417,8 +438,11 @@ node_modules/.bin/tsc -p tsconfig.public.json
 node scripts/copy-katex.ts
 node scripts/copy-highlight.ts
 chmod u+x bin/tau.js
-node --test test/detached-runtime.test.ts test/detached-runtime-native.test.ts
+node --test test/vendor-inputs.test.ts test/close-worker.test.ts test/runtime-recovery.test.ts test/detached-runtime.test.ts test/pimux-attach.test.ts test/http-routes.test.ts
+node --test test/e2e/close-agent.e2e.ts test/e2e/shared-input-safety.e2e.ts test/e2e/contextual-input.e2e.ts
 node --test test/voice.test.ts test/voice-route.test.ts
+# Explicit native lanes use isolated real Pi runtimes with faux inference:
+node --test test/detached-runtime-native.test.ts test/e2e/worker-close-native.e2e.ts
 node --test test/e2e/pimux-share.e2e.ts
 ```
 

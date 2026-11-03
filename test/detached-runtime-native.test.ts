@@ -10,7 +10,7 @@ import { listRuntimes, stopRuntime } from '@phimacs/pimux/runtime';
 import { processIdentityStatus, readProcessIdentity } from '@phimacs/pimux/process-identity';
 import { acquireClaim, releaseClaim } from '@phimacs/pimux/ownership';
 import type { JsonRecord } from '../src/server/types.ts';
-import { until } from './fake-pimux.ts';
+import { until } from './e2e/fixtures/detached-peer.ts';
 
 const cli = fileURLToPath(new URL('../bin/tau.js', import.meta.url));
 const faux = fileURLToPath(new URL('./e2e/fixtures/pimux-faux.ts', import.meta.url));
@@ -94,14 +94,12 @@ test('real faux root survives server exit, reattaches symmetrically, exports saf
   assert.equal(resumed.status, 200, JSON.stringify(resumed.data));
   assert.equal(resumed.data.started, false);
   const resumedTab = resumed.data.session as JsonRecord;
-  const unconfirmed = await request(second.endpoint, `/api/live-sessions/${resumedTab.id}/stop`, {});
-  assert.equal(unconfirmed.status, 400);
-  assert.equal(processIdentityStatus(pi), 'alive');
-  const stopped = await request(second.endpoint, `/api/live-sessions/${resumedTab.id}/stop`, { confirm: true, operationId: 'owned-stop' });
+  const stopped = await request(second.endpoint, `/api/live-sessions/${resumedTab.id}/stop`, { operationId: 'owned-close' });
   assert.equal(stopped.status, 200, JSON.stringify(stopped.data));
   assert.equal((stopped.data.receipt as JsonRecord).state, 'stopped');
   assert.equal(processIdentityStatus(pi), 'dead');
-  const repeated = await request(second.endpoint, `/api/agents/${runtime.muxId}/stop`, { confirm: true, operationId: 'reconcile-lost-ack' });
+  await until(async () => ((await request(second.endpoint, '/api/live-sessions', undefined, 'GET')).data.sessions as JsonRecord[]).length === 0, 'acknowledged Close removes its Tau view');
+  const repeated = await request(second.endpoint, `/api/agents/${runtime.muxId}/stop`, { operationId: 'reconcile-lost-ack' });
   assert.equal(repeated.status, 200, JSON.stringify(repeated.data));
   assert.deepEqual(repeated.data.receipt, stopped.data.receipt);
 });
@@ -168,6 +166,17 @@ test('two real Tau clients reject delayed input after a shared file replacement'
   await until(() => fs.existsSync(String(next.sessionFile)) && fs.readFileSync(String(next.sessionFile), 'utf8').includes('reply: the new context is explicit'), 'new contextual reply persisted', 15000);
   assert.equal(fs.readFileSync(String(next.sessionFile), 'utf8').includes('never forward this old instruction'), false);
   assert.equal(listRuntimes().filter(entry => entry.muxId === runtime.muxId).length, 1);
+  const identity = readProcessIdentity(Number(runtime.piPid))!;
+  const closed = await request(second.endpoint, `/api/live-sessions/${peer.id}/stop`, {});
+  assert.equal(closed.status, 200, JSON.stringify(closed.data));
+  assert.equal((closed.data.receipt as JsonRecord).muxId, runtime.muxId);
+  assert.equal(processIdentityStatus(identity), 'dead');
+  for (const tau of [first, second]) {
+    await until(async () => {
+      const live = await request(tau.endpoint, '/api/live-sessions', undefined, 'GET');
+      return !(live.data.sessions as JsonRecord[]).some(session => (session.runtime as JsonRecord).muxId === runtime.muxId);
+    }, 'Close removes the agent from every Tau frontend');
+  }
 });
 
 test('HTTP force never overrides a native owner or a stopped-file mutation lease', { timeout: 30000 }, async t => {

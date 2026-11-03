@@ -4,11 +4,27 @@
     {
       "name": "@phimacs/pimux",
       "version": "0.1.0",
-      "file": "phimacs-pimux-0.1.0-afbfc9e.tgz",
-      "sha256": "a721bc5ad6677c8c973943f0ae0b18b1b2afaf07135bcbefe5c04c3fa26a3bfa",
+      "file": "phimacs-pimux-0.1.0-working-a880d9408769.tgz",
+      "sha256": "a880d94087691c6ba6e84db5342246994558d94cde4b27a63b27420dc8e926e0",
       "sourceRepository": "https://github.com/offline-ant/phimacs",
-      "sourceRevision": "afbfc9e35de84ade2ba5604c708e9bdc5f6e6a8d",
+      "sourceBaseRevision": "34fcdd0f88ebf97e242b0f87d9a0947b199f4d00",
+      "sourceDirty": true,
+      "sourceArchive": "phimacs-source-working-a3c0b5c230f4.tgz",
+      "sourceArchiveSha256": "a3c0b5c230f40698c53fa6fd606b7481d99028ff7ccd7fcdebe16c95df201798",
       "sourceDirectory": "packages/pimux",
+      "license": "MIT"
+    },
+    {
+      "name": "pi-orchestration",
+      "version": "0.1.0",
+      "file": "pi-orchestration-0.1.0-working-97c17d288d07.tgz",
+      "sha256": "97c17d288d07daa199b7b3e3989b01780d5bf2c940425bca56a02ba64752cf5a",
+      "sourceRepository": "https://github.com/offline-ant/phimacs",
+      "sourceBaseRevision": "34fcdd0f88ebf97e242b0f87d9a0947b199f4d00",
+      "sourceDirty": true,
+      "sourceArchive": "phimacs-source-working-a3c0b5c230f4.tgz",
+      "sourceArchiveSha256": "a3c0b5c230f40698c53fa6fd606b7481d99028ff7ccd7fcdebe16c95df201798",
+      "sourceDirectory": "packages/orchestration",
       "license": "MIT"
     },
     {

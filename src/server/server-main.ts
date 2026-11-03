@@ -3,8 +3,8 @@
  * Tau standalone server.
  *
  * Serves the Tau web UI and equal socket clients of detached Pi runtimes.
- * Tab DELETE and server shutdown disconnect views, never stop agents.
- * Explicit identity-bound global stop is a separate confirmed operation.
+ * Agent Close stops its exact runtime; internal view cleanup and server
+ * shutdown only disconnect. Browser loss never controls agent lifetime.
  */
 
 import http from 'node:http';
@@ -27,10 +27,12 @@ import { completeDirectories } from './path-completion.js';
 import { getAvailableModels, modelLabel, normalizeModel, parseModelSpecToModel, parsePiListModels, _clearModelListCacheForTest, _setExecFileForTest } from './model-utils.js';
 import { InputContextError, LiveSessionManager, PiRpcSession, SessionOpenError, assertNoSessionArgs, isGenericSessionName, liveManager, makeId } from './sessions.js';
 import { isReadOnlyCommand } from '@phimacs/pimux/protocol';
-import { pimuxCommand, pimuxEntryForFile, pimuxFiles, pimuxSharing } from './pimux.js';
+import { readWorkerTask } from 'pi-orchestration/worker-task';
+import { observeWorkerExit } from './close-worker.js';
+import { workerExitReport } from './runtime-exit.js';
+import { pimuxCommand, pimuxEntryById, pimuxEntryForFile, pimuxFiles, pimuxSharing } from './pimux.js';
 import { AgentOverview } from './agents.js';
 import { canonicalSessionPath, lookupClaim } from '@phimacs/pimux/ownership';
-import { stopRuntime } from '@phimacs/pimux/runtime';
 import { withStoppedSessionLease } from './session-files.js';
 import { exportSession } from './session-export.js';
 import { readSessionHeader } from './session-header.js';
@@ -549,7 +551,7 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
         if (body.refresh !== undefined && typeof body.refresh !== 'boolean') throw new Error('refresh must be a boolean');
       } catch (e) { return rejectBeforeSpawn(errorMessage(e)); }
       const existing = liveManager.findBySessionFile(resolvedFile);
-      if (existing && body.refresh !== true && !existing.terminating && !liveManager.hasTerminatingResume(resolvedFile) && !liveManager.hasPendingResume(resolvedFile)) {
+      if (existing && !existing.exited && body.refresh !== true && !existing.terminating && !liveManager.hasTerminatingResume(resolvedFile) && !liveManager.hasPendingResume(resolvedFile)) {
         return json(res, 200, { session: existing.metadata(), reused: true, started: false, ...(existing.attachment ? { attached: true } : {}) });
       }
       const refusal = terminalOwnerRefusal(resolvedFile, body.force === true);
@@ -585,9 +587,24 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
   const stopAgent = cleanPath.match(/^\/api\/agents\/([^/]+)\/stop$/);
   if (stopAgent && req.method === 'POST') {
     readBody(req).then(async body => {
-      if (body.confirm !== true || body.operationId !== undefined && typeof body.operationId !== 'string') return json(res, 400, { error: 'Explicit global-stop confirmation and a valid operationId are required' });
-      try { return json(res, 200, { receipt: await stopRuntime(decodeURIComponent(stopAgent[1]), { operationId: body.operationId as string | undefined }) }); }
-      catch (error) { return sendLifecycleError(res, error); }
+      if (body.operationId !== undefined && typeof body.operationId !== 'string') return json(res, 400, { error: 'operationId must be a string' });
+      try {
+        const muxId = decodeURIComponent(stopAgent[1]);
+        const known = [...liveManager.sessions.values()].find(view => view.attachment?.muxId === muxId);
+        const env = known?.attachment ? { ...process.env, PIMUX_DIR: path.dirname(known.attachment.socket) } : process.env;
+        const task = readWorkerTask(muxId, env);
+        if (task?.state === 'failed') throw new SessionOpenError(`Worker task cleanup failed: ${task.error}`, 503, muxId);
+        const session = known ?? (pimuxEntryById(muxId, env.PIMUX_DIR)?.placement === 'worker'
+          ? (await liveManager.attachById(muxId)).session : undefined);
+        if (!session && task?.state === 'pending') throw new SessionOpenError('Worker task cleanup is still pending; no cancellation connection is available', 503, muxId);
+        const receipt = session ? await session.stop(body.operationId as string | undefined)
+          : await liveManager.runtime.stop(muxId, { operationId: body.operationId as string | undefined, env });
+        for (const view of liveManager.sessions.values()) {
+          if (view.attachment?.muxId === muxId) await liveManager.delete(view.id, 'closed_by_user', receipt);
+        }
+        const report = session?.attachedOwner?.placement === 'worker' || task ? workerExitReport(session?.attachment?.exit ?? receipt) : undefined;
+        return json(res, 200, { receipt, ...report });
+      } catch (error) { return sendLifecycleError(res, error); }
     }).catch(error => json(res, 400, { error: errorMessage(error) }));
     return;
   }
@@ -603,9 +620,13 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
     if (!session) return json(res, 404, { error: 'Live session not found' });
     if (cleanPath.endsWith('/stop') && req.method === 'POST') {
       readBody(req).then(async body => {
-        if (body.confirm !== true) return json(res, 400, { error: 'Stopping ends this agent in every frontend. Explicit confirmation is required, including when idle.' });
         if (body.operationId !== undefined && typeof body.operationId !== 'string') return json(res, 400, { error: 'operationId must be a string' });
-        try { return json(res, 200, { receipt: await session.stop(body.operationId as string | undefined) }); }
+        try {
+          const receipt = await session.stop(body.operationId as string | undefined);
+          await liveManager.delete(id, 'closed_by_user', receipt);
+          const report = session.attachedOwner?.placement === 'worker' ? workerExitReport(session.attachment?.exit ?? receipt) : undefined;
+          return json(res, 200, { receipt, ...report });
+        }
         catch (error) { return sendLifecycleError(res, error); }
       }).catch(error => json(res, 400, { error: errorMessage(error) }));
       return;
@@ -621,10 +642,10 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
       return;
     }
     if (!isSnapshotRoute && req.method === 'DELETE') {
-      liveManager.delete(id, 'closed_by_user').then(
-        () => json(res, 200, { success: true }),
-        (error) => sendLifecycleError(res, error),
-      );
+      const disconnected = session.attachedOwner?.placement === 'worker'
+        ? (session.transport?.close() ?? Promise.resolve()).then(() => observeWorkerExit(session))
+        : liveManager.delete(id, 'closed_by_user');
+      disconnected.then(() => json(res, 200, { success: true }), error => sendLifecycleError(res, error));
       return;
     }
   }

@@ -912,7 +912,7 @@ test('refresh refuses a terminal owner until that owner releases it', async t =>
   assert.equal(launcher.calls.length, 1);
 });
 
-test('idle global stop requires confirmation and uses only the selected runtime identity', async t => {
+test('idle Close needs no confirmation and uses only the selected runtime identity', async t => {
   const launcher = installFakeRuntime(t);
   const created = await jsonBody(await fetch(`${base}/api/live-sessions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cwd: PROJECTS_DIR }) }));
   const calls: string[] = [];
@@ -924,10 +924,22 @@ test('idle global stop requires confirmation and uses only the selected runtime 
   t.after(() => { liveManager.runtime.stop = stop; });
   const route = `${base}/api/live-sessions/${created.session.id}/stop`;
   const request = (body: object) => fetch(route, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  assert.equal((await request({})).status, 400);
+  assert.equal((await request({ operationId: 42 })).status, 400);
   assert.deepEqual(calls, []);
-  const stopped = await request({ confirm: true, operationId: 'explicit-stop' });
+  const stopped = await request({ operationId: 'explicit-close' });
   assert.equal(stopped.status, 200);
-  assert.equal((await jsonBody(stopped)).receipt.operationId, 'explicit-stop');
+  assert.equal((await jsonBody(stopped)).receipt.operationId, 'explicit-close');
   assert.deepEqual(calls, [launcher.muxes[0].muxId]);
+  assert.equal(liveManager.get(created.session.id), undefined);
+});
+
+test('failed Close retains the exact view and returns its uncertainty instead of disconnecting', async t => {
+  installFakeRuntime(t);
+  const session = await liveManager.create({ cwd: PROJECTS_DIR, model: undefined, sessionFile: undefined, args: undefined, env: undefined });
+  t.mock.method(liveManager.runtime, 'stop', async () => { throw new SessionOpenError('Agent exit is uncertain; reconcile this runtime', 503, session.attachment!.muxId); });
+  const response = await fetch(`${base}/api/live-sessions/${session.id}/stop`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  assert.equal(response.status, 503);
+  assert.match((await jsonBody(response)).error, /exit is uncertain/);
+  assert.equal(liveManager.get(session.id), session);
+  assert.equal(session.terminating, false);
 });

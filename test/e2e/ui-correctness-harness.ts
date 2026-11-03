@@ -65,7 +65,12 @@ export async function openUI(browser: Browser, initial = [session('a'), session(
     const selected = url.pathname.match(/^\/api\/live-sessions\/([^/]+)\/snapshot$/)?.[1];
     if (selected) return route.fulfill({ json: snapshot(live.get(selected) || session(selected)) });
     if (url.pathname === '/api/live-sessions') return route.fulfill({ json: { sessions: [...live.values()] } });
-    if (url.pathname.endsWith('/stop')) return route.fulfill({ json: { receipt: { state: 'stopped' } } });
+    if (url.pathname.endsWith('/stop')) {
+      const id = decodeURIComponent(url.pathname.split('/').at(-2)!);
+      const muxId = live.get(id)?.attached?.muxId;
+      live.delete(id);
+      return route.fulfill({ json: { receipt: { state: 'stopped', muxId } } });
+    }
     if (url.pathname === '/api/rpc') return route.fulfill({ json: { success: true, data: body?.type === 'get_available_models' ? { models: [] }
       : body?.type === 'get_state' ? { isStreaming: false, isCompacting: false }
       : body?.type === 'clear_queue' ? { steering: [], followUp: [] } : {} } });

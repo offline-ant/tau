@@ -94,9 +94,14 @@ integration test pass.
 
 ## Detached runtime and uncertainty
 
-The Tau process never owns Pi lifetime. Tab/server closure only disconnects;
-explicit identity-bound stop is separate, including for idle roots. A committed
-runtime remains after attach failure. Failed or uncertain starts retain operation
+The Tau process never owns Pi lifetime. Agent Close is an unconfirmed,
+identity-bound stop in every frontend. Browser/server shutdown and internal view
+cleanup only disconnect; never replace those cleanup paths with global stop.
+Worker Close requires an advertised cancellation command and matching final parent
+task cleanup evidence, not dispatch or runtime exit alone. Parent web-host DELETE
+must disconnect without removing a pending or failed worker view. Reconnect reads
+retained task evidence even after Tau restarts, using the captured socket namespace.
+A committed runtime remains after attach failure. Failed or uncertain starts retain operation
 identity and cannot justify another spawn. A refused socket, HTTP timeout, removed
 tab or sent signal never proves the writer is gone. `force` does not bypass claims.
 
@@ -118,8 +123,10 @@ transaction. Raw Pi 1.4 internal storage bypasses remain outside the cooperative
 guarantee; do not describe all disk mutations as universally protected.
 
 Focused checks: `npm run typecheck`, explicit compilation, and
-`node --test test/detached-runtime.test.ts test/detached-runtime-native.test.ts
- test/pimux-attach.test.ts test/session-export.test.ts`.
+`node --test test/close-worker.test.ts test/runtime-recovery.test.ts
+ test/detached-runtime.test.ts test/pimux-attach.test.ts test/session-export.test.ts`.
+The explicit real-runtime lane is `node --test test/detached-runtime-native.test.ts
+ test/e2e/worker-close-native.e2e.ts`.
 
 ## Browser connections
 

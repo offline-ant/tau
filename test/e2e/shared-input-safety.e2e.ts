@@ -123,20 +123,22 @@ test('Abort explains its global effects, clears the queue and keeps returned tex
   } finally { await view.close(); }
 });
 
-test('idle agents expose global Stop separately from tab disconnect, regardless of who created them', async () => {
+test('the palette and tab × both Close an agent without confirmation or local detach', async () => {
   const view = await openUI(browser);
   try {
-    assert.equal(await view.page.locator('#tree-btn').evaluate(element => element.classList.contains('hidden')), false, 'advertised tree capability is available on a shared agent');
-    await view.command('Stop agent everywhere'); await view.flush();
-    const stops = view.requests.filter(item => item.path.endsWith('/stop'));
-    assert.equal(stops.length, 1); assert.equal(stops[0].method, 'POST'); assert.equal(stops[0].body?.confirm, true);
-    assert.equal(typeof stops[0].body?.operationId, 'string');
-    assert.equal(view.requests.some(item => item.body?.type === 'abort'), false);
-    const confirmations = await view.page.evaluate(() => Reflect.get(window, 'fixtureConfirmations')) as string[];
-    assert.match(confirmations[0], /every frontend.*idle/);
-    await view.page.locator('.live-tab[data-session-id="a"] .live-tab-close').click(); await view.flush();
-    assert.equal(view.requests.filter(item => item.path.endsWith('/stop')).length, 1, 'closing never sends stop');
-    assert.equal(view.requests.filter(item => item.method === 'DELETE' && item.path === '/api/live-sessions/a').length, 1);
+    await view.page.evaluate(() => { window.confirm = () => { throw new Error('Close must not ask'); }; });
+    await view.command('Close agent'); await view.flush();
+    assert.equal(await view.page.locator('.live-tab[data-session-id="a"]').count(), 0);
+    await view.page.locator('.live-tab[data-session-id="b"] .live-tab-close').click(); await view.flush();
+    const closes = view.requests.filter(item => item.path.endsWith('/stop'));
+    assert.deepEqual(closes.map(item => item.path), ['/api/live-sessions/a/stop', '/api/live-sessions/b/stop']);
+    for (const close of closes) {
+      assert.equal(close.method, 'POST');
+      assert.equal(close.body?.confirm, undefined);
+      assert.equal(typeof close.body?.operationId, 'string');
+    }
+    assert.equal(await view.page.locator('.live-tab').count(), 0);
+    assert.equal(view.requests.some(item => item.method === 'DELETE' || item.body?.type === 'abort'), false);
   } finally { await view.close(); }
 });
 
@@ -202,13 +204,12 @@ test('a lost queued-prompt acknowledgement keeps the ordered dispatch locked wit
   } finally { await view.close(); }
 });
 
-test('declining global actions leaves the agent, its queue and the composer untouched', async () => {
+test('declining queue clearing and Abort leaves the agent and composer untouched', async () => {
   const view = await openUI(browser);
   try {
     await view.page.evaluate(() => { window.confirm = () => false; });
     await view.page.locator('#message-input').fill('untouched draft');
     await view.command('Clear agent queue everywhere');
-    await view.command('Stop agent everywhere');
     await view.emit({ type: 'event', sessionId: 'a', event: { type: 'agent_start' } });
     await view.page.locator('#abort-btn').click(); await view.flush();
     assert.equal(view.requests.some(item => ['clear_queue', 'abort'].includes(String(item.body?.type)) || item.path.endsWith('/stop') || item.method === 'DELETE'), false);
@@ -217,11 +218,11 @@ test('declining global actions leaves the agent, its queue and the composer unto
   } finally { await view.close(); }
 });
 
-test('an incomplete global-stop receipt cannot claim the agent stopped or remove its tab', async () => {
+test('an incomplete Close receipt cannot claim the agent stopped or remove its tab', async () => {
   const view = await openUI(browser);
   try {
     const held = view.hold('/api/live-sessions/a/stop');
-    await view.command('Stop agent everywhere'); await held.called;
+    await view.command('Close agent'); await held.called;
     await held.resolve({ receipt: { state: 'stopping' } });
     await view.page.locator('#status-text', { hasText: 'not confirmed' }).waitFor();
     assert.equal(await view.page.locator('.live-tab[data-session-id="a"]').count(), 1);

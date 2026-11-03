@@ -3,7 +3,7 @@ import net from 'node:net';
 import { once } from 'node:events';
 import type { RuntimeReceipt } from '@phimacs/pimux/runtime';
 import { validateSocket } from '@phimacs/pimux/runtime';
-import { PROTOCOL_VERSION, RUNTIME_CAPABILITIES, type JsonRecord } from '@phimacs/pimux/protocol';
+import { isReadOnlyCommand, parseInputContext, PROTOCOL_VERSION, RUNTIME_CAPABILITIES, type JsonRecord } from '@phimacs/pimux/protocol';
 
 export async function until<T>(check: () => T | undefined | false | null | Promise<T | undefined | false | null>, description: string, timeoutMs = 20000): Promise<T> {
   const deadline = Date.now() + timeoutMs;
@@ -58,7 +58,10 @@ export class DetachedPeer {
 
   send(record: JsonRecord): void {
     assert.ok(this.socket.writable, 'peer must be connected');
-    this.socket.write(JSON.stringify(record) + '\n');
+    const context = parseInputContext([...this.records].reverse().find(item => item.type === 'pimux_snapshot')?.inputContext);
+    const outbound = !isReadOnlyCommand(String(record.type)) && !String(record.type).startsWith('pimux_')
+      ? { pimuxContext: context, ...record } : record;
+    this.socket.write(JSON.stringify(outbound) + '\n');
   }
   mark(): number { return this.records.length; }
   find(match: (record: JsonRecord) => boolean, after = 0): JsonRecord | undefined { return this.records.slice(after).find(match); }

@@ -7,6 +7,7 @@ import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { FakePimux, until } from './fake-pimux.ts';
 import { FakeRuntimeLauncher } from './runtime-launcher.ts';
+import { workerTaskFixture } from './worker-task-fixture.ts';
 import type { JsonRecord } from '../src/server/types.ts';
 
 import * as tau from '../bin/tau.js';
@@ -110,7 +111,7 @@ test('attach by mux id, snapshot refresh and rejection of session-opening args',
   assert.equal(args.status, 400);
   assert.match(String(args.body.error), /must not open a session/);
   const missing = await post('/api/live-sessions/attach', { muxId: 'nope' });
-  assert.equal(missing.status, 404);
+  assert.equal(missing.status, 503, 'missing identity without terminal evidence is unavailable, not proof of closure');
 });
 
 function deadPid() {
@@ -336,7 +337,7 @@ test('renames go through the Pi that writes the file; deleting a live file is re
   assert.equal(listing.sessions.find((session) => session.filePath === file)?.shared, mux.muxId);
 });
 
-test('closing an attached tab only disconnects', async () => {
+test('internal view disposal only disconnects', async () => {
   forbidSpawn();
   const { mux } = await sharedSession('detach');
   const { body } = await post('/api/live-sessions/attach', { muxId: mux.muxId });
@@ -351,7 +352,77 @@ test('closing an attached tab only disconnects', async () => {
   assert.equal(closed.message, undefined);
 });
 
-test('pimux_exit closes the tab with Pi\'s stderr; a lost connection says Pi may still run', async () => {
+test('Close by runtime identity reconciles and removes a previously disconnected view', async t => {
+  const { mux } = await sharedSession('close-disconnected');
+  const opened = await post('/api/live-sessions/attach', { muxId: mux.muxId });
+  const id = (opened.body.session as JsonRecord).id;
+  mux.drop();
+  await until(() => liveManager.get(id)?.exited, 'view becomes unavailable');
+  t.mock.method(liveManager.runtime, 'stop', async (muxId: string) => ({ protocol: 2, muxId, operationId: 'retained-close', state: 'stopped', code: 0, signal: null, stoppedAt: 'synthetic-time' }));
+  const closed = await post(`/api/agents/${mux.muxId}/stop`, {});
+  assert.equal(closed.status, 200, String(closed.body.error));
+  assert.equal(liveManager.get(id), undefined);
+  assert.equal((closed.body.receipt as JsonRecord).muxId, mux.muxId);
+});
+
+for (const addressing of ['tab', 'agent'] as const) for (const abnormal of [false, true]) {
+  test(`Close by ${addressing} identity waits for final cleanup and preserves worker diagnostics (abnormal: ${abnormal})`, async t => {
+    const { mux } = await sharedSession(`cancel-${addressing}-${abnormal}`, { placement: 'worker' });
+    mux.responses.get_commands = { success: true, data: { commands: [{ name: 'worker-cancel', source: 'extension' }] } };
+    const task = workerTaskFixture(mux);
+    t.mock.method(liveManager.runtime, 'stop', async () => { assert.fail('Worker Close must never signal its runtime'); });
+    const opened = await post('/api/live-sessions/attach', { muxId: mux.muxId });
+    const id = (opened.body.session as JsonRecord).id;
+    const route = addressing === 'tab' ? `/api/live-sessions/${id}/stop` : `/api/agents/${mux.muxId}/stop`;
+    const closing = post(route, {});
+    let acknowledged = false;
+    void closing.then(() => { acknowledged = true; });
+    await until(() => mux.commands.some(command => command.type === 'prompt' && command.message === '/worker-cancel'), 'exact worker cancellation dispatched');
+    assert.equal(acknowledged, false);
+    task.exit(abnormal ? { code: 1, stderrTail: 'worker provider failed during cancellation' } : {});
+    await until(() => liveManager.get(id)?.exited, 'runtime exited before task cleanup');
+    assert.equal(acknowledged, false);
+    assert.equal(browserMessages.some(message => message.type === 'live_session_closed' && message.sessionId === id), false);
+    task.finish();
+    const closed = await closing;
+    assert.equal(closed.status, 200, String(closed.body.error));
+    assert.equal((closed.body.receipt as JsonRecord).muxId, mux.muxId);
+    assert.equal((closed.body.receipt as JsonRecord).state, 'stopped');
+    assert.equal((closed.body.receipt as JsonRecord).code, abnormal ? 1 : 0);
+    assert.equal(closed.body.notice, !abnormal);
+    assert.match(String(closed.body.message), abnormal ? /Pi process exited \(1\):\nworker provider failed/ : /This worker was closed/);
+    const event = browserMessages.find(message => message.type === 'live_session_closed' && message.sessionId === id);
+    assert.equal(event?.message, closed.body.message, 'HTTP and broadcast retirement preserve the same diagnostics');
+    assert.equal(event?.notice, closed.body.notice);
+    assert.equal(liveManager.get(id), undefined);
+  });
+}
+
+for (const addressing of ['tab', 'agent'] as const) {
+  test(`Close by ${addressing} preserves retained exit diagnostics when transport disposal precedes pimux_exit`, async t => {
+    const { mux } = await sharedSession(`receipt-first-${addressing}`, { placement: 'worker' });
+    const task = workerTaskFixture(mux);
+    const opened = await post('/api/live-sessions/attach', { muxId: mux.muxId });
+    const id = (opened.body.session as JsonRecord).id;
+    t.mock.method(liveManager.runtime, 'stop', async () => { assert.fail('Complete worker cleanup requires no runtime signal'); });
+    task.receipt({ code: 2 });
+    task.finish();
+    assert.equal(liveManager.get(id)?.exited, false, 'the client has not observed pimux_exit');
+    const route = addressing === 'tab' ? `/api/live-sessions/${id}/stop` : `/api/agents/${mux.muxId}/stop`;
+    const closed = await post(route, {});
+    assert.equal(closed.status, 200, String(closed.body.error));
+    assert.equal((closed.body.receipt as JsonRecord).code, 2);
+    assert.equal(closed.body.notice, false);
+    assert.match(String(closed.body.message), /Pi process exited \(2\)/);
+    const event = browserMessages.find(message => message.type === 'live_session_closed' && message.sessionId === id);
+    assert.equal(event?.message, closed.body.message, 'peer browsers receive receipt diagnostics despite disposal racing terminal records');
+    assert.equal(event?.notice, false);
+    assert.equal(mux.commands.some(command => command.type === 'prompt'), false);
+    assert.equal(liveManager.get(id), undefined);
+  });
+}
+
+test('authoritative exit removes the tab; connection loss retains an unavailable view until reconnect', async () => {
   forbidSpawn();
   const { mux } = await sharedSession('exit');
   let { body } = await post('/api/live-sessions/attach', { muxId: mux.muxId });
@@ -371,12 +442,28 @@ test('pimux_exit closes the tab with Pi\'s stderr; a lost connection says Pi may
   ({ body } = await post('/api/live-sessions/attach', { muxId: mux.muxId }));
   id = (body.session as JsonRecord).id as string;
   mux.drop();
-  closed = await until(() => browserMessages.find((message) => message.type === 'live_session_closed' && message.sessionId === id), 'drop close');
-  assert.equal(closed.reason, 'pimux_disconnected');
-  assert.match(String(closed.message), /may still be running/);
-  // The entry still names a live wrapper: reopening attaches again, never spawns.
+  await until(() => liveManager.get(id)?.exited, 'connection lost');
+  assert.equal(liveManager.get(id).metadata().inputReady, false);
+  assert.equal(browserMessages.some((message) => message.type === 'live_session_closed' && message.sessionId === id), false);
+  assert.ok(browserMessages.some(message => String((message.event as JsonRecord | undefined)?.message).includes('may still be running')));
+  // A verified new connection replaces the unavailable view without launching Pi.
   const again = await post('/api/live-sessions/attach', { muxId: mux.muxId });
   assert.equal(again.status, 200, String(again.body.error));
+  assert.notEqual((again.body.session as JsonRecord).id, id);
+  assert.equal(liveManager.get(id), undefined);
+});
+
+test('orderly worker exit reports closure without claiming that a result was delivered', async () => {
+  const { mux } = await sharedSession('neutral-worker-exit', { placement: 'worker' });
+  const task = workerTaskFixture(mux);
+  const opened = await post('/api/live-sessions/attach', { muxId: mux.muxId });
+  const id = (opened.body.session as JsonRecord).id;
+  task.exit();
+  await until(() => liveManager.get(id)?.exited, 'worker runtime exit');
+  task.finish();
+  const closed = await until(() => browserMessages.find(message => message.type === 'live_session_closed' && message.sessionId === id), 'worker closure notice');
+  assert.equal(closed.message, 'This worker was closed.');
+  assert.equal(closed.notice, true);
 });
 
 test('foreign events update shared tab state', async () => {

@@ -158,8 +158,14 @@ test('a socket frontend and a phone share one detached Pi through pimux and Tau'
   await shot(page, 'agents-overview');
 
   // Tapping attaches; the history Emacs already has is there.
+  const attaching = page.waitForResponse(response => response.url().endsWith('/api/live-sessions/attach'));
+  const selecting = page.waitForResponse(response => response.url().endsWith('/snapshot'));
   await rootRow.click();
-  await panel.waitFor({ state: 'hidden' });
+  const attached = await attaching;
+  assert.equal(attached.status(), 200, await attached.text());
+  const selected = await selecting;
+  assert.equal(selected.status(), 200, await selected.text());
+  await panel.waitFor({ state: 'hidden', timeout: 5000 }).catch(async error => { throw new Error(`${String(error)}\n${await page.locator('#status-text').innerText()}\n${await page.locator('#messages').innerText()}`); });
   await userMessages(page, 'first from emacs').waitFor();
   await assistantText(page, 'reply: first from emacs').waitFor();
   assert.ok(fs.existsSync(root1.sessionFile));
@@ -180,32 +186,35 @@ test('a socket frontend and a phone share one detached Pi through pimux and Tau'
 
   // A dialog answered in Emacs closes in the phone.
   let start = root1.primary.mark();
-  root1.primary.send({ type: 'prompt', message: '/fx-select' });
+  const firstPicker = root1.primary.request({ type: 'prompt', message: '/fx-select' });
   const asked = await root1.primary.waitFor((record) => record.type === 'extension_ui_request' && record.method === 'select', 'dialog', start);
   await page.locator('.dialog-title', { hasText: 'Pick a fruit' }).waitFor();
   root1.primary.send({ type: 'extension_ui_response', id: asked.id, value: 'pear' });
   await page.locator('#dialog-container.hidden').waitFor({ state: 'attached' });
   await root1.primary.waitFor((record) => record.type === 'extension_ui_request' && record.method === 'notify' && record.message === 'picked:pear', 'pear', start);
+  assert.equal((await firstPicker).success, true);
 
   // A dialog answered in the phone closes in Emacs, which hears who answered.
   start = root1.primary.mark();
-  root1.primary.send({ type: 'prompt', message: '/fx-select' });
+  const secondPicker = root1.primary.request({ type: 'prompt', message: '/fx-select' });
   const second = await root1.primary.waitFor((record) => record.type === 'extension_ui_request' && record.method === 'select', 'second dialog', start);
   await page.locator('.dialog-option', { hasText: 'apple' }).click();
   const closed = await root1.primary.waitFor((record) => record.type === 'pimux_dialog_closed' && record.id === second.id, 'closed in Emacs', start);
   assert.equal(closed.reason, 'answered');
   assert.notEqual(closed.clientId, root1.primary.find((record) => record.type === 'pimux_hello')!.clientId);
   await root1.primary.waitFor((record) => record.type === 'extension_ui_request' && record.method === 'notify' && record.message === 'picked:apple', 'apple', start);
+  assert.equal((await secondPicker).success, true);
 
   // Two dialogs at once take turns in the phone; neither answers the other with a cancel.
   start = root1.primary.mark();
-  root1.primary.send({ type: 'prompt', message: '/fx-two' });
+  const twoPickers = root1.primary.request({ type: 'prompt', message: '/fx-two' });
   await page.locator('.dialog-title', { hasText: 'Fruit one' }).waitFor();
   await root1.primary.waitFor((record) => record.type === 'extension_ui_request' && record.title === 'Fruit two', 'second dialog at once', start);
   await page.locator('.dialog-option', { hasText: 'pear' }).click();
   await page.locator('.dialog-title', { hasText: 'Fruit two' }).waitFor();
   await page.locator('.dialog-option', { hasText: 'plum' }).click();
   await root1.primary.waitFor((record) => record.type === 'extension_ui_request' && record.method === 'notify' && record.message === 'both:pear,plum', 'both answers', start);
+  assert.equal((await twoPickers).success, true);
 
   // A model chosen in Emacs reaches the tab, and reloading mid-reply resumes the stream exactly.
   assert.equal((await root1.primary.request({ type: 'set_model', provider: 'tau-fx-slow', modelId: 'one' })).success, true);
@@ -231,24 +240,25 @@ test('a socket frontend and a phone share one detached Pi through pimux and Tau'
   const moved = await (await page.request.get(`${base}/api/live-sessions`)).json() as { sessions: Array<{ sessionFile?: string }> };
   assert.notEqual(moved.sessions[0].sessionFile, root1.sessionFile);
 
-  // Closing the tab only detaches: Emacs keeps its Pi.
-  await page.locator('.live-tab.active .live-tab-close').click();
-  await until(async () => ((await (await page.request.get(`${base}/api/live-sessions`)).json()) as { sessions: unknown[] }).sessions.length === 0, 'tab closed');
-  assert.ok(discovery().some((record) => record.muxId === root1.muxId));
+  // Close stops the shared runtime without a prompt and removes both browser
+  // views as well as notifying the equal socket frontend.
   await root1.primary.request({ type: 'set_model', provider: 'tau-fx', modelId: 'one' });
-  await root1.primary.run('still mine');
-
-  // Reattach from the overview; when Emacs's Pi exits, the phone says so.
-  await page.locator('#agents-btn').click();
-  await panel.locator(`.agent-row[data-mux-id="${root1.muxId}"]`).click();
-  await assistantText(page, 'reply: still mine').waitFor();
+  await root1.primary.run('before closing');
+  const other = await context.newPage();
+  t.after(() => other.close());
+  await other.goto(base);
+  await assistantText(other, 'reply: before closing').waitFor();
   const piIdentity = readProcessIdentity(root1.receipt.piPid)!;
   assert.ok(piIdentity);
-  const stop = await stopRuntime(root1.muxId);
-  assert.equal(stop.state, 'stopped');
-  assert.equal(processIdentityStatus(piIdentity), 'dead');
-  await page.locator('.system-message', { hasText: 'This agent was closed in emacs.' }).waitFor();
-  await assistantText(page, 'reply: still mine').waitFor();
+  page.on('dialog', dialog => { void dialog.dismiss(); assert.fail('Close must not ask for confirmation'); });
+  await page.locator('.live-tab.active .live-tab-close').click();
+  await root1.primary.waitFor(record => record.type === 'pimux_exit', 'Close reaches the equal socket frontend');
+  await until(() => processIdentityStatus(piIdentity) === 'dead', 'Close waits for actual Pi exit');
+  await until(async () => ((await (await page.request.get(`${base}/api/live-sessions`)).json()) as { sessions: unknown[] }).sessions.length === 0, 'closed agent removed from Tau');
+  await page.locator('.live-tab').waitFor({ state: 'detached' });
+  await other.locator('.live-tab').waitFor({ state: 'detached' });
+  assert.equal(await other.evaluate(() => localStorage.getItem('tau-active-live-session-id')), null);
+  assert.ok(!discovery().some(record => record.muxId === root1.muxId));
   await shot(page, 'shared-exit');
 });
 
@@ -349,7 +359,7 @@ test('a shared tab offers advertised tree navigation and equal root actions, tit
   assert.ok(labels.includes('New session'));
   assert.ok(!labels.includes('Session tree'), labels.join());
   assert.ok(labels.includes('Take from Herdr…'));
-  assert.ok(labels.includes('Stop agent everywhere…'));
+  assert.ok(labels.includes('Close agent'));
   await page.keyboard.press('Escape');
 
   // The tab keeps the agent's name, whatever is said in it.
@@ -442,7 +452,7 @@ test('either frontend can create, leave zero clients, reattach and stop only by 
   assert.equal((await backToCreator.request({ type: 'get_state' })).success, true);
   await backToCreator.disconnect();
   assert.equal(processIdentityStatus(identity), 'alive');
-  const stoppedPeerRoot = await api.post(`${base}/api/agents/${fromPeer.muxId}/stop`, { data: { confirm: true, operationId: 'peer-origin-stop' } });
+  const stoppedPeerRoot = await api.post(`${base}/api/agents/${fromPeer.muxId}/stop`, { data: { operationId: 'peer-origin-close' } });
   assert.equal(stoppedPeerRoot.status(), 200);
   assert.equal((await stoppedPeerRoot.json() as { receipt: { state: string } }).receipt.state, 'stopped');
   assert.equal(processIdentityStatus(identity), 'dead');
@@ -467,12 +477,12 @@ test('either frontend can create, leave zero clients, reattach and stop only by 
   assert.equal(restored.runtime.piPid, receipt.piPid);
   const again = await peerFor(receipt);
   assert.equal((await again.request({ type: 'get_state' })).success, true);
-  const stopped = await api.post(`${base}/api/live-sessions/${restored.id}/stop`, { data: { confirm: true, operationId: 'tau-origin-stop' } });
+  const stopped = await api.post(`${base}/api/live-sessions/${restored.id}/stop`, { data: { operationId: 'tau-origin-close' } });
   assert.equal(stopped.status(), 200, await stopped.text());
   const terminal = (await stopped.json() as { receipt: { state: string } }).receipt;
   assert.equal(terminal.state, 'stopped');
   await again.waitFor(record => record.type === 'pimux_exit', 'stop reaches the equal socket peer');
   assert.equal(processIdentityStatus(tauIdentity), 'dead');
-  const repeated = await api.post(`${base}/api/agents/${receipt.muxId}/stop`, { data: { confirm: true, operationId: 'reconcile-stop' } });
+  const repeated = await api.post(`${base}/api/agents/${receipt.muxId}/stop`, { data: { operationId: 'reconcile-close' } });
   assert.deepEqual((await repeated.json() as { receipt: unknown }).receipt, terminal);
 });

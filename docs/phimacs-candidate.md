@@ -8,10 +8,12 @@ the full integration matrix and explicit publication approval.
 
 ## Reproducible package graph
 
-`vendor/manifest.json` records the exact compiled pimux and generic sound source
-revisions, archive hashes and licenses. Every internal dependency is a local
-archive with a locked integrity, never a registry-name fallback or sibling
-checkout. Package contents retain those archives, compiled JavaScript, optional
+`vendor/manifest.json` records compiled pimux, orchestration and generic sound
+archives, source provenance, hashes and licenses. Every internal dependency is a
+local archive with a locked integrity, never a registry-name fallback or sibling
+checkout. Orchestration's exact pimux requirement shares Tau's local archive;
+its Pi SDK peers share the existing locked host without additional root packages.
+Package contents retain those archives, compiled JavaScript, optional
 Pi extension source, browser fonts/highlighting and original notices. The npm pack
 is an input to the coordinated release graph, not a standalone offline installer:
 file dependencies require the included vendor directory to be extracted before
@@ -26,17 +28,34 @@ rejects stale, missing or unknown contexts instead of substituting the current
 file or branch. Sound is rebuilt from its pinned source and retains the same
 verified archive bytes when those inputs are unchanged.
 
-Rebuild the generic inputs with their explicit compile scripts, followed by
-`npm pack --ignore-scripts`. Record the resulting archive hash and source revision
-in `vendor/manifest.json`; replace the local dependency path and refresh the lock
-with `npm install --package-lock-only --ignore-scripts --offline --no-audit`.
-Review the lock diff so an internal archive update does not change unrelated
-package versions.
+The pimux and orchestration archives are compiled from the retained
+`phimacs-source-working-*.tgz` snapshot. `sourceArchiveSha256` identifies those
+exact dirty source bytes. `sourceBaseRevision` identifies only their Git base;
+`sourceDirty:true` means they do not correspond exactly to that commit. They
+therefore have no `sourceRevision`. Sound retains its committed source revision
+and unchanged archive, including its MIT license and Apache-2.0 sound notices.
+
+The vendor archives and retained snapshot select the reviewed stable root tree,
+including its PTY and deck integration. They remain dirty-tree development inputs;
+final committed-source archival and acquisition pins are still pending.
+
+To rebuild the dirty inputs, extract their source snapshot into an empty isolated
+directory, run `npm ci --ignore-scripts`, then run `npm run compile --workspace
+@phimacs/pimux` and `npm run compile --workspace pi-orchestration`. Run
+`npm pack --ignore-scripts` from each compiled package directory. Preserve the
+licenses, hash the resulting archives and record their exact source snapshot in
+`vendor/manifest.json`. Dependency paths must be relative `file:vendor/...tgz`
+specifiers, never temporary build paths. Refresh the existing lock with
+`npm install --package-lock-only --ignore-scripts --offline --no-audit` and review
+all existing registry versions, URLs and integrity hashes for unintended changes.
 
 Use `npm ci --ignore-scripts`, then explicit TypeScript compilation and the two
 asset-copy scripts. There is no install-time `prepare` hook. The runtime Pi SDK is
-exactly 1.4.0; pimux and sound share that physical host package. An installed-prefix
-check must verify this identity as well as Node execution below `node_modules`.
+exactly 1.4.0; pimux, orchestration and sound share that physical host package.
+`node --test test/vendor-inputs.test.ts` checks archive and source hashes, retained
+notices, packed public task APIs, installed bin files and common SDK resolution.
+The explicit native `test/e2e/worker-close-native.e2e.ts` lane checks final parent
+cleanup through a real worker using these installed packages.
 
 Configuration uses `--pi-command` / `TAU_PI_COMMAND` for one absolute supported
 release Pi; the default is the installed SDK entry. `PHIMACS_PI_VERSION` and
@@ -73,7 +92,10 @@ synthetic backends only; these are not paid-provider or live-deployment tests.
 - Tau/upstream declare MIT without a tracked license grant. Preserve attribution
   and obtain clarification before public redistribution; private work is not a
   blanket relicensing decision.
-- Final corresponding-source archives and public acquisition pins belong to the
-  coordinated release. Local commits and private hashes alone are not anonymous
-  installation or publication evidence. No public push or service change follows
-  from these tests.
+- Final archival remains pending. Commit the reviewed root and Tau source changes,
+  rebuild and retain their corresponding-source archives, then update the root's
+  committed fork/source acquisition pins. Dirty snapshot hashes are reproducible
+  development inputs, not committed revision pins or public acquisition evidence.
+  The root release pack already replaces these internal vendor edges through its
+  coordinated package map; no release pin can be updated before committed hashes
+  exist. No public push or service change follows from these tests.
