@@ -83,9 +83,9 @@
     "test:e2e": "bash scripts/e2e.sh"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "1.4.0",
-    "@phimacs/pimux": "file:vendor/phimacs-pimux-0.1.0-working-a880d9408769.tgz",
-    "pi-orchestration": "file:vendor/pi-orchestration-0.1.0-working-97c17d288d07.tgz",
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "@phimacs/pimux": "file:vendor/phimacs-pimux-0.1.0-943308be88ad.tgz",
+    "pi-orchestration": "file:vendor/pi-orchestration-0.1.0-c0ce15b13564.tgz",
     "pi-sound": "file:vendor/pi-sound-0.1.0.tgz",
     "ws": "8.21.3"
   },

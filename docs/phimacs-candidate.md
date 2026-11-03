@@ -28,30 +28,21 @@ rejects stale, missing or unknown contexts instead of substituting the current
 file or branch. Sound is rebuilt from its pinned source and retains the same
 verified archive bytes when those inputs are unchanged.
 
-The pimux and orchestration archives are compiled from the retained
-`phimacs-source-working-*.tgz` snapshot. `sourceArchiveSha256` identifies those
-exact dirty source bytes. `sourceBaseRevision` identifies only their Git base;
-`sourceDirty:true` means they do not correspond exactly to that commit. They
-therefore have no `sourceRevision`. Sound retains its committed source revision
-and unchanged archive, including its MIT license and Apache-2.0 sound notices.
+The pimux and orchestration archives are compiled from the committed Phimacs
+revision recorded in `vendor/manifest.json`. Its complete Git source archive is
+retained alongside the packs and verified by SHA-256. Unrelated working-tree
+changes are excluded. Sound retains its existing committed source and archive,
+including its MIT license and Apache-2.0 sound notices.
 
-The vendor archives and retained snapshot select the reviewed stable root tree,
-including its PTY and deck integration. They remain dirty-tree development inputs;
-final committed-source archival and acquisition pins are still pending.
-
-To rebuild the dirty inputs, extract their source snapshot into an empty isolated
-directory, run `npm ci --ignore-scripts`, then run `npm run compile --workspace
-@phimacs/pimux` and `npm run compile --workspace pi-orchestration`. Run
-`npm pack --ignore-scripts` from each compiled package directory. Preserve the
-licenses, hash the resulting archives and record their exact source snapshot in
-`vendor/manifest.json`. Dependency paths must be relative `file:vendor/...tgz`
-specifiers, never temporary build paths. Refresh the existing lock with
-`npm install --package-lock-only --ignore-scripts --offline --no-audit` and review
-all existing registry versions, URLs and integrity hashes for unintended changes.
+To reproduce the packs, extract the retained source archive, run
+`npm ci --ignore-scripts`, compile the pimux and orchestration workspaces, then run
+`npm pack --ignore-scripts` in each. The resulting archives reproduce byte-for-byte.
+Vendor dependencies use relative `file:vendor/...tgz` paths with locked integrity;
+no temporary build paths or dirty-source revision claims are retained.
 
 Use `npm ci --ignore-scripts`, then explicit TypeScript compilation and the two
 asset-copy scripts. There is no install-time `prepare` hook. The runtime Pi SDK is
-exactly 1.4.0; pimux, orchestration and sound share that physical host package.
+exactly 1.5.0; pimux, orchestration and sound share that physical host package.
 `node --test test/vendor-inputs.test.ts` checks archive and source hashes, retained
 notices, packed public task APIs, installed bin files and common SDK resolution.
 The explicit native `test/e2e/worker-close-native.e2e.ts` lane checks final parent
@@ -83,19 +74,16 @@ synthetic backends only; these are not paid-provider or live-deployment tests.
 
 ## External release gates
 
-- Pi 1.4.0 has unguarded internal storage paths. Managed claims protect cooperating
+- Pi 1.5.0 has unguarded internal storage paths. Managed claims protect cooperating
   launches and lease-mediated operations, not arbitrary raw Pi/editor I/O. No Pi
   fork is part of this candidate.
-- The official Pi 1.4.0 distribution contains bundled vulnerable dependencies.
-  External npm overrides do not patch embedded code. A reviewed owning fixed host
-  artifact is required before the complete Phimacs release can be accepted.
+- Pi 1.5.0 selects patched undici/minimatch dependencies. Actual bundled-host
+  security acceptance remains required; external npm audit alone is not proof.
+  The owning review is Phimacs's `docs/dependency-security.md`.
 - Tau/upstream declare MIT without a tracked license grant. Preserve attribution
   and obtain clarification before public redistribution; private work is not a
   blanket relicensing decision.
-- Final archival remains pending. Commit the reviewed root and Tau source changes,
-  rebuild and retain their corresponding-source archives, then update the root's
-  committed fork/source acquisition pins. Dirty snapshot hashes are reproducible
-  development inputs, not committed revision pins or public acquisition evidence.
-  The root release pack already replaces these internal vendor edges through its
-  coordinated package map; no release pin can be updated before committed hashes
-  exist. No public push or service change follows from these tests.
+- The complete release must use this candidate's committed source archive and
+  matching root acquisition pins. The root pack replaces internal vendor edges
+  through its coordinated package map. Final immutable-release acceptance remains
+  separate from source tests; no public push or service change follows from them.

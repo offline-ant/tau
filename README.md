@@ -60,7 +60,7 @@ Tau only disconnects its views.
 ## Install
 
 This is an unpublished Phimacs candidate, not the upstream npm package. It needs
-Linux, Node 24 and its exact Pi 1.4.0 host. The release installs the complete tested
+Linux, Node 24 and its exact Pi 1.5.0 host. The release installs the complete tested
 runtime; it does not use or modify an unrelated global Pi.
 
 For candidate development, reviewed compiled pimux, orchestration and generic sound
@@ -69,7 +69,7 @@ archives are included in `vendor/` and locked with integrity hashes. Run
 never builds or downloads assets through a lifecycle script. Orchestration supplies
 `pi-orchestration/worker-task` and the `phimacs-task-status` executable. See the
 [candidate input record](docs/phimacs-candidate.md) for retained source provenance
-and pending final archival. Public redistribution remains gated on the complete
+and committed source archives. Public redistribution remains gated on the complete
 release matrix and the upstream license clarification.
 
 ## Usage

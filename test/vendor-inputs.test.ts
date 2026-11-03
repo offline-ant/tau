@@ -9,9 +9,10 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { readWorkerTask } from 'pi-orchestration/worker-task';
 import { lookupTerminalReceipt } from '@phimacs/pimux/runtime';
+import { verifyHost } from '@phimacs/pimux/host';
 
 type Input = { name: string; version: string; file: string; sha256: string; license: string;
-  sourceRevision?: string; sourceBaseRevision?: string; sourceDirty?: boolean;
+  sourceRevision: string;
   sourceArchive?: string; sourceArchiveSha256?: string; sourceDirectory: string };
 const root = fileURLToPath(new URL('../', import.meta.url));
 const manifest = JSON.parse(fs.readFileSync(path.join(root, 'vendor/manifest.json'), 'utf8')) as { schema: number; inputs: Input[] };
@@ -45,9 +46,8 @@ test('candidate inputs are reviewed local archives with exact integrity and hone
     const entries = archiveFiles(input.file);
     assert.ok(entries.includes('package/LICENSE'), input.name);
     assert.ok(entries.includes('package/README.md'), input.name);
-    if (input.sourceDirty) {
-      assert.equal(input.sourceRevision, undefined, 'dirty bytes must not claim a committed source revision');
-      assert.match(input.sourceBaseRevision!, /^[a-f0-9]{40}$/);
+    assert.match(input.sourceRevision, /^[a-f0-9]{40}$/);
+    if (input.sourceArchive) {
       assert.equal(path.basename(input.sourceArchive!), input.sourceArchive);
       const source = fs.readFileSync(path.join(root, 'vendor', input.sourceArchive!));
       assert.equal(createHash('sha256').update(source).digest('hex'), input.sourceArchiveSha256);
@@ -55,8 +55,6 @@ test('candidate inputs are reviewed local archives with exact integrity and hone
       const sources = archiveFiles(input.sourceArchive!);
       for (const required of ['./LICENSE', './package-lock.json', `./${input.sourceDirectory}/scripts/compile.mjs`]) assert.ok(sources.includes(required), required);
       assert.ok(sources.every(file => !/(^|\/)(node_modules|dist|\.git)(\/|$)/.test(file)), 'source archive excludes installed and generated trees');
-    } else {
-      assert.match(input.sourceRevision!, /^[a-f0-9]{40}$/);
     }
   }
   for (const [name, entry] of Object.entries(lock.packages)) {
@@ -64,7 +62,7 @@ test('candidate inputs are reviewed local archives with exact integrity and hone
     if (entry.resolved?.startsWith('file:')) assert.match(entry.resolved, /^file:vendor\/[^/]+\.tgz$/);
     assert.ok(!name.startsWith('node_modules/pi-orchestration/node_modules/'), 'orchestration shares the locked host and pimux');
   }
-  assert.equal(pkg.dependencies['@earendil-works/pi-coding-agent'], '1.4.0');
+  assert.equal(pkg.dependencies['@earendil-works/pi-coding-agent'], '1.5.0');
   assert.ok(pkg.files.includes('vendor'));
   assert.equal(pkg.engines.node, '>=24.0.0');
   for (const hook of ['preinstall', 'install', 'postinstall', 'prepare']) assert.ok(!(hook in pkg.scripts), hook);
@@ -88,6 +86,7 @@ test('the orchestration archive includes public task APIs and its executable wit
 
 test('installed task APIs and npm bins use the same physical locked host after scripts-disabled hydration', () => {
   const host = fs.realpathSync(findPackageJSON('@earendil-works/pi-coding-agent', import.meta.url)!);
+  assert.equal(verifyHost(path.join(path.dirname(host), 'dist/bundle/cli.js')).version, '1.5.0');
   for (const entry of ['@phimacs/pimux/runtime', 'pi-orchestration/worker-task']) {
     assert.equal(fs.realpathSync(findPackageJSON('@earendil-works/pi-coding-agent', import.meta.resolve(entry))!), host);
   }
@@ -104,7 +103,7 @@ test('installed task APIs and npm bins use the same physical locked host after s
   } finally { fs.rmSync(directory, { recursive: true, force: true }); }
 });
 
-test('Tau packs the runtime, reviewed vendor archives and matching dirty source snapshot', () => {
+test('Tau packs the runtime, reviewed vendor archives and matching committed source archive', () => {
   const [pack] = JSON.parse(execFileSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts', '--offline'], { cwd: root, encoding: 'utf8', timeout: 10000 })) as Array<{ files: Array<{ path: string }> }>;
   const entries = new Set(pack.files.map(file => file.path));
   for (const file of ['bin/tau.js', 'bin/worker-task-evidence.js', 'vendor/manifest.json']) assert.ok(entries.has(file), file);
