@@ -6,10 +6,14 @@ import {
   setupHistoryE2E,
   skipUnlessBrowser,
   openPage,
+  openNestedPage,
   sessionItemSelector,
   assertNoPageErrors,
   liveManager,
   largeFile,
+  smallFile,
+  B_ROUNDS,
+  LAST_MARKER,
   ROUNDS,
   TOOL_EVERY,
   TOTAL_ITEMS,
@@ -90,14 +94,26 @@ test('tool results are paired onto their cards in both the newest and oldest chu
     { timeout: 60000 }
   );
 
+  // Port the fork's grouped chronology assertion without replacing upstream
+  // newest-first progressive loading with one blocking eager render.
+  const ordered = await page.locator('#messages > .message').evaluateAll(nodes => nodes.map(element => ({
+    user: element.classList.contains('user'), text: element.textContent || '',
+  })));
+  assert.equal(ordered.length, ROUNDS * 2);
+  assert.equal(await page.locator('#messages > .assistant-block').count(), ROUNDS);
+  assert.equal(await page.locator('.assistant-block .tool-card').count(), Math.ceil(ROUNDS / TOOL_EVERY));
   const pad = (i: number) => String(i).padStart(4, '0');
+  for (let round = 0; round < ROUNDS; round++) {
+    assert.equal(ordered[round * 2].user, true);
+    assert.match(ordered[round * 2].text, new RegExp(`msg-user-${pad(round)}`));
+    assert.equal(ordered[round * 2 + 1].user, false);
+    assert.match(ordered[round * 2 + 1].text, new RegExp(`msg-asst-${pad(round)}`));
+  }
   const lastToolRound = Math.floor((ROUNDS - 1) / TOOL_EVERY) * TOOL_EVERY;
   for (const round of [0, lastToolRound]) {
     const id = `tool-${pad(round)}`;
     const output = await page.evaluate((toolCallId: string) => {
       const card = document.querySelector(`.tool-card[data-tool-call-id="${toolCallId}"]`);
-      // A history card builds its output when it first opens.
-      card?.querySelector<HTMLElement>('.tool-card-header')?.click();
       return card?.querySelector('.tool-output')?.textContent ?? null;
     }, id);
     assert.equal(output, `tool-result-${pad(round)}`, `result missing on card ${id}`);
@@ -110,6 +126,120 @@ test('tool results are paired onto their cards in both the newest and oldest chu
     assert.match(await card.locator('.nested-calls-indicator').textContent() || '', /2 succeeded/);
   }
 
+  await assertNoPageErrors(errors);
+});
+
+test('grouped history expands, collapses and reopens without stale DOM or card references', async (t: TestContext) => {
+  if (skipUnlessBrowser(t)) return;
+  const { page, errors } = await openPage(t);
+  const openLarge = async () => {
+    await page.click(sessionItemSelector(largeFile));
+    await page.waitForFunction((expected: number) => document.querySelectorAll('#messages > .message').length === expected,
+      TOTAL_ITEMS, { timeout: 60000 });
+    assert.ok((await page.locator('#messages').textContent())?.includes(LAST_MARKER));
+  };
+  const command = async (label: string) => {
+    await page.click('#command-btn');
+    await page.getByText(label, { exact: true }).click();
+  };
+  await openLarge();
+  await command('Expand All Steps');
+  assert.equal(await page.locator('.assistant-block.expanded').count(), ROUNDS);
+  assert.equal(await page.locator('.assistant-block-item[data-label="text"]').first().isVisible(), true);
+  assert.equal(await page.locator('.tool-card-body').first().isVisible(), true);
+  await command('Collapse All Steps');
+  assert.equal(await page.locator('.assistant-block.expanded').count(), 0);
+  assert.equal(await page.locator('.assistant-block-item[data-label="text"]').first().isVisible(), false);
+  assert.equal(await page.locator('.tool-card-body').first().isVisible(), true, 'the final tool result remains readable');
+  await page.click(sessionItemSelector(smallFile));
+  await page.waitForFunction((expected: number) => document.getElementById('messages')?.textContent?.includes(`other-asst-${expected - 1}`), B_ROUNDS);
+  assert.equal(await page.locator('#messages > .message').count(), B_ROUNDS * 2);
+  assert.equal(await page.locator('.tool-card').count(), 0);
+  assert.ok(!/msg-user-|msg-asst-|tool-result-/.test(await page.locator('#messages').textContent() || ''));
+  await openLarge();
+  assert.equal(await page.locator('.tool-card[data-tool-call-id="tool-0000"] .tool-output').textContent(), 'tool-result-0000');
+  await command('Expand All Steps');
+  assert.equal(await page.locator('.assistant-block-item[data-label="text"]').first().isVisible(), true);
+  await command('Collapse All Steps');
+  assert.equal(await page.locator('.assistant-block-item[data-label="text"]').first().isVisible(), false);
+  await assertNoPageErrors(errors);
+});
+
+test('a completed grouped tool result remains reachable after reading older history', async (t: TestContext) => {
+  if (skipUnlessBrowser(t)) return;
+  const { page, errors } = await openPage(t);
+  await page.click(sessionItemSelector(largeFile));
+  await page.waitForFunction((expected: number) => document.querySelectorAll('#messages > .message').length === expected,
+    TOTAL_ITEMS, { timeout: 60000 });
+  await page.evaluate(() => document.getElementById('messages')!.scrollTo({ top: 0, behavior: 'instant' }));
+  await page.waitForSelector('#scroll-bottom-btn:not(.hidden)');
+  const session = liveManager.findBySessionFile(largeFile);
+  assert.ok(session);
+  const toolCallId = 'completed-large-tool';
+  const marker = 'completed-tool-final-line';
+  for (const event of [
+    { type: 'message_start', message: { role: 'user', content: 'Create the large file.' } },
+    { type: 'agent_start' },
+    { type: 'tool_execution_start', toolCallId, toolName: 'write', args: { path: '/tmp/large.txt', content: `${'argument line\n'.repeat(1000)}${marker}` } },
+    { type: 'tool_execution_end', toolCallId, result: { content: [{ type: 'text', text: 'File written.' }] }, isError: false },
+    { type: 'agent_end' },
+    { type: 'agent_settled' },
+  ]) liveManager.broadcast({ type: 'event', sessionId: session.id, event });
+  const card = page.locator(`.assistant-block .tool-card[data-tool-call-id="${toolCallId}"]`);
+  await card.waitFor();
+  assert.ok((await card.textContent())?.includes(marker));
+  assert.equal(await card.locator('.tool-card-body').isVisible(), true);
+  await page.click('#scroll-bottom-btn');
+  await page.waitForFunction(() => {
+    const messages = document.getElementById('messages')!;
+    return messages.scrollHeight - messages.scrollTop - messages.clientHeight < 10;
+  });
+  const position = await card.evaluate(element => {
+    const viewport = document.getElementById('messages')!.getBoundingClientRect();
+    const output = element.querySelector('.tool-output')!.getBoundingClientRect();
+    return { top: output.top, bottom: output.bottom, viewportTop: viewport.top, viewportBottom: viewport.bottom };
+  });
+  assert.ok(position.bottom > position.viewportTop && position.bottom <= position.viewportBottom + 1);
+  await assertNoPageErrors(errors);
+});
+
+test('thinking-only activity never leaks into text and final provider errors survive hidden thinking', async (t: TestContext) => {
+  if (skipUnlessBrowser(t)) return;
+  const { page, errors, broadcast } = await openNestedPage(t);
+  await page.click('#settings-btn');
+  await page.click('#toggle-show-thinking');
+  await page.click('#settings-close');
+  const emit = (event: unknown) => broadcast(event as JsonAgentSessionEvent);
+  const thinking = 'private thinking must not become final text';
+  emit({ type: 'message_start', message: { role: 'user', content: 'A thinking-only reply' } });
+  emit({ type: 'agent_start' });
+  emit({ type: 'message_start', message: { role: 'assistant', content: [] } });
+  emit({ type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', contentIndex: 0, delta: thinking } });
+  emit({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'thinking', thinking }] } });
+  emit({ type: 'agent_end' });
+  emit({ type: 'agent_settled' });
+  await page.locator('.thinking-content').last().waitFor({ state: 'attached' });
+  assert.equal(await page.locator('.thinking-content').last().isVisible(), false);
+  assert.ok(!(await page.locator('.assistant-step-content:not(.thinking-block)').allTextContents()).some(text => text.includes(thinking)));
+
+  emit({ type: 'message_start', message: { role: 'user', content: 'Try again' } });
+  emit({ type: 'agent_start' });
+  emit({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'retryable failure' } });
+  emit({ type: 'auto_retry_start', attempt: 1, maxAttempts: 3, delayMs: 1000, errorMessage: 'retryable failure' });
+  await page.locator('.retry-message').waitFor();
+  assert.equal(await page.locator('.message-error').count(), 0);
+  emit({ type: 'message_start', message: { role: 'assistant', content: [] } });
+  emit({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'thinking', thinking }], stopReason: 'error', errorMessage: 'final provider failure' } });
+  emit({ type: 'auto_retry_end', success: false, finalError: 'final provider failure' });
+  emit({ type: 'agent_end' });
+  assert.equal(await page.locator('.message-error').count(), 0, 'agent_end does not finalize failures before end hooks');
+  emit({ type: 'agent_settled' });
+  await page.locator('.message-error').waitFor();
+  assert.equal(await page.locator('.message-error').count(), 1);
+  assert.equal(await page.locator('.message-error-detail').textContent(), 'final provider failure');
+  assert.equal(await page.locator('.message-error').isVisible(), true, 'hidden thinking cannot hide the final error');
+  assert.equal(await page.locator('.retry-message').count(), 0);
+  assert.ok(!(await page.locator('.assistant-step-content:not(.thinking-block)').allTextContents()).some(text => text.includes(thinking)));
   await assertNoPageErrors(errors);
 });
 

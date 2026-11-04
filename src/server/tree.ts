@@ -3,7 +3,7 @@
  *
  * pi stores a session as an append-only JSONL tree (entries have id/parentId;
  * the current position is the "leaf"). pi's native RPC protocol only exposes
- * READ-ONLY tree commands (get_tree / get_entries) — there is no command that
+ * READ-ONLY session commands (get_tree / get_entries) — there is no command that
  * moves the leaf — so tau bundles a small pi extension
  * (src/pi-extension/tau-tree.ts, loaded into every child via `--extension`)
  * that registers a `/tau-tree-navigate <entryId>` command. The handler calls
@@ -16,10 +16,10 @@
  * visible to the model.
  *
  * navigateTree below drives that command over RPC: it resolves the target
- * from a preflight get_tree, sends the prompt, then re-fetches the tree to
+ * from a preflight get_entries, sends the prompt, then re-fetches the tree to
  * refresh session.entries and VERIFY the move — a handler error does not fail
  * the prompt response (pi reports it as an `extension_error` event instead),
- * so the follow-up get_tree is the real success check.
+ * so the follow-up get_entries is the real success check.
  *
  * Selection semantics mirror pi's /tree (docs/sessions.md "Selection
  * Behavior"); the extension delegates them to ctx.navigateTree, and tau
@@ -34,6 +34,7 @@
  */
 
 import type { JsonRecord, RpcCommand, RpcResponse } from './types.js';
+import type { InputContext } from '@phimacs/pimux/protocol';
 
 /**
  * Name of the slash command registered by tau's bundled pi extension.
@@ -48,7 +49,7 @@ export const NAVIGATE_COMMAND = 'tau-tree-navigate';
  */
 export const NAVIGATION_MARKER_TYPE = 'tau:navigate-tree';
 
-/** Loosely-typed session entry as stored in the JSONL file / returned by get_tree. */
+/** Loosely-typed session entry as stored in the JSONL file / returned by get_entries. */
 export type TreeEntry = {
   id: string;
   parentId: string | null;
@@ -59,7 +60,6 @@ export type TreeEntry = {
   [key: string]: unknown;
 };
 
-export type SessionTreeNodeLike = { entry: TreeEntry; children?: SessionTreeNodeLike[] };
 
 export type NavigationTarget = {
   /** Entry id the leaf should move to; null means reset to an empty conversation. */
@@ -92,17 +92,12 @@ export function selectNavigationTarget(entry: TreeEntry): NavigationTarget {
   return { leafTargetId: entry.id };
 }
 
-/** Flatten get_tree nodes (possibly multiple roots) into an id → entry map. */
-export function flattenTree(nodes: SessionTreeNodeLike[] | undefined | null): Map<string, TreeEntry> {
-  const byId = new Map<string, TreeEntry>();
-  const stack = [...(nodes || [])];
-  while (stack.length) {
-    const node = stack.pop();
-    if (!node || !node.entry || typeof node.entry.id !== 'string') continue;
-    byId.set(node.entry.id, node.entry);
-    if (node.children && node.children.length) stack.push(...node.children);
-  }
-  return byId;
+/**
+ * Index a session's flat entries by id. Tau reads entries flat because Pi's
+ * get_tree nests one level per entry, which a long session cannot serialize.
+ */
+export function entriesById(entries: TreeEntry[] | undefined | null): Map<string, TreeEntry> {
+  return new Map((entries || []).map((entry) => [entry.id, entry]));
 }
 
 /** Walk root→leaf along parentId links; returns [] for a null/unknown leaf. */
@@ -141,7 +136,7 @@ export type NavigableSession = {
   entries: JsonRecord[];
   historyEpoch: number;
   send: (command: RpcCommand, opts?: { timeoutMs?: number }) => Promise<RpcResponse>;
-  snapshot: () => JsonRecord;
+  snapshot: () => JsonRecord | Promise<JsonRecord>;
   manager: { broadcast: (data: unknown) => void; broadcastUpdated: (id: string) => void };
   /**
    * Last `extension_error` event text reported by the pi child (set by
@@ -193,7 +188,7 @@ async function assertNavigateCommandAvailable(session: NavigableSession): Promis
 
 /**
  * Full navigate_tree flow for a live session: resolve the target from a
- * preflight get_tree, have the child move its leaf in-process via the bundled
+ * preflight get_entries, have the child move its leaf in-process via the bundled
  * extension's /tau-tree-navigate command, re-fetch the tree to confirm the
  * move, refresh session.entries to the new active path, and broadcast a fresh
  * `live_session_snapshot` (plus `live_session_updated`) so every connected
@@ -208,7 +203,7 @@ async function assertNavigateCommandAvailable(session: NavigableSession): Promis
  * (leaf verification fails) the clients are re-synced to the child's real
  * state before the error is reported.
  */
-export async function navigateTree(session: NavigableSession, entryId: string): Promise<{ editorText?: string }> {
+export async function navigateTree(session: NavigableSession, entryId: string, inputContext?: InputContext): Promise<{ editorText?: string }> {
   if (navigationsInFlight.has(session.id)) {
     throw new Error('Another tree navigation for this session is already in progress');
   }
@@ -219,12 +214,12 @@ export async function navigateTree(session: NavigableSession, entryId: string): 
     // unknown ids), detect no-ops, and derive editorText locally — RPC-mode
     // extensions cannot fill the client's editor, and the /tau-tree-navigate
     // prompt response cannot carry handler data.
-    let treeResp = await session.send({ type: 'get_tree' }, { timeoutMs: 15000 });
+    let treeResp = await session.send({ type: 'get_entries' }, { timeoutMs: 15000 });
     if (treeResp.success === false) {
       throw new Error(`pi did not answer the pre-navigation tree check: ${treeResp.error || 'unknown error'}`);
     }
-    let treeData = (treeResp.data || {}) as { tree?: SessionTreeNodeLike[]; leafId?: string | null };
-    let byId = flattenTree(treeData.tree);
+    let treeData = (treeResp.data || {}) as { entries?: TreeEntry[]; leafId?: string | null };
+    let byId = entriesById(treeData.entries);
     const entry = byId.get(entryId);
     if (!entry) throw new Error(`Entry ${entryId} not found in the session tree`);
     const target = selectNavigationTarget(entry);
@@ -242,14 +237,15 @@ export async function navigateTree(session: NavigableSession, entryId: string): 
     // ctx.isIdle() as the authoritative guard).
     assertNotStreaming(session);
     session.lastExtensionError = null;
-    const prompted = await session.send({ type: 'prompt', message: `/${NAVIGATE_COMMAND} ${entryId}` }, { timeoutMs: 30000 });
+    const prompted = await session.send({ type: 'prompt', message: `/${NAVIGATE_COMMAND} ${entryId}`,
+      ...(inputContext ? { pimuxContext: inputContext } : {}) }, { timeoutMs: 30000 });
     if (prompted.success === false) {
       throw new Error(`pi refused the tree-navigation command: ${prompted.error || 'unknown error'}`);
     }
     // The prompt ack only means the handler ran — its errors surface as
     // `extension_error` events, not as a failed response — so the follow-up
-    // get_tree is the real success check.
-    treeResp = await session.send({ type: 'get_tree' }, { timeoutMs: 30000 });
+    // get_entries is the real success check.
+    treeResp = await session.send({ type: 'get_entries' }, { timeoutMs: 30000 });
     if (treeResp.success === false) {
       // The child MAY have moved its leaf; we just cannot re-derive the
       // entries. At least nudge clients so they refetch metadata instead of
@@ -257,15 +253,14 @@ export async function navigateTree(session: NavigableSession, entryId: string): 
       session.manager.broadcastUpdated(session.id);
       throw new Error(`pi could not report the session tree after navigating: ${treeResp.error || 'unknown error'}`);
     }
-    treeData = (treeResp.data || {}) as { tree?: SessionTreeNodeLike[]; leafId?: string | null };
-    byId = flattenTree(treeData.tree);
+    treeData = (treeResp.data || {}) as { entries?: TreeEntry[]; leafId?: string | null };
+    byId = entriesById(treeData.entries);
     const newLeafId = treeData.leafId ?? null;
     // Refresh entries and broadcast BEFORE verifying the leaf: at this point
     // the child is authoritative, so even when verification fails below every
     // client must be re-rendered onto whatever the child actually has.
-    session.entries = pathFromRoot(byId, newLeafId) as unknown as JsonRecord[];
-    session.historyEpoch++;
-    session.manager.broadcast({ type: 'live_session_snapshot', sessionId: session.id, ...session.snapshot() });
+    // The mux snapshot, not this independent read, owns the history boundary.
+    session.manager.broadcast({ type: 'live_session_snapshot', sessionId: session.id, ...await session.snapshot() });
     session.manager.broadcastUpdated(session.id);
     // On success the extension appended a marker at the navigation target and
     // that marker IS the child's new leaf (no reload happens, so nothing else

@@ -4,45 +4,49 @@
 
 import { WebSocketClient } from './websocket-client.js';
 import { StateManager } from './state.js';
+import { clearSessionLinkHash, SessionLink } from './session-link.js';
 import { MessageRenderer } from './message-renderer.js';
-import { ToolCardRenderer, type ToolCardState, type ToolExecution, type ToolResult } from './tool-card.js';
+import { ToolCardRenderer, type ToolResult } from './tool-card.js';
 import { attachCompletionList } from './completion-list.js';
 import { modelMeta, modelRef, normalizeModelList, searchModels } from './model-match.js';
+import { AssistantBlocks } from './assistant-blocks.js';
 import { DialogHandler, type DialogRequest } from './dialogs.js';
-import { SessionSidebar, type SidebarProject, type SidebarSession } from './session-sidebar.js';
-import { themes, applyTheme, getCurrentTheme } from './themes.js';
+import { SessionSidebar, type SidebarSession } from './session-sidebar.js';
+import { themes, applyTheme, chooseTheme, getCurrentTheme, type ThemeId } from './themes.js';
 import { FileBrowser, getFileIcon } from './file-browser.js';
 import { setupLauncherPanel } from './launcher-panel.js';
 import { setupModelPicker } from './model-picker.js';
 import { setupTreeView } from './tree-view.js';
-import { setupVoiceInput } from './voice-input.js';
+import { setupVoiceInput, type VoiceInput } from './voice-input.js';
 import { setupCommandPalette } from './command-palette.js';
 import { setupSessionStatsCard, type SessionStats } from './session-stats-card.js';
 import { isImeComposition } from './keyboard.js';
-import { buildHistoryItems, type HistoryItem, type SessionHistoryEntry } from './history-render.js';
+import { buildHistoryItems, messageImages, type HistoryItem, type SessionHistoryEntry } from './history-render.js';
 import { parseCompactCommand } from './compact-command.js';
 import { formatElapsed, renderCompactionRow, type CompactionRowState, type SummaryRetry } from './compaction-row.js';
+import { setupAgentsPanel, type OverviewAgent } from './agents-panel.js';
+import { UnsentInputStore, copyInputContext, runtimeInputContext, sameContext, type CommandTarget, type InputContext, type UnsentInput } from './unsent-input.js';
 
-import type { AppEvent, AppMessage, ExtensionUIRequest, InteractionState, LiveSession, MessageContentBlock, ModelRecord, PendingDialog, PendingFilePath, PendingImage, QueuedCommand, RpcCommand, UsageRecord } from './app-types.js';
+import type { AppEvent, AppMessage, AssistantStep, ExtensionUIRequest, InteractionState, LiveInstance, LiveSession, MessageContentBlock, ModelRecord, PendingDialog, PendingFilePath, PendingImage, QueuedCommand, RpcCommand, UsageRecord } from './app-types.js';
+
+type CompactionResult = { summary?: string; tokensBefore?: number; estimatedTokensAfter?: number };
+type RunningCompaction = Extract<CompactionRowState, { status: 'running' }>;
 
 type LiveSessionSnapshotData = {
   sessionId?: string;
   sessionFile?: string | null;
+  leafId?: string | null;
   session?: LiveSession;
   isStreaming?: boolean;
   model?: ModelRecord | null;
   thinkingLevel?: string;
   entries?: SessionHistoryEntry[];
-  /** Where `entries` begins in the session's history, when only its newest part was sent. */
-  entriesStart?: number;
-  historyEpoch?: number;
   pendingDialogs?: PendingDialog[];
   interactionRevision?: number;
-  compaction?: LiveSession['compaction'];
+  /** Attached tabs: the pimux boundary this snapshot describes, and its open dialogs. */
+  generation?: number;
+  dialogs?: AppEvent[];
 };
-
-type CompactionResult = { summary?: string; tokensBefore?: number; estimatedTokensAfter?: number };
-type RunningCompaction = Extract<CompactionRowState, { status: 'running' }>;
 
 type RpcEventDetail = { sessionId?: string; event?: AppEvent };
 
@@ -55,9 +59,13 @@ const state = new StateManager();
 // of <body>). A missing element means the page is structurally broken, so we
 // assert non-null at the query site rather than guarding every usage.
 const messageRenderer = new MessageRenderer(document.getElementById('messages')!);
-const toolCardRenderer = new ToolCardRenderer(document.getElementById('messages')!);
+const toolCardRenderer = new ToolCardRenderer(document.getElementById('messages')!, true);
 const dialogHandler = new DialogHandler(document.getElementById('dialog-container')!, {
   async send(command) {
+    const captured = command as RpcCommand;
+    if (!captured.sessionId || !captured.inputContext || !commandContextIsCurrent(captured.sessionId, captured.inputContext as InputContext)) {
+      throw new Error('The dialog conversation is no longer ready. Refresh it before answering.');
+    }
     const response = await fetch('/api/rpc', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(command),
     });
@@ -65,13 +73,40 @@ const dialogHandler = new DialogHandler(document.getElementById('dialog-containe
     if (!response.ok || !data.success) throw new Error(data.error || 'Could not send response. Please retry.');
   },
 }, () => activeLiveSessionId);
+let focusedDialog: HTMLElement | null = null;
+document.addEventListener('focusin', event => {
+  const target = event.target;
+  // Disabling the chosen answer can release focus to the body before the mux
+  // confirms closure. A later focused control, unlike that neutral blur, owns it.
+  if (!(target instanceof Element) || target === document.body || target === document.documentElement) return;
+  const dialog = dialogHandler.currentDialog;
+  focusedDialog = dialog?.contains(target) ? dialog : null;
+});
+
+function clearResolvedDialog() {
+  const dialog = dialogHandler.currentDialog;
+  const ownedFocus = !!dialog && (dialog.contains(document.activeElement) || focusedDialog === dialog);
+  dialogHandler.clearCurrentDialog();
+  focusedDialog = null;
+  return ownedFocus;
+}
+
+const assistantBlocks = new AssistantBlocks(document.getElementById('messages')!);
+const assistantBlockControllers = new Set([assistantBlocks]);
+let expandedAssistantBlocks = false;
 
 // Session sidebar
 const sidebar = new SessionSidebar(
   document.getElementById('session-list')!,
   handleSessionSelect,
-  (project) => openNewLiveSessionModal(project.path)
+  (cwd) => openNewLiveSessionModal(cwd),
+  (message) => flashStatusError(message, 6000),
+  file => {
+    const session = liveSessions.find(session => session.sessionFile === file);
+    return session ? captureCommandTarget(session.id) : null;
+  },
 );
+sidebar.onRendered = () => updateLiveSessionIndicators();
 
 // UI elements
 const messageInput = document.getElementById('message-input')!;
@@ -100,12 +135,13 @@ function restoreStatusIndicator() {
     open && state.isStreaming ? 'streaming' : (open ? 'connected' : 'disconnected')
   }`;
 }
-// Set a transient statusText message and schedule its restore. Cancels any
+// Set a transient statusText message and, with `restoreMs`, schedule the
+// return to the real connection state. Cancels any
 // previously scheduled restore so overlapping messages cannot race. A new
 // status message also supersedes any active error flash: it cancels the
 // flash's restore and returns the dot to its real state so the `error`
 // class cannot linger with no timer to clear it.
-function setStatusMessage(text: string, restoreText: string | null = null, restoreMs = 3000) {
+function setStatusMessage(text: string, restoreMs: number | null = null) {
   if (statusFlashTimer !== null) {
     clearTimeout(statusFlashTimer);
     statusFlashTimer = null;
@@ -113,7 +149,7 @@ function setStatusMessage(text: string, restoreText: string | null = null, resto
   }
   clearTimeout(statusRestoreTimer ?? undefined);
   statusText.textContent = text;
-  if (restoreText !== null) {
+  if (restoreMs !== null) {
     statusRestoreTimer = setTimeout(() => {
       statusRestoreTimer = null;
       statusText.textContent = currentStatusText();
@@ -152,7 +188,7 @@ const sidebarToggle = document.getElementById('sidebar-toggle')!;
 const sidebarOverlay = document.getElementById('sidebar-overlay')!;
 
 const refreshSessionsBtn = document.getElementById('refresh-sessions-btn')!;
-const sessionSearchInput = document.getElementById('session-search-input')!;
+const sessionSearchInput = document.getElementById('session-search-input') as HTMLInputElement;
 const typingIndicator = document.getElementById('typing-indicator')!;
 
 const contextPillEl = document.getElementById('context-pill')!;
@@ -162,7 +198,17 @@ const messagesContainer = document.getElementById('messages')!;
 const launcherPanel = setupLauncherPanel({
   launcherEl: document.getElementById('launcher')!,
   messagesContainer,
+  selectView(kind) {
+    beginViewSelection();
+    bindComposerContext(null);
+    if (kind === 'chat') restoreActiveLiveSession();
+    else {
+      viewingActiveSession = false;
+      updateLiveSessionInputState();
+    }
+  },
   async createSession(projectPath) {
+    const selection = beginViewSelection();
     try {
       const res = await fetch('/api/live-sessions', {
         method: 'POST',
@@ -171,8 +217,8 @@ const launcherPanel = setupLauncherPanel({
       });
       const data = await res.json();
       if (data.session) {
-        upsertLiveSession(data.session);
-        await selectLiveSession(data.session.id);
+        rememberOpenedSession(data.session);
+        if (selection === viewSelection) await selectLiveSession(data.session.id, true, selection);
       }
     } catch (e) {
       console.error('[Launcher] Failed to create Tau tab:', e);
@@ -181,28 +227,24 @@ const launcherPanel = setupLauncherPanel({
 });
 
 // State tracking
-let currentStreamingElement: HTMLElement | null = null;
-let currentStreamingText = '';
-let currentStreamingThinking = '';
-// Queued messages wait until the conversation and its current status are restored.
-let applyingMissedEvents = false;
-// A failed assistant reply is kept here until the whole turn settles. Pi may
-// still retry it, and an error the user never saw as final should not appear.
-type PendingAssistantError = { element: HTMLElement | null; errorMessage: string };
-let pendingAssistantError: PendingAssistantError | null = null;
+const currentMessageSteps = new Map<number, HTMLElement>();
+// A failed reply may still be replaced by Pi's retries before agent_settled.
+let pendingAssistantError: { errorMessage: string } | null = null;
 let retryStatusElement: HTMLElement | null = null;
 let sessionTotalCost = 0;
-// True once Pi's own session stats set sessionTotalCost. Costs found in older
-// history loaded after that are already part of it.
-let costFromStats = false;
 let lastInputTokens = 0;
 // True while lastInputTokens is Pi's estimate after a compaction. The next
 // reply that reports usage replaces it with a real count.
 let contextTokensEstimated = false;
 // The transcript row of the compaction running in the viewed tab.
-type CompactionRowRef = { element: HTMLElement; state: RunningCompaction };
-let compactionRow: CompactionRowRef | null = null;
+let compactionRow: { element: HTMLElement; state: RunningCompaction } | null = null;
 let compactionElapsedTimer: ReturnType<typeof setInterval> | null = null;
+// Tabs that asked Pi to compact and have not seen it start yet. They count as
+// compacting, so a message sent in that gap is queued instead of rejected.
+const compactRequests = new Set<string>();
+// Counts compaction_start events per tab, so a compact request can tell
+// whether Pi began compacting before it failed.
+const compactionStarts = new Map<string, number>();
 let contextWindowSize = 0;  // fetched from model info
 let originalTitle = document.title;
 let hasFocus = true;
@@ -214,11 +256,33 @@ let lastUsage: UsageRecord | null = null; // Full usage object for context visua
 let activeLiveSessionFile: string | null = null; // The active live session file path
 let viewingActiveSession = false; // Whether we're viewing a live backend Tau tab or historical read-only session
 let hasReceivedInitialServerState = false;
+let liveInstances: LiveInstance[] = []; // Sidebar live indicators derived from backend live sessions
 let liveSessions: LiveSession[] = [];
+const closedLiveSessionIds = new Set<string>();
+// HTTP lists cannot replace a tab list changed by socket events or another read.
+let liveSessionsRevision = 0;
+let connectionRevision = 0;
 let activeLiveSessionId = localStorage.getItem('tau-active-live-session-id') || null;
+let voiceInput: VoiceInput | null = null;
+let takeRequest: { id: string; sessionId: string } | null = null;
 let hasRestoredInitialLiveSession = false;
+const sessionLink = new SessionLink(location.hash);
+// Every explicit choice, even A -> B -> A, retires the previous view's reads.
+let viewSelection = 0;
+function beginViewSelection(explicit = true) {
+  ++viewSelection;
+  if (explicit) reattachMuxId = null;
+  stopFollowing();
+  return viewSelection;
+}
+// A URL selects a view, not permission to submit that tab's queued input.
+let resumeQueuedInput = true;
 let pendingExtensionUIRequests: ExtensionUIRequest[] = []; // background notifications only
 const interactionStates = new Map<string, InteractionState>();
+// Native Pi dialogs use Tau's revisioned registry. Attached Pi dialogs use
+// mux membership instead: only a newer snapshot or dialog_closed removes one.
+const sharedDialogs = new Map<string, Map<string, AppEvent>>();
+const sharedDialogGenerations = new Map<string, number>();
 const operationRevisions = new Map<string, number>();
 const sessionStateRevisions = new Map<string, number>();
 const abortRequests = new Map<string, Promise<void>>();
@@ -235,15 +299,19 @@ type QueuedDispatch = {
   retryTimer?: ReturnType<typeof setTimeout>;
 };
 const queuedPrompts = new Map<string, QueuedDispatch>();
-// Tabs that asked Pi to compact and have not seen it start yet. They count as
-// compacting, so a message sent in that gap is queued instead of rejected.
-const compactRequests = new Set<string>();
-// Counts compaction_start events per tab, so a compact request can tell
-// whether Pi began compacting before it failed.
-const compactionStarts = new Map<string, number>();
-// WebSocket prompts by command id, so a rejection can be shown in its tab.
-const sentPrompts = new Map<string, string>();
-dialogHandler.onIdle = () => processQueuedExtensionUIRequest();
+const DIALOG_METHODS = new Set(['select', 'confirm', 'input', 'editor']);
+/** Extension UI for a terminal's chrome; Tau has no place for it, and it asks nothing of the user. */
+const DISPLAY_UI_METHODS = new Set(['setStatus', 'setWidget', 'setTitle', 'set_editor_text']);
+let reattachMuxId: string | null = null; // The shared agent on screen when Tau went away
+const editorNoticeIds = new Map<string, number>();
+const piQueues = new Map<string, { steering: string[]; followUp: string[] }>(); // Prompts Pi holds, by Tau tab
+const sidebarFiles = new Set<string>(); // Session files whose first turn the sidebar has been refreshed for
+let sidebarRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+let agentSessionFiles = '';
+dialogHandler.onIdle = () => {
+  processQueuedExtensionUIRequest();
+  focusComposer();
+};
 
 // File browser
 const fileSidebar = document.getElementById('file-sidebar')!;
@@ -356,6 +424,29 @@ function scrollToBottom() {
   messagesContainer.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'smooth' });
 }
 
+// An on-screen keyboard shrinks only the visual viewport where the browser
+// does not resize the layout (Chrome in fullscreen, iOS Safari). Fit the app to
+// the visible area so the composer stays above the keyboard, keeping the latest
+// message in view. Pinch zoom also shrinks the visual viewport; ignore it.
+const visibleViewport = window.visualViewport;
+if (visibleViewport) {
+  const rootStyle = document.documentElement.style;
+  const fitVisibleViewport = () => {
+    const keepBottom = !isScrolledUp;
+    if (Math.abs(visibleViewport.scale - 1) < 0.01) {
+      rootStyle.setProperty('--visible-height', `${visibleViewport.height}px`);
+      rootStyle.setProperty('--visible-top', `${visibleViewport.offsetTop}px`);
+    } else {
+      rootStyle.removeProperty('--visible-height');
+      rootStyle.removeProperty('--visible-top');
+    }
+    if (keepBottom) messagesContainer.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'instant' });
+  };
+  visibleViewport.addEventListener('resize', fitVisibleViewport);
+  visibleViewport.addEventListener('scroll', fitVisibleViewport);
+  fitVisibleViewport();
+}
+
 function showNewMessageBadge() {
   if (isScrolledUp) {
     hasNewWhileScrolled = true;
@@ -368,6 +459,7 @@ function showNewMessageBadge() {
 // ═══════════════════════════════════════
 
 wsClient.addEventListener('connected', () => {
+  ++connectionRevision;
   updateConnectionStatus('connected');
   // Fetch model context window size for token % display
   setTimeout(fetchContextWindow, 1000);
@@ -378,11 +470,19 @@ wsClient.addEventListener('connected', () => {
 });
 
 wsClient.addEventListener('disconnected', () => {
+  ++connectionRevision;
+  // HTTP polling or an old tab's 404 can arrive before the replacement
+  // server's first state. Remember the runtime while its tab still exists.
+  const selected = viewingActiveSession ? liveSessions.find(session => session.id === activeLiveSessionId) : null;
+  if (selected?.attached) reattachMuxId ??= selected.attached.muxId;
   updateConnectionStatus('disconnected');
-  // Any conversation may miss messages until the connection returns.
-  // The shown conversation needs a fresh snapshot before it can be saved.
-  parkedViews.clear();
-  activeViewReady = false;
+  // Their acknowledgements went to this socket and can never arrive.
+  unsentInput.keepInFlight();
+  if (takeRequest) {
+    takeRequest = null;
+    updateLiveSessionInputState();
+    flashStatusError('Connection lost during takeover. Reconnect and check the tab before trying again.', 8000);
+  }
 });
 
 wsClient.addEventListener('reconnectFailed', () => {
@@ -394,6 +494,47 @@ wsClient.addEventListener('rpcEvent', (e: Event) => {
   const detail = (e as CustomEvent<RpcEventDetail>).detail || {};
   const event = (detail.event || detail) as AppEvent;
   const sessionId = detail.sessionId;
+  if (sessionId && event.type === 'pimux_editor_text' && typeof event.text === 'string') {
+    const session = liveSessions.find(session => session.id === sessionId);
+    if (!session) return;
+    const context = inputContexts.get(sessionId) || inputContextOf(session);
+    const agentId = session.attached?.muxId || session.id;
+    const noticeId = typeof event.noticeId === 'number' ? event.noticeId : undefined;
+    if (noticeId !== undefined && noticeId <= (editorNoticeIds.get(agentId) || 0)) return;
+    if (noticeId !== undefined) editorNoticeIds.set(agentId, noticeId);
+    unsentInput.keep({ agentId: context.agentId, file: typeof event.sessionFile === 'string' ? event.sessionFile : null, leafId: undefined, runtimeContext: null }, { text: event.text, images: [] });
+    restoreUnsentInput();
+    return;
+  }
+  // pimux closes a shared dialog however it ended, in every browser.
+  if (sessionId && event.type === 'pimux_dialog_closed') {
+    closeSharedDialog(sessionId, String(event.id));
+    return;
+  }
+  if (sessionId && event.type === 'shared_queue_cleared') {
+    piQueues.set(sessionId, { steering: [], followUp: [] });
+    if (sessionId === activeLiveSessionId) renderQueuedMessages();
+    return; // The broadcast never returns the requester's recovered text to other clients.
+  }
+  if (sessionId && event.type === 'pimux_session_changed' && sessionId === activeLiveSessionId && viewingActiveSession) {
+    setStatusMessage('The shared session moved to another conversation', 4000);
+  }
+  if (takeRequest?.sessionId === sessionId && sessionId === activeLiveSessionId && viewingActiveSession) {
+    // A handled command can still report failure through the extension UI.
+    // Keep that structured error in the status bar through snapshot redraws.
+    if (event.type === 'extension_error') flashStatusError(String(event.error), 8000);
+    if (event.type === 'extension_ui_request' && event.method === 'notify' && event.notifyType === 'error') {
+      flashStatusError(String(event.message), 8000);
+    }
+  }
+  if (takeRequest && takeRequest.sessionId === sessionId && event.type === 'response' && event.id === takeRequest.id) {
+    // The server publishes its authoritative snapshot before this actual
+    // completion, even when HTTP already acknowledged a prompt timeout.
+    takeRequest = null;
+    updateLiveSessionInputState();
+    if (event.success !== true) flashStatusError(String(event.error || 'Session takeover failed.'));
+  }
+  if (event.type === 'response' && typeof event.id === 'string') settlePrompt(event.id, event.success !== false, event.error);
   if (sessionId) {
     sessionStateRevisions.set(sessionId, (sessionStateRevisions.get(sessionId) || 0) + 1);
     const session = liveSessions.find(s => s.id === sessionId);
@@ -421,6 +562,7 @@ wsClient.addEventListener('rpcEvent', (e: Event) => {
       if (event.type === 'agent_settled') session.isStreaming = false;
       if (event.type === 'compaction_start') {
         session.compaction = { reason: String(event.reason || 'manual'), startedAt: Date.now() };
+        // A reply can compact before agent_start; only agent_settled ends it.
         if (event.reason === 'threshold' || event.reason === 'overflow') session.isStreaming = true;
       }
       if (event.type === 'compaction_end') session.compaction = null;
@@ -430,34 +572,30 @@ wsClient.addEventListener('rpcEvent', (e: Event) => {
         treeViewController.notifyStreamingChanged(sessionId, !!session.isStreaming);
       }
       if (event.type === 'session_name' && event.name) session.sessionName = event.name;
-      if ((event.message as AppMessage)?.role === 'assistant' && (event.message as AppMessage)?.usage) {
-        session.contextUsage = { ...(session.contextUsage || {}), usage: (event.message as AppMessage).usage };
+      if (event.type === 'queue_update') {
+        piQueues.set(sessionId, { steering: (event.steering as string[]) ?? [], followUp: (event.followUp as string[]) ?? [] });
+        if (sessionId === activeLiveSessionId) renderQueuedMessages();
       }
+      // A first prompt is what writes a new session's file.
+      if (event.type === 'agent_end' && session.sessionFile && !sidebarFiles.has(session.sessionFile)) {
+        sidebarFiles.add(session.sessionFile);
+        scheduleSidebarRefresh();
+      }
+      if ((event.message as AppMessage)?.role === 'assistant' && (event.message as AppMessage)?.usage) session.contextUsage = { ...(session.contextUsage || {}), usage: (event.message as AppMessage).usage };
       renderLiveTabs();
     }
     if (sessionId !== activeLiveSessionId || !viewingActiveSession) {
-      if (event.type === 'extension_ui_request') queueExtensionUIRequest(event, sessionId);
-      bufferParkedEvent(sessionId, event);
+      if (event.type === 'extension_ui_request' && !DISPLAY_UI_METHODS.has(String(event.method))) queueExtensionUIRequest(event, sessionId);
       return;
     }
   }
   handleRPCEvent(event, sessionId);
 });
 
-// Replies to prompts sent over the WebSocket. A rejected message must never
-// look sent without a word, for example when Pi is busy compacting.
+// Tau answers the sender on its socket even when no Pi ever saw the command.
 wsClient.addEventListener('rpcResponse', (e: Event) => {
-  const response = (e as CustomEvent<{ id?: string; command?: string; success?: boolean; error?: string; delivery?: string }>).detail || {};
-  if (response.command !== 'prompt') return;
-  const sessionId = response.id ? sentPrompts.get(response.id) : undefined;
-  if (response.id) sentPrompts.delete(response.id);
-  if (response.success !== false) return;
-  const reason = response.error || 'Pi did not accept the message';
-  const text = response.delivery === 'uncertain'
-    ? `The message may not have been sent: ${reason}`
-    : `The message was not sent: ${reason}`;
-  if (!sessionId || (viewingActiveSession && sessionId === activeLiveSessionId)) messageRenderer.renderError(text);
-  else flashStatusError(text, 5000);
+  const { id, success, error } = (e as CustomEvent<{ id?: unknown; success?: boolean; error?: string }>).detail;
+  if (typeof id === 'string') settlePrompt(id, success !== false, error);
 });
 
 wsClient.addEventListener('serverError', (e: Event) => {
@@ -465,16 +603,35 @@ wsClient.addEventListener('serverError', (e: Event) => {
 });
 
 wsClient.addEventListener('stateUpdate', (e: Event) => {
-  const detail = (e as CustomEvent<{ liveSessions?: LiveSession[] }>).detail;
+  const detail = (e as CustomEvent<{ liveSessions?: LiveSession[]; agents?: OverviewAgent[] }>).detail;
   const wasViewingLive = viewingActiveSession;
   const launcherVisible = launcherPanel.isVisible();
+  const firstState = !hasReceivedInitialServerState;
   hasReceivedInitialServerState = true;
+  // A restarted Tau has no tabs: the shared agents behind them may well run on.
+  const remaining = new Set((detail.liveSessions || []).map(session => session.id));
+  for (const session of liveSessions.filter(item => !remaining.has(item.id))) {
+    if (viewingActiveSession && session.id === activeLiveSessionId && session.attached) reattachMuxId ??= session.attached.muxId;
+  }
   setLiveSessions(detail.liveSessions || []);
+  agentsPanel.update(detail.agents || []);
+  if (!firstState) scheduleSidebarRefresh();
+  // With nothing open yet, the shared agents are what a phone comes to see.
+  if (firstState && !liveSessions.length && agentsPanel.count() && !/[#&]session=/.test(location.hash)) agentsPanel.show();
+  if (applyPendingSessionLink()) {
+    hasRestoredInitialLiveSession = true;
+    return;
+  }
+  if (restoreReconnectedView()) {
+    hasRestoredInitialLiveSession = true;
+    return;
+  }
   if (!hasRestoredInitialLiveSession || (wasViewingLive && !launcherVisible)) {
     hasRestoredInitialLiveSession = true;
     restoreActiveLiveSession();
   } else {
     if (activeLiveSessionId && !liveSessions.some(s => s.id === activeLiveSessionId)) {
+      voiceInput?.cancel();
       activeLiveSessionId = null;
       activeLiveSessionFile = null;
       sidebar.clearActive();
@@ -483,39 +640,75 @@ wsClient.addEventListener('stateUpdate', (e: Event) => {
       renderLiveTabs();
     }
     updateLiveSessionInputState();
-    syncSidebarOpenSessions();
+    updateLiveSessionIndicators();
+    restoreUnsentInput();
+  }
+  // Tau came back: the agent on screen when it stopped is the one to return to.
+  if (!firstState && reattachMuxId) {
+    const muxId = reattachMuxId;
+    reattachMuxId = null;
+    if (!liveSessions.some(session => session.id === activeLiveSessionId && session.attached?.muxId === muxId)) {
+      // The overview can lag behind the runtime we already know.
+      const selection = beginViewSelection(false);
+      void attachSharedAgent(muxId, selection).then(opened => {
+        if (selection !== viewSelection) return;
+        if (opened) { agentsPanel.hide(); focusComposer(); }
+        else agentsPanel.show();
+      });
+    }
   }
 });
 
 wsClient.addEventListener('liveSessionCreated', (e: Event) => {
   upsertLiveSession((e as CustomEvent<LiveSession>).detail);
+  restoreReconnectedView();
+  scheduleSidebarRefresh();
 });
 
 wsClient.addEventListener('liveSessionUpdated', (e: Event) => {
   const detail = (e as CustomEvent<LiveSession>).detail;
   const previousAbortState = liveSessions.find(session => session.id === detail.id)?.abortState;
   upsertLiveSession(detail);
+  restoreReconnectedView();
   // Native Abort acknowledgement can establish idle without agent_settled.
   // Never let an acknowledgement for an older operation stop a newer one:
   // the server's isStreaming metadata already accounts for that race.
-  const acknowledgedStop = previousAbortState && previousAbortState !== 'idle' && detail.abortState === 'idle';
+  const acknowledgedStop = (previousAbortState && previousAbortState !== 'idle' && detail.abortState === 'idle') ||
+    (!!detail.attached && localAbortStates.has(detail.id) && detail.isStreaming === false);
   if (acknowledgedStop) {
     localAbortStates.delete(detail.id);
     settledWhileStopping.delete(detail.id);
     if (detail.id === activeLiveSessionId && viewingActiveSession && detail.isStreaming === false) {
       state.setStreaming(false);
+      assistantBlocks.setWorking(false);
       toolCardRenderer.settleNestedCalls();
       showTypingIndicator(false);
     }
   }
-  if (detail?.id === activeLiveSessionId) {
+  if (viewingActiveSession && detail?.id === activeLiveSessionId) {
     applyActiveSessionMetadata(detail);
     updateUI();
   }
 });
 
 wsClient.addEventListener('liveSessionClosed', (e: Event) => {
-  handleLiveSessionClosed((e as CustomEvent<{ sessionId: string }>).detail.sessionId);
+  const detail = (e as CustomEvent<{ sessionId: string; reason?: string; message?: string; notice?: boolean }>).detail;
+  const session = liveSessions.find(s => s.id === detail.sessionId);
+  if (session) {
+    if ((detail.reason === 'server_shutdown' || detail.reason === 'reconnected') && viewingActiveSession && session.id === activeLiveSessionId) reattachMuxId ??= session.attached?.muxId || null;
+  }
+  handleLiveSessionClosed(detail.sessionId, detail.message, detail.notice, detail.reason);
+  restoreReconnectedView();
+  scheduleSidebarRefresh();
+});
+
+wsClient.addEventListener('agentsUpdate', (e: Event) => {
+  const agents = (e as CustomEvent<OverviewAgent[]>).detail || [];
+  agentsPanel.update(agents);
+  // Agents start and change sessions elsewhere too.
+  const files = agents.map(agent => agent.sessionFile).sort().join('\n');
+  if (files !== agentSessionFiles) scheduleSidebarRefresh();
+  agentSessionFiles = files;
 });
 
 wsClient.addEventListener('interactionState', (e: Event) => {
@@ -523,12 +716,100 @@ wsClient.addEventListener('interactionState', (e: Event) => {
 });
 
 // Receive a full live-session state snapshot.
+// Passive fanout updates only the live conversation currently being viewed.
+// Explicit selection loads its own snapshot after setting viewingActiveSession.
+// A shared tab's snapshots also carry its open dialogs, which apply to any tab.
 wsClient.addEventListener('liveSessionSnapshot', (e: Event) => {
-  const detail = (e as CustomEvent<LiveSessionSnapshotData>).detail;
-  // New entries replace the history a kept view was built from, for example
-  // after a session tree navigation.
-  if (detail.sessionId && detail.entries) parkedViews.delete(detail.sessionId);
-  applyLiveSessionSnapshot(detail);
+  const snapshot = (e as CustomEvent<LiveSessionSnapshotData>).detail;
+  if (snapshot.sessionId && snapshot.session) {
+    const previous = contextGenerations.get(snapshot.sessionId);
+    if (snapshot.generation !== undefined && previous !== undefined && snapshot.generation <= previous) return;
+    if (snapshot.generation !== undefined) contextGenerations.set(snapshot.sessionId, snapshot.generation);
+    upsertLiveSession(snapshot.session);
+  }
+  if (snapshot.sessionId && Array.isArray(snapshot.dialogs)) reconcileSharedDialogs(snapshot.sessionId, snapshot.dialogs, snapshot.generation);
+  if (!viewingActiveSession || snapshot.sessionId !== activeLiveSessionId) return;
+  const rendered = appliedGenerations.get(snapshot.sessionId);
+  if (typeof snapshot.generation === 'number' && rendered !== undefined && rendered >= snapshot.generation) return;
+  applyLiveSessionSnapshot(snapshot);
+  if (typeof snapshot.generation === 'number') appliedGenerations.set(snapshot.sessionId, snapshot.generation);
+  processQueuedExtensionUIRequest(snapshot.sessionId);
+});
+
+/**
+ * pimux generation of the last shared-tab snapshot this view rendered. The
+ * server publishes a snapshot and then its replayed in-flight work over the
+ * WebSocket before it answers the HTTP snapshot request, so an HTTP answer
+ * that is not newer would erase that replay.
+ */
+const appliedGenerations = new Map<string, number>();
+const contextGenerations = new Map<string, number>();
+
+/** A shared tab's open dialogs at a pimux boundary replace those this browser holds for it. */
+function reconcileSharedDialogs(sessionId: string, dialogs: AppEvent[], generation?: number) {
+  if (!liveSessions.find(session => session.id === sessionId)?.attached) return;
+  const previous = sharedDialogGenerations.get(sessionId);
+  // An HTTP answer for a boundary already received over the socket cannot
+  // reopen a dialog closed (or erase one opened) by the subsequent replay.
+  if (generation !== undefined && previous !== undefined && generation <= previous) return;
+  if (generation !== undefined) sharedDialogGenerations.set(sessionId, generation);
+  const open = new Map(dialogs.filter(dialog => DIALOG_METHODS.has(String(dialog.method)) && typeof dialog.id === 'string')
+    .map(dialog => [String(dialog.id), dialog]));
+  sharedDialogs.set(sessionId, open);
+  const current = dialogHandler.currentRequest;
+  const restoreFocus = current?.sessionId === sessionId && !open.has(String(current.id)) ? clearResolvedDialog() : false;
+  renderLiveTabs();
+  processQueuedExtensionUIRequest();
+  if (restoreFocus && viewingActiveSession && sessionId === activeLiveSessionId) focusComposer();
+  // The snapshot caller applies metadata before updating input/dispatch. A
+  // boundary that closes a dialog may simultaneously establish a busy run.
+}
+
+/** Another frontend answered it, or Pi stopped waiting: no browser may still offer it. */
+function closeSharedDialog(sessionId: string, id: string) {
+  if (!liveSessions.find(session => session.id === sessionId)?.attached) return;
+  sharedDialogs.get(sessionId)?.delete(id);
+  const current = dialogHandler.currentRequest;
+  let restoreFocus = false;
+  if (current?.sessionId === sessionId && String(current.id) === id) {
+    restoreFocus = clearResolvedDialog();
+    processQueuedExtensionUIRequest();
+  }
+  renderLiveTabs();
+  if (viewingActiveSession && activeLiveSessionId === sessionId) {
+    updateUI();
+    if (restoreFocus) focusComposer();
+  }
+}
+
+// A link is one navigation request, not a preference reapplied on reconnect.
+// Missing targets are rejected after the current server state, never kept as
+// promises to select an unrelated future tab with that id.
+function applyPendingSessionLink(): boolean {
+  const intent = sessionLink.take(liveSessions.map(session => session.id));
+  if (!intent) return false;
+  clearSessionLinkHash(location, history);
+  if (intent.kind === 'select') {
+    void selectLiveSession(intent.id, false);
+  } else {
+    if (!hasRestoredInitialLiveSession) {
+      activeLiveSessionId = null;
+      viewingActiveSession = false;
+      renderLiveTabs();
+      updateLiveSessionInputState();
+    }
+    flashStatusError(intent.kind === 'missing'
+      ? 'Linked Tau tab is no longer live. Select a tab to continue.'
+      : 'Invalid Tau session link. Select a tab to continue.', 8000);
+  }
+  return true;
+}
+
+window.addEventListener('hashchange', () => {
+  sessionLink.set(location.hash);
+  if (hasReceivedInitialServerState && wsClient.ws?.readyState === WebSocket.OPEN) {
+    applyPendingSessionLink();
+  }
 });
 
 // ═══════════════════════════════════════
@@ -537,6 +818,8 @@ wsClient.addEventListener('liveSessionSnapshot', (e: Event) => {
 
 const liveTabsList = document.getElementById('live-tabs-list');
 const liveTabAddBtn = document.getElementById('live-tab-add');
+const takeHerdrBtn = document.getElementById('take-herdr-btn')!;
+takeHerdrBtn.addEventListener('click', () => { void takeFromHerdr(); });
 const newLiveSessionOverlay = document.getElementById('new-live-session-overlay');
 const newLiveSessionModal = document.getElementById('new-live-session-modal');
 const newLiveSessionForm = document.getElementById('new-live-session-form');
@@ -546,13 +829,38 @@ const newLiveSessionProjects = document.getElementById('new-live-session-project
 const newLiveSessionSubmit = document.getElementById('new-live-session-submit')!;
 
 function setLiveSessions(sessions: LiveSession[]) {
+  sessions = sessions.filter(session => !closedLiveSessionIds.has(session.id));
+  ++liveSessionsRevision;
+  const remaining = new Set(sessions.map(session => session.id));
+  for (const removed of liveSessions.filter(session => !remaining.has(session.id))) keepUnsentInput(removed);
+  for (const session of sessions) observeInputContext(session);
   liveSessions = sessions || [];
+  liveInstances = liveSessions.map(s => ({ sessionFile: s.sessionFile, cwd: s.cwd, port: location.port }));
   renderLiveTabs();
-  syncSidebarOpenSessions();
+  updateLiveSessionIndicators();
 }
 
-function handleLiveSessionClosed(closedId: string) {
+/** No tab is shown any more: the header must not keep describing the last one. */
+function clearActiveSessionHeader() {
+  modelPickerController.setModelState('', 'off');
+  sessionTotalCost = 0;
+  lastInputTokens = 0;
+  lastUsage = null;
+  updateContextPill();
+}
+
+function handleLiveSessionClosed(closedId: string, message?: string, notice = false, reason?: string) {
   if (!closedId) return;
+  closedLiveSessionIds.add(closedId);
+  const session = liveSessions.find(session => session.id === closedId);
+  if (session) keepUnsentInput(session);
+  ++liveSessionsRevision;
+  appliedGenerations.delete(closedId);
+  contextGenerations.delete(closedId);
+  inputContexts.delete(closedId);
+  sharedDialogs.delete(closedId);
+  sharedDialogGenerations.delete(closedId);
+  piQueues.delete(closedId);
   liveSessions = liveSessions.filter(s => s.id !== closedId);
   messageQueue = messageQueue.filter(cmd => cmd.sessionId !== closedId);
   pendingExtensionUIRequests = pendingExtensionUIRequests.filter(req => req.sessionId !== closedId);
@@ -564,32 +872,48 @@ function handleLiveSessionClosed(closedId: string) {
   queuedPrompts.delete(closedId);
   compactRequests.delete(closedId);
   compactionStarts.delete(closedId);
-  parkedViews.delete(closedId);
   if (dialogHandler.currentRequest?.sessionId === closedId) {
     dialogHandler.clearCurrentDialog();
     processQueuedExtensionUIRequest();
   }
   renderQueuedMessages();
+  if (session && message && !notice && (activeLiveSessionId !== closedId || !viewingActiveSession)) {
+    const diagnostic = `${liveTabTitle(session)}: ${message}`;
+    flashStatusError(diagnostic, 8000);
+    messageRenderer.renderError(diagnostic);
+  }
   if (activeLiveSessionId === closedId) {
+    if (reason !== 'reconnected') beginViewSelection(false);
+    bindComposerContext(null);
     const wasViewingActive = viewingActiveSession;
+    voiceInput?.cancel();
     activeLiveSessionId = null;
     localStorage.removeItem('tau-active-live-session-id');
     activeLiveSessionFile = null;
     sidebar.clearActive();
-    currentStreamingElement = null;
-    currentStreamingThinking = '';
-    currentStreamingText = '';
+    currentMessageSteps.clear();
     pendingAssistantError = null;
     retryStatusElement = null;
     state.reset();
     showTypingIndicator(false);
     if (wasViewingActive) {
-      clearConversation();
-      const next = getMostRecentLiveSession();
-      if (next) selectLiveSession(next.id);
+      if (!message) clearConversation();
+      const next = message || reason === 'reconnected' ? null : getMostRecentLiveSession();
+      if (message) {
+        // A shared Pi exited or its connection was lost: say why, below the
+        // conversation, which stays readable.
+        viewingActiveSession = false;
+        assistantBlocks.setWorking(false);
+        if (notice) messageRenderer.renderNotice(message);
+        else messageRenderer.renderError(message);
+        clearActiveSessionHeader();
+        updateLiveSessionInputState();
+        updateUI();
+      } else if (next) selectLiveSession(next.id, true, beginViewSelection(false));
       else {
         viewingActiveSession = false;
         messageRenderer.renderWelcome();
+        clearActiveSessionHeader();
         updateLiveSessionInputState();
         updateUI();
       }
@@ -598,25 +922,52 @@ function handleLiveSessionClosed(closedId: string) {
       updateUI();
     }
   }
+  liveInstances = liveSessions.map(s => ({ sessionFile: s.sessionFile, cwd: s.cwd, port: location.port }));
   renderLiveTabs();
-  syncSidebarOpenSessions();
+  updateLiveSessionIndicators();
+}
+
+/** A peer can reconnect this mux without this browser issuing the request. */
+function restoreReconnectedView(): boolean {
+  const session = reattachMuxId && liveSessions.find(session => session.attached?.muxId === reattachMuxId && session.inputReady !== false);
+  if (!session) return false;
+  reattachMuxId = null;
+  void selectLiveSession(session.id, resumeQueuedInput, viewSelection);
+  return true;
 }
 
 function upsertLiveSession(session: LiveSession) {
-  if (!session) return;
+  if (!session || closedLiveSessionIds.has(session.id)) return;
+  ++liveSessionsRevision;
+  observeInputContext(session);
   sessionStateRevisions.set(session.id, (sessionStateRevisions.get(session.id) || 0) + 1);
   const idx = liveSessions.findIndex(s => s.id === session.id);
   let shouldRenderTabs = false;
   if (idx >= 0) {
     const before = liveTabSignature(liveSessions[idx]);
+    const movedCwd = session.cwd !== undefined && liveSessions[idx].cwd !== session.cwd;
+    const movedFile = liveSessions[idx].sessionFile !== session.sessionFile;
     liveSessions[idx] = { ...liveSessions[idx], ...session };
     shouldRenderTabs = before !== liveTabSignature(liveSessions[idx]);
+    if (movedCwd && session.id === activeLiveSessionId && viewingActiveSession && !fileSidebar.classList.contains('collapsed')) void fileBrowser.load();
+    if (movedFile) {
+      if (session.id === activeLiveSessionId && viewingActiveSession) sidebar.setActive(session.sessionFile);
+      scheduleSidebarRefresh();
+    }
   } else {
     liveSessions.push(session);
     shouldRenderTabs = true;
   }
+  liveInstances = liveSessions.map(s => ({ sessionFile: s.sessionFile, cwd: s.cwd, port: location.port }));
   if (shouldRenderTabs) renderLiveTabs();
-  syncSidebarOpenSessions();
+  updateLiveSessionIndicators();
+}
+
+/** A late open can add a background tab, but cannot roll back a tab already known here. */
+function rememberOpenedSession(session: LiveSession) {
+  // An open response can have been captured before a socket snapshot, even
+  // when this is still the chosen view. Its metadata is only a fallback.
+  if (!liveSessions.some(current => current.id === session.id)) upsertLiveSession(session);
 }
 
 function getMostRecentLiveSession() {
@@ -634,20 +985,25 @@ function compactModelLabel(session: LiveSession) {
   return String(raw).replace(/^.*\//, '').replace(/^claude-/, '').replace(/-\d{8}$/, '');
 }
 
-function liveTabSignature(session: LiveSession) {
-  return [
-    session.sessionName || basename(session.cwd || ''),
-    compactModelLabel(session),
-    session.cwd || '',
-    session.modelSpec || '',
-    sessionIsBusy(session) ? 'streaming' : 'idle',
-    pendingInteractionCount(session.id),
-  ].join('\u001f');
+function liveTabTitle(session: LiveSession) {
+  return session.sessionName || session.attached?.name || basename(session.cwd || '');
 }
 
 /** Whether the tab shows activity: a reply or a compaction is running. */
 function sessionIsBusy(session: LiveSession) {
   return !!session.isStreaming || !!session.compaction || compactRequests.has(session.id);
+}
+
+function liveTabSignature(session: LiveSession) {
+  return [
+    liveTabTitle(session),
+    compactModelLabel(session),
+    session.cwd || '',
+    session.modelSpec || '',
+    sessionIsBusy(session) ? 'streaming' : 'idle',
+    pendingInteractionCount(session.id),
+    session.attached ? 'shared' : '',
+  ].join('\u001f');
 }
 
 function renderLiveTabs() {
@@ -668,16 +1024,17 @@ function renderLiveTabs() {
     }
     seen.add(session.id);
     tab.classList.toggle('active', session.id === activeLiveSessionId);
-    tab.title = `${session.cwd || ''}${session.modelSpec ? ` • ${session.modelSpec}` : ''}`;
+    tab.classList.toggle('shared', !!session.attached);
+    tab.title = `${session.cwd || ''}${session.modelSpec ? ` • ${session.modelSpec}` : ''}${session.attached ? ` • shared with ${session.attached.host || 'another frontend'}` : ''}`;
     const signature = liveTabSignature(session);
     if (tab.dataset.signature !== signature) {
       tab.dataset.signature = signature;
       tab.innerHTML = `
         ${sessionIsBusy(session) ? '<span class="live-tab-streaming-dot"></span>' : ''}
         ${pendingInteractionCount(session.id) ? `<span class="live-tab-ui-dot" title="Waiting for approval" aria-label="${pendingInteractionCount(session.id)} pending approvals">${pendingInteractionCount(session.id)}</span>` : ''}
-        <span class="live-tab-title">${escapeHtml(session.sessionName || basename(session.cwd || ''))}</span>
+        <span class="live-tab-title">${escapeHtml(liveTabTitle(session))}</span>
         <span class="live-tab-model">${escapeHtml(compactModelLabel(session))}</span>
-        <span class="live-tab-close" title="Close Tau tab">×</span>
+        <span class="live-tab-close" title="Close agent">×</span>
       `;
       tab.querySelector('.live-tab-close')?.addEventListener('click', (ev) => {
         ev.stopPropagation();
@@ -696,7 +1053,7 @@ function restoreActiveLiveSession() {
   const saved = activeLiveSessionId && liveSessions.find(s => s.id === activeLiveSessionId);
   const next = saved || getMostRecentLiveSession();
   if (next) {
-    selectLiveSession(next.id);
+    selectLiveSession(next.id, resumeQueuedInput, beginViewSelection(false));
   } else {
     activeLiveSessionId = null;
     viewingActiveSession = false;
@@ -710,15 +1067,26 @@ function restoreActiveLiveSession() {
   }
 }
 
-async function selectLiveSession(id: string) {
+/** Sidebar lists come from disk: picks up sessions that appeared or moved, once a burst of changes settles. */
+function scheduleSidebarRefresh() {
+  if (sidebarRefreshTimer !== null) clearTimeout(sidebarRefreshTimer);
+  sidebarRefreshTimer = setTimeout(() => {
+    sidebarRefreshTimer = null;
+    // A reconnect refreshes it anyway.
+    if (wsClient.ws?.readyState === WebSocket.OPEN) void sidebar.refresh().then(updateLiveSessionIndicators);
+  }, 400);
+}
+
+async function selectLiveSession(id: string, resumeQueue = true, selection = beginViewSelection()): Promise<void> {
+  if (selection !== viewSelection) return;
+  sessionLink.cancel();
+  voiceInput?.cancel();
   const session = liveSessions.find(s => s.id === id);
   if (!session) return;
-  // Selecting the shown tab again reloads it from the server.
-  const reload = id === activeLiveSessionId && viewingActiveSession;
-  if (!reload) parkActiveView();
-  const parked = parkedViews.get(id);
-  parkedViews.delete(id);
+  resumeQueuedInput = resumeQueue;
   suspendCurrentDialogForTabSwitch(id);
+  treeViewController.closeIfOpen();
+  stopFollowing();
   launcherPanel.hide();
   activeLiveSessionId = id;
   localStorage.setItem('tau-active-live-session-id', id);
@@ -726,32 +1094,54 @@ async function selectLiveSession(id: string) {
   renderLiveTabs();
   renderQueuedMessages();
   applyActiveSessionMetadata(session);
-  if (parked && !reload) {
-    restoreParkedView(id, parked, session);
-    if (!fileSidebar.classList.contains('collapsed')) fileBrowser.load();
-    updateLiveSessionInputState();
-    processQueuedExtensionUIRequest(id);
-    flushQueue();
-    return;
-  }
-  currentStreamingElement = null;
-  currentStreamingThinking = '';
-  currentStreamingText = '';
+  restoreUnsentInput();
+  // Selection and its context become interactive together. A socket snapshot
+  // may already be authoritative while the HTTP refresh is still in flight.
+  updateLiveSessionInputState();
+  currentMessageSteps.clear();
   pendingAssistantError = null;
   retryStatusElement = null;
   state.reset();
   state.setStreaming(!!session.isStreaming);
   clearConversation();
+  renderCloseError(id);
+  if (wsClient.ws?.readyState !== WebSocket.OPEN) {
+    // Tau-local tab IDs do not survive a server restart. Selecting one while
+    // disconnected records the stable target, not an HTTP read of its old ID.
+    reattachMuxId ??= session.attached?.muxId || null;
+    keepUnsentInput(session);
+    messageRenderer.renderNotice('Disconnected; waiting to restore the selected conversation.');
+    updateLiveSessionInputState();
+    updateUI();
+    return;
+  }
+  const requestedAtConnection = connectionRevision;
   const requestedAtRevision = sessionStateRevisions.get(id) || 0;
+  // A shared tab's snapshot request makes the server publish a fresh pimux
+  // boundary over the WebSocket; only a WebSocket snapshot rendered in this
+  // view can make the HTTP answer redundant.
+  appliedGenerations.delete(id);
   try {
-    const res = await fetch(`/api/live-sessions/${encodeURIComponent(id)}/snapshot?tail=${SNAPSHOT_TAIL_ENTRIES}`);
+    const res = await fetch(`/api/live-sessions/${encodeURIComponent(id)}/snapshot`);
     const data = await res.json();
+    if (selection !== viewSelection || requestedAtConnection !== connectionRevision) return;
+    if (res.ok && session.attached && data.session?.id !== id && data.session?.attached?.muxId === session.attached.muxId) {
+      rememberOpenedSession(data.session);
+      return selectLiveSession(data.session.id, resumeQueue, selection);
+    }
+    if (id !== activeLiveSessionId || !viewingActiveSession) return;
     if (!res.ok || data.error) {
-      handleLiveSessionClosed(id);
+      // A shared tab whose snapshot failed is still attached; only a missing tab is gone.
+      if (res.status === 404) handleLiveSessionClosed(id);
       throw new Error(data.error || 'Live session not found');
     }
-    applyLiveSessionSnapshot({ ...data, sessionId: id }, requestedAtRevision);
+    const rendered = appliedGenerations.get(id);
+    if (typeof data.generation !== 'number' || rendered === undefined || rendered < data.generation) {
+      applyLiveSessionSnapshot({ ...data, sessionId: id }, requestedAtRevision);
+      if (typeof data.generation === 'number') appliedGenerations.set(id, data.generation);
+    }
   } catch (e) {
+    if (selection !== viewSelection || requestedAtConnection !== connectionRevision || id !== activeLiveSessionId || !viewingActiveSession) return;
     messageRenderer.renderError((e instanceof Error ? e.message : '') || 'Failed to load live session snapshot');
     return;
   }
@@ -763,30 +1153,94 @@ async function selectLiveSession(id: string) {
 
 function applyActiveSessionMetadata(session: LiveSession) {
   if (!session) return;
+  observeInputContext(session);
+  bindComposerContext(inputContextOf(session));
   activeLiveSessionFile = session.sessionFile || null;
-  sidebar.setActive(activeLiveSessionFile, session.id);
+  sidebar.setActive(activeLiveSessionFile);
   // Server is canonical: session.model is always null or a full {provider,id}
   // object, so assign directly. No modelLabel/modelSpec string fallbacks.
   modelPickerController.setModelState(session.model || '', session.thinkingLevel || 'off');
 }
 
+const closeRequests = new Set<string>();
+const closeErrors = new Map<string, string>();
+function closePending(sessionId = activeLiveSessionId): boolean {
+  const session = liveSessions.find(session => session.id === sessionId);
+  return !!session && closeRequests.has(session.attached?.muxId || session.id);
+}
+function renderCloseError(sessionId: string) {
+  const session = liveSessions.find(session => session.id === sessionId);
+  const error = session && closeErrors.get(session.attached?.muxId || session.id);
+  if (error) messageRenderer.renderError(error);
+}
 async function closeLiveSession(id: string) {
   const session = liveSessions.find(s => s.id === id);
-  if (!session) return;
-  const hasQueuedMessages = messageQueue.some(cmd => cmd.sessionId === id);
-  if (session.isStreaming || hasQueuedMessages) {
-    const reason = session.isStreaming && hasQueuedMessages
-      ? 'This Tau tab is streaming and has queued unsent messages. Close it, terminate the Pi session, and discard the queue?'
-      : session.isStreaming
-        ? 'This Tau tab is streaming. Close it and terminate the Pi session?'
-        : 'This Tau tab has queued unsent messages. Close it and discard them?';
-    if (!confirm(reason)) return;
-  }
+  if (!session || closePending(id)) return;
+  const muxId = session.attached?.muxId;
+  const agentId = muxId || session.id;
+  closeRequests.add(agentId);
+  updateUI();
   try {
-    await fetch(`/api/live-sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
-  } catch (e) {
-    messageRenderer.renderError('Failed to close Tau tab');
+    const response = await fetch(`/api/live-sessions/${encodeURIComponent(id)}/stop`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ operationId: crypto.randomUUID() }),
+    });
+    const data = await response.json();
+    if (!response.ok || data.error || data.receipt?.state !== 'stopped' || !muxId || data.receipt.muxId !== muxId) {
+      throw new Error(data.error || 'Agent closure was not confirmed');
+    }
+    closeErrors.delete(agentId);
+    for (const current of liveSessions.filter(current => (current.attached?.muxId || current.id) === agentId)) handleLiveSessionClosed(current.id, data.message, data.notice);
+  } catch (error) {
+    if (liveSessions.some(current => (current.attached?.muxId || current.id) === agentId)) {
+      const message = `${liveTabTitle(session)}: ${error instanceof Error ? error.message : 'Agent closure was not confirmed'}`;
+      closeErrors.set(agentId, message);
+      const selected = liveSessions.find(current => current.id === activeLiveSessionId && (current.attached?.muxId || current.id) === agentId);
+      if (viewingActiveSession && selected) {
+        flashStatusError(message, 8000);
+        renderCloseError(selected.id);
+      }
+    }
+  } finally {
+    closeRequests.delete(agentId);
+    updateLiveSessionInputState();
   }
+}
+
+const queueClearRequests = new Map<string, Promise<boolean>>();
+function clearSharedQueue(sessionId = activeLiveSessionId, confirmed = false): Promise<boolean> {
+  const session = liveSessions.find(s => s.id === sessionId);
+  if (!session || !sessionId) return Promise.resolve(false);
+  const existing = queueClearRequests.get(sessionId);
+  if (existing) return existing;
+  if (!confirmed && !confirm('Remove ALL queued steering and follow-up input from EVERY frontend of this agent? Only this browser receives the returned text for review. It is not resent, and images are not returned.')) return Promise.resolve(false);
+  const target = captureCommandTarget(sessionId);
+  if (!target) return Promise.resolve(false);
+  const context = target.inputContext;
+  const selection = viewSelection;
+  const request = (async () => {
+    try {
+      const response = await fetch('/api/rpc', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'clear_queue', id: crypto.randomUUID(), ...target, confirmGlobal: true }),
+      });
+      const data = await response.json();
+      if (!response.ok || data.success !== true) throw new Error(data.error || 'Queue clearing was not confirmed');
+      const origin = context;
+      const returned = [...(Array.isArray(data.data?.steering) ? data.data.steering : []),
+        ...(Array.isArray(data.data?.followUp) ? data.data.followUp : [])].filter((text): text is string => typeof text === 'string');
+      if (returned.length) unsentInput.keep(origin, { text: returned.join('\n\n'), images: [] });
+      restoreUnsentInput();
+      return true;
+    } catch (error) {
+      if (selection === viewSelection) flashStatusError(`${error instanceof Error ? error.message : 'Queue clearing was not confirmed'}. Queued input may still run; nothing was resent.`, 8000);
+      return false;
+    } finally {
+      queueClearRequests.delete(sessionId);
+    }
+  })();
+  queueClearRequests.set(sessionId, request);
+  return request;
 }
 
 async function loadProjectChips() {
@@ -847,6 +1301,7 @@ function openNewLiveSessionModal(cwd?: string) {
   newLiveSessionOverlay?.classList.remove('hidden');
   newLiveSessionModal?.classList.remove('hidden');
   newLiveSessionSubmit.disabled = false;
+  newLiveSessionSubmit.textContent = 'Create tab';
   if (cwd) newLiveSessionCwd.value = cwd;
   else if (!newLiveSessionCwd.value) newLiveSessionCwd.value = liveSessions.find(s => s.id === activeLiveSessionId)?.cwd || '';
   loadProjectChips();
@@ -871,6 +1326,7 @@ newLiveSessionForm?.addEventListener('submit', async (e) => {
   if (!cwd) return;
   newLiveSessionSubmit.disabled = true;
   newLiveSessionSubmit.textContent = 'Starting…';
+  const selection = beginViewSelection();
   try {
     const res = await fetch('/api/live-sessions', {
       method: 'POST',
@@ -879,15 +1335,19 @@ newLiveSessionForm?.addEventListener('submit', async (e) => {
     });
     const data = await res.json();
     if (!res.ok || data.error) throw new Error(data.error || 'Failed to create Tau tab');
-    upsertLiveSession(data.session);
+    rememberOpenedSession(data.session);
+    if (selection !== viewSelection) return;
     closeNewLiveSessionModal();
     newLiveSessionModel.value = '';
     await selectLiveSession(data.session.id);
+    focusComposer();
   } catch (err) {
-    messageRenderer.renderError((err instanceof Error ? err.message : '') || 'Failed to create Tau tab');
+    if (selection === viewSelection) messageRenderer.renderError((err instanceof Error ? err.message : '') || 'Failed to create Tau tab');
   } finally {
-    newLiveSessionSubmit.disabled = false;
-    newLiveSessionSubmit.textContent = 'Create tab';
+    if (selection === viewSelection) {
+      newLiveSessionSubmit.disabled = false;
+      newLiveSessionSubmit.textContent = 'Create tab';
+    }
   }
 });
 
@@ -918,24 +1378,20 @@ function flushPendingAssistantError() {
   const pending = pendingAssistantError;
   pendingAssistantError = null;
   if (!pending) return;
-  if (pending.element?.isConnected) {
-    messageRenderer.appendMessageError(pending.element, pending.errorMessage);
-    return;
-  }
   // A snapshot might already have rendered this error from session history.
-  const alreadyShown = Array.from(messagesContainer.querySelectorAll('.message-error'))
-    .some(element => (element.textContent || '').includes(pending.errorMessage));
-  if (!alreadyShown) messageRenderer.renderError(pending.errorMessage);
+  const lastBlock = messagesContainer.lastElementChild;
+  const alreadyShown = lastBlock?.classList.contains('assistant-block') &&
+    Array.from(lastBlock.querySelectorAll('.message-error-detail'))
+      .some(element => element.textContent === pending.errorMessage);
+  if (!alreadyShown) {
+    appendLiveActivity(messageRenderer.renderAssistantError(pending.errorMessage), 'error');
+    messageRenderer.scrollToBottom();
+  }
 }
 
 function handleAutoRetryStart(event: AppEvent) {
-  // The failed reply is not final yet, so show retry progress instead of a
-  // red error the user would see even when the retry succeeds. A failed reply
-  // with no visible content would otherwise leave an empty bubble behind.
-  const emptyContent = pendingAssistantError?.element?.querySelector('.message-content');
-  if (pendingAssistantError?.element?.isConnected && emptyContent && !emptyContent.textContent?.trim()) {
-    pendingAssistantError.element.remove();
-  }
+  // Keep partial steps, but never materialize a provisional provider error
+  // (or an empty assistant bubble) while Pi is still retrying.
   pendingAssistantError = null;
   showRetryStatus(event);
 }
@@ -947,7 +1403,7 @@ function handleAutoRetryEnd(event: AppEvent) {
     ? event.finalError
     : undefined;
   if (finalError && !pendingAssistantError) {
-    pendingAssistantError = { element: null, errorMessage: finalError };
+    pendingAssistantError = { errorMessage: finalError };
   }
 }
 
@@ -969,6 +1425,11 @@ function handleRPCEvent(event: AppEvent, sessionId: string | null = null) {
       break;
     case 'turn_start':
       handleAgentStart();
+      break;
+    case 'agent_end':
+      // Reply rendering can finish before Pi's end hooks release input.
+      assistantBlocks.setWorking(false);
+      messageRenderer.scrollToBottom();
       break;
     case 'agent_settled':
       handleAgentSettled();
@@ -1010,7 +1471,10 @@ function handleRPCEvent(event: AppEvent, sessionId: string | null = null) {
       handleSummaryRetryAttemptStart();
       break;
     case 'extension_ui_request':
-      handleExtensionUIRequest(event, sessionId);
+      if (sessionId && DIALOG_METHODS.has(String(event.method))) {
+        queueExtensionUIRequest(event, sessionId);
+        processQueuedExtensionUIRequest(sessionId);
+      } else handleExtensionUIRequest(event, sessionId);
       break;
     case 'extension_error':
       messageRenderer.renderError(`Extension error: ${event.error}`);
@@ -1037,24 +1501,22 @@ function resetCompactionRow() {
 
 /** Draw the running row at the end of the transcript, replacing an earlier one. */
 function showRunningCompaction(reason: string, startedAt: number) {
+  assistantBlocks.boundary();
+  currentMessageSteps.clear();
   const state: RunningCompaction = { status: 'running', reason, startedAt };
   const element = compactionRow?.element.isConnected ? compactionRow.element : document.createElement('div');
-  messagesContainer.querySelector('.welcome')?.remove();
+  messageRenderer.removeWelcome();
   renderCompactionRow(state, element);
   messagesContainer.appendChild(element);
   compactionRow = { element, state };
-  startCompactionElapsedTimer();
-  scrollToBottom();
-}
-
-// Show how long the running compaction has taken, so a slow one does not look stuck.
-function startCompactionElapsedTimer() {
   stopCompactionElapsedTimer();
+  // Show how long it has been running, so a slow compaction does not look stuck.
   compactionElapsedTimer = setInterval(() => {
     const elapsed = compactionRow?.element.querySelector('.compaction-elapsed');
     if (!compactionRow?.element.isConnected || !elapsed) return stopCompactionElapsedTimer();
-    elapsed.textContent = formatElapsed(Date.now() - (compactionRow.state.startedAt ?? Date.now()));
+    elapsed.textContent = formatElapsed(Date.now() - startedAt);
   }, 1000);
+  scrollToBottom();
 }
 
 function updateRunningCompaction(retry: SummaryRetry) {
@@ -1102,10 +1564,15 @@ function handleCompactionEnd(event: AppEvent) {
   } else if (event.aborted === true) {
     finished = { status: 'cancelled' };
   } else {
-    finished = { status: 'failed', errorMessage: event.errorMessage };
+    finished = { status: 'failed', errorMessage: typeof event.errorMessage === 'string' ? event.errorMessage : undefined };
   }
+  // A browser attaching during compaction has no running row or boundary.
   const element = compactionRow?.element.isConnected ? compactionRow.element : null;
   resetCompactionRow();
+  if (!element) {
+    assistantBlocks.boundary();
+    currentMessageSteps.clear();
+  }
   const row = renderCompactionRow(finished, element ?? undefined);
   if (!element) messagesContainer.appendChild(row);
   messageRenderer.scrollToBottom();
@@ -1122,6 +1589,7 @@ function handleCompactionEnd(event: AppEvent) {
 }
 
 function handleAgentStart() {
+  assistantBlocks.setWorking(true);
   state.setStreaming(true);
   showTypingIndicator(true);
   updateUI();
@@ -1134,8 +1602,9 @@ function handleAgentSettled() {
   flushPendingAssistantError();
   state.setStreaming(false);
   showTypingIndicator(false);
-  currentStreamingElement = null;
-  currentStreamingText = '';
+  currentMessageSteps.clear();
+  assistantBlocks.setWorking(false);
+  messageRenderer.scrollToBottom();
   updateUI();
 
   // Pi has finished its end hooks, compaction and queued continuations.
@@ -1165,20 +1634,14 @@ function handleMessageStart(message: AppMessage) {
   if (message.role === 'assistant') {
     pendingAssistantError = null;
     clearRetryStatus();
-    currentStreamingText = '';
-    currentStreamingThinking = '';
-    currentStreamingElement = messageRenderer.renderAssistantMessage(
-      { content: '' },
-      true
-    );
+    currentMessageSteps.clear();
   } else if (message.role === 'user') {
-    // User messages can echo back via backend events; only render if we did
-    // not just send this message ourselves.
+    assistantBlocks.boundary();
+    // The prompt is already drawn locally when sent.
     if (!lastSentMessage || getMessageText(message) !== lastSentMessage) {
       const content = getMessageText(message);
-      if (content) {
-        messageRenderer.renderUserMessage({ content });
-      }
+      const images = messageImages(message);
+      if (content || images.length) messageRenderer.renderUserMessage({ content, images });
     }
     lastSentMessage = null;
   }
@@ -1186,175 +1649,169 @@ function handleMessageStart(message: AppMessage) {
 
 function getMessageText(message: AppMessage) {
   if (typeof message.content === 'string') return message.content;
-  if (Array.isArray(message.content)) {
-    return message.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
-  }
-  return '';
+  return (message.content || []).filter(block => block.type === 'text').map(block => block.text).join('\n');
 }
 
-function getMessageThinking(message: AppMessage) {
-  if (!Array.isArray(message?.content)) return '';
-  return message.content
-    .filter(b => b.type === 'thinking')
-    .map(b => b.thinking || b.text || '')
-    .filter(Boolean)
-    .join('\n');
+function nextMessageStep(index: number) {
+  let next: HTMLElement | null = null;
+  let position = Infinity;
+  for (const [candidate, element] of currentMessageSteps) {
+    if (candidate > index && candidate < position) {
+      next = element;
+      position = candidate;
+    }
+  }
+  return next;
+}
+
+function updateMessageStep(index: number, step: AssistantStep, streaming: boolean) {
+  let element = currentMessageSteps.get(index);
+  if (!element) {
+    element = messageRenderer.renderAssistantStep(step, streaming);
+    // message_end supplies blocks missed when this browser joined mid-message.
+    appendLiveActivity(element, step.type, nextMessageStep(index));
+    currentMessageSteps.set(index, element);
+    if (streaming) messageRenderer.scrollToBottom();
+  } else if (streaming) {
+    messageRenderer.queueAssistantStep(element, step.text);
+  } else {
+    messageRenderer.updateAssistantStep(element, step.text);
+  }
 }
 
 function handleMessageUpdate(event: AppEvent) {
   if (typeof event.message === 'object') rememberToolDefinitions(event.message);
-  const { assistantMessageEvent } = event;
-  if (!assistantMessageEvent) return;
+  const update = event.assistantMessageEvent;
+  if (!update) return;
+  const index = update.contentIndex;
+  if (index === undefined) return;
+  const type = update.type;
+  if (type !== 'thinking_start' && type !== 'thinking_delta' && type !== 'text_start' && type !== 'text_delta') return;
+  const kind = type.startsWith('thinking') ? 'thinking' : 'text';
+  const block = update.partial?.content?.[index];
+  const element = currentMessageSteps.get(index);
+  const previous = element ? messageRenderer.assistantStepText(element) : '';
+  const text = block && typeof block !== 'string'
+    ? (kind === 'thinking' ? block.thinking : block.text) || ''
+    : previous + (update.delta || '');
+  updateMessageStep(index, { type: kind, text }, true);
+}
 
-  if (assistantMessageEvent.type === 'thinking_delta') {
-    if (!currentStreamingElement) {
-      currentStreamingElement = messageRenderer.renderAssistantMessage({ content: '' }, true);
-    }
-    currentStreamingThinking += assistantMessageEvent.delta;
-    if (currentStreamingElement) {
-      messageRenderer.updateStreamingThinking(currentStreamingElement, currentStreamingThinking);
-    }
-  } else if (assistantMessageEvent.type === 'text_delta') {
-    if (!currentStreamingElement) {
-      currentStreamingElement = messageRenderer.renderAssistantMessage({ content: '' }, true);
-    }
-    currentStreamingText += assistantMessageEvent.delta;
-    if (currentStreamingElement) {
-      messageRenderer.updateStreamingMessage(
-        currentStreamingElement,
-        currentStreamingText
-      );
-    }
+function appendLiveActivity(element: HTMLElement, label: string, before: HTMLElement | null = null) {
+  assistantBlocks.append(element, label, before);
+  // Once a history block receives live content its height must not be deferred.
+  element.closest('.assistant-block')?.classList.remove('history');
+}
+
+function ensureToolCard(toolCallId: string, toolName: string, args: Record<string, unknown> = {}, before: HTMLElement | null = null) {
+  let card = toolCardRenderer.toolCards.get(toolCallId);
+  if (!card) {
+    card = toolCardRenderer.createToolCard({ toolCallId, toolName, args, status: 'pending' }, document.createDocumentFragment());
+    appendLiveActivity(card, toolName, before);
   }
+  card.classList.remove('history');
+  card.closest('.assistant-block')?.classList.remove('history');
+  return card;
 }
 
 function handleMessageEnd(message: AppMessage) {
   if (message?.role === 'toolResult') {
     if (message.toolCallId) {
-      toolCardRenderer.reconcileToolResult(message.toolCallId, {
-        content: Array.isArray(message.content) ? message.content : [],
+      const card = toolCardRenderer.reconcileToolResult(message.toolCallId, {
+        content: typeof message.content === 'string' ? [{ type: 'text', text: message.content }] : message.content || [],
         nestedCalls: message.nestedCalls,
       }, message.isError ?? false);
+      if (card?.parentElement === messagesContainer) {
+        appendLiveActivity(card, card.querySelector('.tool-name')?.textContent || 'tool');
+      }
     }
     return;
   }
   if (message?.role !== 'assistant') return;
   rememberToolDefinitions(message);
-  let finishedElement = currentStreamingElement;
-  if (!currentStreamingElement) {
-    finishedElement = messageRenderer.renderAssistantMessage(message, false, true);
-  }
-  if (currentStreamingElement) {
-    finishedElement = currentStreamingElement;
-    // If this client attached mid-stream, local deltas may be incomplete. The
-    // message_end payload is authoritative, so refresh the streaming DOM from it
-    // before finalizing.
-    const finalText = getMessageText(message);
-    const finalThinking = getMessageThinking(message);
-    if (finalText && finalText.length >= currentStreamingText.length) {
-      currentStreamingText = finalText;
-      messageRenderer.updateStreamingMessage(currentStreamingElement, currentStreamingText);
+  const blocks = typeof message.content === 'string' ? [{ type: 'text', text: message.content }] : message.content || [];
+  blocks.forEach((block, index) => {
+    if (block.type === 'text' || block.type === 'thinking') {
+      updateMessageStep(index, {
+        type: block.type, text: block.type === 'thinking' ? block.thinking || '' : block.text || '',
+      }, false);
+    } else if (block.type === 'toolCall') {
+      const card = ensureToolCard(block.id || '', block.name || '', block.arguments, nextMessageStep(index));
+      currentMessageSteps.set(index, card);
     }
-    if (finalThinking && finalThinking.length >= currentStreamingThinking.length) {
-      currentStreamingThinking = finalThinking;
-      messageRenderer.updateStreamingThinking(currentStreamingElement, currentStreamingThinking);
-    }
+  });
+  currentMessageSteps.clear();
 
-    // Pass usage info for cost display
-    const usage = message?.usage || null;
-    // Pass thinking and text so finalize renders each in its own place
-    messageRenderer.finalizeStreamingMessage(currentStreamingElement, usage, currentStreamingThinking, currentStreamingText);
-    currentStreamingElement = null;
-    currentStreamingThinking = '';
-    currentStreamingText = '';
-
-    // Track session cost and tokens
-    if (usage?.cost?.total) {
-      sessionTotalCost += usage.cost.total;
-    }
-    if (usage?.input) {
-      lastInputTokens = usage.input + (usage.cacheRead || 0);
-      contextTokensEstimated = false;
-      lastUsage = usage;
-    }
-    updateContextPill();
-    showNewMessageBadge();
+  const usage = message.usage;
+  if (usage?.cost?.total) sessionTotalCost += usage.cost.total;
+  if (usage?.input) {
+    lastInputTokens = usage.input + (usage.cacheRead || 0);
+    contextTokensEstimated = false;
+    lastUsage = usage;
   }
-
-  // Hold the error until agent_settled: an auto-retry may still replace this
-  // failed reply, and only the final failure should be shown inline.
-  if (message.stopReason === 'error') {
-    pendingAssistantError = { element: finishedElement, errorMessage: message.errorMessage || 'Request failed' };
-  } else {
-    pendingAssistantError = null;
-  }
+  updateContextPill();
+  showNewMessageBadge();
+  // Keep failures provisional until Pi's authoritative operation settles.
+  pendingAssistantError = message.stopReason === 'error'
+    ? { errorMessage: message.errorMessage || 'Request failed' } : null;
 }
 
 function handleToolExecutionStart(event: AppEvent) {
   const { toolCallId, toolName, args } = event;
   if (!toolCallId) return;
-
-  state.addToolExecution(toolCallId, {
-    toolName,
-    args,
-    status: 'pending',
-  });
-
-  const exec = state.getToolExecution(toolCallId);
-  if (exec) toolCardRenderer.createToolCard(exec as ToolExecution);
+  ensureToolCard(toolCallId, toolName || '', args);
+  toolCardRenderer.updateToolCard({ toolCallId, status: 'pending' });
+  messageRenderer.scrollToBottom();
 }
 
 function handleToolExecutionUpdate(event: AppEvent) {
-  const { toolCallId, partialResult } = event;
-  if (!toolCallId) return;
-  const output = formatToolOutput(partialResult);
-
-  state.updateToolExecution(toolCallId, {
-    status: 'streaming',
-    output,
+  if (!event.toolCallId) return;
+  ensureToolCard(event.toolCallId, event.toolName || '', event.args);
+  toolCardRenderer.updateToolCard({
+    toolCallId: event.toolCallId, status: 'streaming', output: formatToolOutput(event.partialResult),
   });
-
-  const exec = state.getToolExecution(toolCallId);
-  if (exec) toolCardRenderer.updateToolCard(exec as ToolExecution);
+  messageRenderer.scrollToBottom();
 }
 
 function handleToolExecutionEnd(event: AppEvent) {
-  const { toolCallId, result, isError } = event;
-  if (!toolCallId) return;
-  const output = formatToolOutput(result);
-
-  state.updateToolExecution(toolCallId, {
-    status: isError ? 'error' : 'complete',
-    output,
-    isError,
-  });
-
-  toolCardRenderer.finalizeToolCard(toolCallId, result as ToolResult, isError ?? false);
+  if (!event.toolCallId) return;
+  ensureToolCard(event.toolCallId, event.toolName || '', event.args);
+  toolCardRenderer.finalizeToolCard(event.toolCallId, event.result as ToolResult, event.isError ?? false);
 }
 
 function pendingInteractionCount(sessionId: string) {
-  return liveSessions.find(session => session.id === sessionId)?.pendingInteractionCount || 0;
+  const session = liveSessions.find(session => session.id === sessionId);
+  return session?.attached ? sharedDialogs.get(sessionId)?.size || 0 : session?.pendingInteractionCount || 0;
 }
 
 function reconcileInteractionState(next: InteractionState) {
-  if (!liveSessions.some(session => session.id === next.sessionId)) return;
+  const session = liveSessions.find(session => session.id === next.sessionId);
+  if (!session || session.attached) return;
   const current = interactionStates.get(next.sessionId);
   // HTTP snapshots and WebSocket updates can cross in flight. In particular,
   // an older snapshot must never recreate a request another client answered.
   if (current && next.interactionRevision <= current.interactionRevision) return;
   interactionStates.set(next.sessionId, next);
   const visible = dialogHandler.currentRequest;
-  if (visible?.sessionId === next.sessionId && !next.pendingDialogs.some(request => request.id === visible.id)) {
-    // Server resolution is not a user cancellation; never send another reply.
-    dialogHandler.clearCurrentDialog();
-  }
+  const restoreFocus = visible?.sessionId === next.sessionId && !next.pendingDialogs.some(request => request.id === visible.id)
+    ? clearResolvedDialog() : false;
   processQueuedExtensionUIRequest(next.sessionId);
   renderLiveTabs();
+  if (restoreFocus && viewingActiveSession && next.sessionId === activeLiveSessionId) focusComposer();
 }
 
 function queueExtensionUIRequest(event: AppEvent, sessionId: string) {
-  // Response-bearing requests arrive only through the full server registry.
-  // Preserve the existing background-tab behavior for transient notifications.
+  if (liveSessions.find(session => session.id === sessionId)?.attached && DIALOG_METHODS.has(String(event.method))) {
+    if (typeof event.id !== 'string') return;
+    let dialogs = sharedDialogs.get(sessionId);
+    if (!dialogs) sharedDialogs.set(sessionId, dialogs = new Map());
+    dialogs.set(event.id, event);
+    renderLiveTabs();
+    if (viewingActiveSession && activeLiveSessionId === sessionId) updateUI();
+    return;
+  }
+  // Native response-bearing requests arrive only through Tau's full registry.
+  // Preserve background-tab transient notifications for both transports.
   if (event.method !== 'notify') return;
   if (!pendingExtensionUIRequests.some(req => req.sessionId === sessionId && req.event.id === event.id)) {
     pendingExtensionUIRequests.push({ sessionId, event });
@@ -1367,7 +1824,9 @@ function processQueuedExtensionUIRequest(sessionId = activeLiveSessionId) {
   pendingExtensionUIRequests = pendingExtensionUIRequests.filter(request => request.sessionId !== sessionId);
   for (const { event } of notifications) handleExtensionUIRequest(event, sessionId);
   if (dialogHandler.currentRequest) return;
-  const request = interactionStates.get(sessionId)?.pendingDialogs.find(request => request.expiresAt === undefined || request.expiresAt > Date.now());
+  const shared = liveSessions.find(session => session.id === sessionId)?.attached;
+  const request = shared ? sharedDialogs.get(sessionId)?.values().next().value
+    : interactionStates.get(sessionId)?.pendingDialogs.find(request => request.expiresAt === undefined || request.expiresAt > Date.now());
   if (request) handleExtensionUIRequest(request, sessionId);
 }
 
@@ -1379,7 +1838,18 @@ function suspendCurrentDialogForTabSwitch(nextSessionId: string) {
 }
 
 function handleExtensionUIRequest(event: AppEvent, sessionId: string | null = null) {
-  const request = (sessionId ? { ...event, sessionId } : event) as DialogRequest;
+  // One dialog shows at a time. Its membership stays with its authoritative
+  // registry even while visible, or while the transport accepts an answer.
+  const current = dialogHandler.currentRequest;
+  if (sessionId && current && DIALOG_METHODS.has(String(event.method))) {
+    if (current.sessionId !== sessionId || current.id !== event.id) queueExtensionUIRequest(event, sessionId);
+    return;
+  }
+  const target = sessionId ? captureCommandTarget(sessionId) : null;
+  const request = (sessionId ? { ...event, sessionId, inputContext: target?.inputContext ?? null } : event) as DialogRequest;
+  // A shared request stays a member until mux closes it or replaces its
+  // snapshot. Native requests still use Tau's original absolute expiry.
+  if (sessionId && liveSessions.find(session => session.id === sessionId)?.attached) delete request.expiresAt;
   switch (event.method) {
     case 'select':
       dialogHandler.showSelect(request);
@@ -1397,7 +1867,7 @@ function handleExtensionUIRequest(event: AppEvent, sessionId: string | null = nu
       dialogHandler.showNotification(request);
       break;
     default:
-      console.warn('[App] Unknown extension UI method:', event.method);
+      if (!DISPLAY_UI_METHODS.has(String(event.method))) console.warn('[App] Unknown extension UI method:', event.method);
   }
 }
 
@@ -1406,9 +1876,7 @@ function formatToolOutput(result: unknown) {
 
   const r = result as { content?: MessageContentBlock[] };
   if (r.content && Array.isArray(r.content)) {
-    // Images show below the output once the tool finishes.
     return r.content
-      .filter((block) => block.type !== 'image')
       .map((block) => {
         if (block.type === 'text') return block.text;
         return JSON.stringify(block);
@@ -1498,11 +1966,17 @@ function processImageFile(file: File): Promise<PendingImage> {
 }
 
 async function addAttachments(files: FileList | File[]) {
+  const context = composerContext ? copyInputContext(composerContext) : null;
+  const selection = viewSelection;
   const list = Array.from(files);            // snapshot before any await
   for (const file of list) {
     if (!file.type.startsWith('image/')) continue;
     try {
-      pendingImages.push(await processImageFile(file));
+      const image = await processImageFile(file);
+      if (context && (selection !== viewSelection || !sameContext(context, composerContext))) {
+        unsentInput.keep(context, { text: '', images: [image] });
+        restoreUnsentInput();
+      } else if (context) pendingImages.push(image);
     } catch (e) {
       console.error('[Tau] Image processing failed:', e);
     }
@@ -1618,11 +2092,162 @@ function renderAttachmentPreviews() {
 // ═══════════════════════════════════════
 
 let messageQueue: QueuedCommand[] = [];
+const unsentInput = new UnsentInputStore();
+const inputContexts = new Map<string, InputContext>();
+let composerContext: InputContext | null = null;
+const recoveredInputEl = document.createElement('section');
+recoveredInputEl.id = 'recovered-input';
+recoveredInputEl.className = 'hidden';
+recoveredInputEl.setAttribute('aria-label', 'Input kept for review');
+document.querySelector('.input-area')!.prepend(recoveredInputEl);
+
+function inputContextOf(session: LiveSession): InputContext {
+  return { agentId: session.attached?.muxId || session.id, file: session.sessionFile ?? null,
+    leafId: session.leafId, runtimeContext: runtimeInputContext(session.runtimeContext) };
+}
+
+function commandContextIsCurrent(sessionId: string, context: InputContext): boolean {
+  const session = liveSessions.find(session => session.id === sessionId);
+  return !!session && session.inputReady === true && !!runtimeInputContext(context.runtimeContext)
+    && sameContext(context, inputContextOf(session));
+}
+
+/** Capture once, before any await; delayed actions must keep this exact target. */
+function captureCommandTarget(sessionId = activeLiveSessionId): CommandTarget | null {
+  const session = liveSessions.find(session => session.id === sessionId);
+  if (!session || session.inputReady !== true) return null;
+  const inputContext = inputContextOf(session);
+  if (!inputContext.runtimeContext || inputContext.runtimeContext.sessionFile !== inputContext.file) return null;
+  return { sessionId: session.id, inputContext: copyInputContext(inputContext) };
+}
+
+function bindComposerContext(context: InputContext | null) {
+  if (sameContext(composerContext, context)) return;
+  // Browser-restored form text can precede the first authoritative identity.
+  const origin = composerContext || { agentId: null, file: null, leafId: undefined, runtimeContext: null };
+  unsentInput.keep(origin, { text: messageInput.value, images: pendingImages, files: pendingFilePaths });
+  voiceInput?.cancel();
+  messageInput.value = '';
+  messageInput.style.height = 'auto';
+  pendingImages = [];
+  pendingFilePaths = [];
+  composerContext = context;
+  renderAttachmentPreviews();
+  restoreUnsentInput();
+}
+
+/** Metadata and exact snapshots, not a mux's lifetime, own the conversation identity. */
+function observeInputContext(session: LiveSession) {
+  const previous = inputContexts.get(session.id), next = inputContextOf(session);
+  // Snapshot reconstruction temporarily withdraws input readiness, not the
+  // selected conversation. Its later live boundary must finish the same open.
+  if (previous?.runtimeContext && !next.runtimeContext && previous.agentId === next.agentId && previous.file === next.file) return;
+  if (previous && !sameContext(previous, next)) {
+    keepUnsentInput(session, previous);
+    if (session.id === activeLiveSessionId && viewingActiveSession) {
+      beginViewSelection(false);
+      treeViewController.closeIfOpen();
+      modelPickerController.closeIfOpen();
+      bindComposerContext(next);
+    }
+  }
+  inputContexts.set(session.id, next);
+}
+
+function putInComposer(input: UnsentInput | null) {
+  if (!input) return;
+  messageInput.value = [input.text, messageInput.value].filter(Boolean).join('\n\n');
+  pendingImages.push(...input.images);
+  pendingFilePaths.push(...(input.files || []).map(file => ({ ...file, sessionId: activeLiveSessionId })));
+  messageInput.dispatchEvent(new Event('input'));
+  renderAttachmentPreviews();
+}
+
+/** Recovery is an explicit choice, even after reconnecting to the same agent. */
+function restoreUnsentInput() {
+  recoveredInputEl.innerHTML = '';
+  for (const { context, input } of unsentInput.entries()) {
+    const row = document.createElement('div');
+    row.className = 'queued-msg';
+    const origin = `${context.file || 'Unknown/new conversation'} · leaf ${context.leafId === undefined ? 'unknown' : context.leafId || 'root'} · ${context.agentId || 'unknown agent'}`;
+    row.title = `${origin}. Review before sending; delivery may have been uncertain.`;
+    const label = document.createElement('span');
+    label.className = 'queued-msg-label';
+    label.textContent = 'Kept for review; not resent';
+    const text = document.createElement('span');
+    text.className = 'queued-msg-text';
+    text.textContent = `${origin}: ${input.text || '(attachments)'}`;
+    const reuse = document.createElement('button');
+    reuse.type = 'button';
+    reuse.textContent = 'Reuse';
+    reuse.disabled = !viewingActiveSession || !composerContext;
+    reuse.addEventListener('click', () => {
+      if (!viewingActiveSession || !composerContext) return;
+      if (!sameContext(context, composerContext) && !confirm(`Reuse input from ${origin} in the currently selected conversation? Review it before sending.`)) return;
+      putInComposer(unsentInput.take(context));
+      restoreUnsentInput();
+      focusComposer();
+    });
+    const discard = document.createElement('button');
+    discard.type = 'button';
+    discard.textContent = 'Discard';
+    discard.addEventListener('click', () => { unsentInput.take(context); restoreUnsentInput(); });
+    row.append(label, text, reuse, discard);
+    recoveredInputEl.appendChild(row);
+  }
+  recoveredInputEl.classList.toggle('hidden', !recoveredInputEl.children.length);
+}
+
+/** Disconnects and context replacements preserve local input without replay or retargeting. */
+function keepUnsentInput(session: LiveSession, context = inputContexts.get(session.id) || inputContextOf(session)) {
+  unsentInput.keepInFlight(context);
+  for (const command of messageQueue.filter(command => command.sessionId === session.id)) {
+    unsentInput.keep(command.inputContext || context, { text: command.message || '', images: command.images || [] });
+  }
+  messageQueue = messageQueue.filter(command => command.sessionId !== session.id);
+  const dispatch = queuedPrompts.get(session.id);
+  if (dispatch) {
+    clearTimeout(dispatch.retryTimer);
+    if (!dispatch.accepted && !dispatch.started) {
+      unsentInput.keep(dispatch.command.inputContext || context, { text: dispatch.command.message || '', images: dispatch.command.images || [] });
+    }
+    queuedPrompts.delete(session.id);
+  }
+  if (session.id === activeLiveSessionId && sameContext(composerContext, context)) bindComposerContext(null);
+  restoreUnsentInput();
+}
+
+function settlePrompt(id: string, delivered: boolean, error?: unknown) {
+  if (!unsentInput.settle(id, delivered)) return;
+  flashStatusError(String(error || 'Pi did not get your message.'), 5000);
+  restoreUnsentInput();
+}
+
+function activeTabIsShared() {
+  const session = liveSessions.find(s => s.id === activeLiveSessionId);
+  return !!(session?.shared || session?.attached);
+}
+
+function activeTabCanNavigate() {
+  return viewingActiveSession && captureCommandTarget() !== null
+    && !!liveSessions.find(s => s.id === activeLiveSessionId)?.capabilities?.navigateTree;
+}
 
 function sendMessage() {
+  if (closePending()) {
+    flashStatusError('This agent is being closed. Your input is still here.');
+    return;
+  }
+  if (takeRequest?.sessionId === activeLiveSessionId) {
+    flashStatusError('Finish taking the session before sending a message.');
+    return;
+  }
+  if (!viewingActiveSession || !activeLiveSessionId || !composerContext || !commandContextIsCurrent(activeLiveSessionId, composerContext)) {
+    flashStatusError('Select a live conversation before sending. Your input is still here.');
+    return;
+  }
   const message = messageInput.value.trim();
   if (!message && pendingImages.length === 0) return;
-
   // Pi runs /compact only in its terminal UI, so Tau runs it here instead
   // of sending the text to the model.
   const compactCommand = parseCompactCommand(message);
@@ -1638,11 +2263,21 @@ function sendMessage() {
     }
     return;
   }
+  if (wsClient.ws?.readyState !== WebSocket.OPEN) {
+    // Keep the draft: a send now would be dropped, for instance while a phone
+    // reconnects after the server restarted.
+    flashStatusError('Reconnecting; your message is still here, send it again in a moment.');
+    if (wsClient.ws?.readyState !== WebSocket.CONNECTING) wsClient.forceReconnect();
+    return;
+  }
 
   messageInput.value = '';
   messageInput.style.height = 'auto';
 
-  const cmd: QueuedCommand = { type: 'prompt', message: message || '(see attached image)' };
+  // Another frontend sharing this Pi can start a run at any moment; Pi then
+  // needs to know how to queue the prompt. It ignores this when idle.
+  const cmd: QueuedCommand = { type: 'prompt', inputContext: copyInputContext(composerContext), message: message || '(see attached image)', streamingBehavior: 'followUp' };
+  const images = pendingImages;
 
   if (pendingImages.length > 0) {
     cmd.images = pendingImages.map(img => {
@@ -1662,6 +2297,16 @@ function sendMessage() {
   }
 
   cmd.sessionId = activeLiveSessionId;
+  resumeQueuedInput = true;
+
+  if (state.isStreaming && activeTabIsShared() && !sessionHasPendingWork(activeLiveSessionId)) {
+    // The run may belong to another frontend: Pi takes this now and every
+    // frontend, this one included, draws it when Pi delivers it.
+    cmd.streamingBehavior = 'steer';
+    setStatusMessage('Sent; Pi reads it at its next step', 3000);
+    sendPrompt(cmd, { text: message, images });
+    return;
+  }
 
   if (state.isStreaming || sessionHasPendingWork(activeLiveSessionId)) {
     // Queue it for the current Tau tab only; do not let tab switches retarget it.
@@ -1672,10 +2317,18 @@ function sendMessage() {
   }
 
   lastSentMessage = message;
+  assistantBlocks.boundary();
   messageRenderer.renderUserMessage({ content: message, images: cmd.images });
-  cmd.id = `prompt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
-  sentPrompts.set(cmd.id, activeLiveSessionId);
-  wsClient.send(cmd);
+  sendPrompt(cmd, { text: message, images });
+}
+
+/** Track only input actually handed to Tau, not a still-local queued draft. */
+function sendPrompt(command: QueuedCommand, input: UnsentInput) {
+  if (command.inputContext) {
+    command.id = crypto.randomUUID();
+    unsentInput.track(command.id, command.inputContext, input);
+  }
+  wsClient.send(command);
 }
 
 /** A short note in the transcript. A newer note replaces the previous one. */
@@ -1699,11 +2352,12 @@ function isCompacting(sessionId: string) {
  * reply away. The transcript row is driven by Pi's compaction events.
  */
 function requestCompaction(customInstructions?: string) {
-  if (!viewingActiveSession || !activeLiveSessionId) {
-    messageRenderer.renderError('Select a live Tau tab first.');
+  const target = viewingActiveSession ? captureCommandTarget() : null;
+  if (!target) {
+    flashStatusError('Select a live conversation before compacting.');
     return false;
   }
-  const sessionId = activeLiveSessionId;
+  const sessionId = target.sessionId;
   if (isCompacting(sessionId)) {
     showCompactionNote('Compaction is already running.');
     return false;
@@ -1717,24 +2371,19 @@ function requestCompaction(customInstructions?: string) {
   hideCompactButton();
   renderLiveTabs();
   updateUI();
-  void sendCompactRequest(sessionId, customInstructions);
+  void sendCompactRequest(target, customInstructions);
   return true;
 }
 
 // Pi answers only after compaction ends. Once Pi has started, its events
 // already report the outcome, so the reply only reports a failure to start.
-async function sendCompactRequest(sessionId: string, customInstructions?: string) {
+async function sendCompactRequest(target: CommandTarget, customInstructions?: string) {
+  const { sessionId } = target;
   const startsBefore = compactionStarts.get(sessionId) || 0;
   let failure: string | null = null;
   try {
-    const response = await fetch('/api/rpc', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type: 'compact', sessionId, ...(customInstructions ? { customInstructions } : {}) }),
-    });
-    const data = await response.json();
-    if (!data.success && !data.compactionStarted) failure = data.error || 'Pi did not start compacting';
-  } catch (error) {
-    failure = error instanceof Error && error.message ? error.message : 'Could not reach the server';
+    const data = await rpcCommand({ type: 'compact', ...target, ...(customInstructions ? { customInstructions } : {}) });
+    if (!data?.success && !data?.compactionStarted) failure = data?.error || 'Pi did not start compacting';
   } finally {
     compactRequests.delete(sessionId);
   }
@@ -1751,6 +2400,10 @@ const queuedMessagesEl = document.getElementById('queued-messages')!;
 
 function renderQueuedMessages() {
   queuedMessagesEl.innerHTML = '';
+  if (!viewingActiveSession) {
+    queuedMessagesEl.classList.add('hidden');
+    return;
+  }
   const uncertain = activeLiveSessionId ? queuedPrompts.get(activeLiveSessionId) : undefined;
   if (uncertain?.uncertain) {
     const el = document.createElement('div');
@@ -1759,11 +2412,19 @@ function renderQueuedMessages() {
     el.title = 'The acknowledgement was lost. This instruction may have run. Waiting for confirmed execution or completion before sending more.';
     queuedMessagesEl.appendChild(el);
   }
-  if (messageQueue.length === 0 && !uncertain?.uncertain) {
-    queuedMessagesEl.classList.add('hidden');
-    return;
+  // What Pi itself is holding, from whichever frontend it came.
+  const piQueue = (activeLiveSessionId && piQueues.get(activeLiveSessionId)) || { steering: [], followUp: [] };
+  for (const [label, messages] of [['Steering', piQueue.steering], ['Follow-up', piQueue.followUp]] as const) {
+    for (const message of messages) {
+      const el = document.createElement('div');
+      el.className = 'queued-msg';
+      el.innerHTML = `
+      <span class="queued-msg-label">${label}</span>
+      <span class="queued-msg-text">${escapeHtml(message)}</span>
+    `;
+      queuedMessagesEl.appendChild(el);
+    }
   }
-  queuedMessagesEl.classList.remove('hidden');
   messageQueue.forEach((cmd, i) => {
     if (cmd.sessionId !== activeLiveSessionId) return;
     const el = document.createElement('div');
@@ -1787,6 +2448,8 @@ function renderQueuedMessages() {
     queuedMessagesEl.appendChild(el);
   });
   queuedMessagesEl.classList.toggle('hidden', queuedMessagesEl.children.length === 0);
+  // The panel takes room from the conversation: its latest line stays in view.
+  if (!isScrolledUp) messageRenderer.scrollToBottom();
 }
 
 function escapeHtml(text: string) {
@@ -1796,12 +2459,20 @@ function escapeHtml(text: string) {
 }
 
 function flushQueue() {
-  if (applyingMissedEvents || !activeLiveSessionId || state.isStreaming || sessionHasPendingWork(activeLiveSessionId)) return;
+  if (!viewingActiveSession || !composerContext || !activeLiveSessionId || !commandContextIsCurrent(activeLiveSessionId, composerContext) || wsClient.ws?.readyState !== WebSocket.OPEN || state.isStreaming || !resumeQueuedInput || sessionHasPendingWork(activeLiveSessionId) || takeRequest?.sessionId === activeLiveSessionId) return;
   const idx = messageQueue.findIndex(cmd => cmd.sessionId === activeLiveSessionId);
   if (idx >= 0) {
+    if (!sameContext(messageQueue[idx].inputContext || null, composerContext)) {
+      const [command] = messageQueue.splice(idx, 1);
+      if (command.inputContext) unsentInput.keep(command.inputContext, { text: command.message || '', images: command.images || [] });
+      restoreUnsentInput();
+      renderQueuedMessages();
+      return;
+    }
     if (messageQueue[idx].error) return; // A failed instruction needs an explicit retry or cancellation.
     const [cmd] = messageQueue.splice(idx, 1);
     lastSentMessage = cmd.message ?? null;
+    assistantBlocks.boundary();
     messageRenderer.renderUserMessage({ content: cmd.message, images: cmd.images });
     renderQueuedMessages();
     // Paired settled/metadata updates may arrive before Pi starts this
@@ -1899,27 +2570,48 @@ function abortState(sessionId: string) {
 }
 
 function sessionHasPendingWork(sessionId: string) {
-  return queuedPrompts.has(sessionId) || isCompacting(sessionId) || pendingInteractionCount(sessionId) > 0 || (abortState(sessionId) === 'stopping' && !settledWhileStopping.has(sessionId));
+  return closePending(sessionId) || queuedPrompts.has(sessionId) || isCompacting(sessionId) || pendingInteractionCount(sessionId) > 0 || (abortState(sessionId) === 'stopping' && !settledWhileStopping.has(sessionId));
 }
 
 function abortActiveSession() {
   if (!viewingActiveSession || !activeLiveSessionId) return;
   const sessionId = activeLiveSessionId;
   if (abortRequests.has(sessionId)) return;
+  const session = liveSessions.find(session => session.id === sessionId)!;
+  const shared = !!(session.shared || session.attached);
+  if (shared && !confirm('Abort current work for EVERY frontend and remove ALL queued input from this agent? Returned queue text is kept for review only in this browser, never resent. The agent itself keeps running.')) return;
+  const target = captureCommandTarget(sessionId);
+  if (!target) return;
+  const context = target.inputContext;
+  if (shared) {
+    keepUnsentInput(session, context);
+    bindComposerContext(context);
+  }
   const revision = operationRevisions.get(sessionId) || 0;
   localAbortStates.set(sessionId, 'stopping');
   settledWhileStopping.delete(sessionId);
   updateUI();
   const request = (async () => {
     try {
+      // Stopping work must not wait for a queue-clear acknowledgement that may be lost.
+      if (shared) void clearSharedQueue(sessionId, true);
       const response = await fetch('/api/rpc', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'abort', sessionId }),
+        body: JSON.stringify({ type: 'abort', ...target }),
       });
       const data = await response.json();
       if (!response.ok || !data.success) throw new Error(data.error || 'Pi did not acknowledge the stop');
-      localAbortStates.delete(sessionId);
       const session = liveSessions.find(session => session.id === sessionId);
+      // An attached Pi acknowledges the command through mux, not through the
+      // native stop-state registry. Acceptance cannot establish operation idle
+      // or discard its dialogs; wait for settled/authoritative idle metadata.
+      if (session?.attached) {
+        if ((operationRevisions.get(sessionId) || 0) !== revision || session.isStreaming === false) {
+          localAbortStates.delete(sessionId);
+        }
+        return;
+      }
+      localAbortStates.delete(sessionId);
       // A queued instruction may already have started after agent_settled.
       // This HTTP response belongs to the operation we originally stopped.
       if (session && (operationRevisions.get(sessionId) || 0) === revision) {
@@ -1927,6 +2619,7 @@ function abortActiveSession() {
         session.isStreaming = false;
         if (viewingActiveSession && activeLiveSessionId === sessionId) {
           state.setStreaming(false);
+          assistantBlocks.setWorking(false);
           toolCardRenderer.settleNestedCalls();
           showTypingIndicator(false);
         }
@@ -1947,14 +2640,58 @@ function abortActiveSession() {
 
 abortBtn.addEventListener('click', abortActiveSession);
 
+async function takeFromHerdr() {
+  const session = liveSessions.find(item => item.id === activeLiveSessionId);
+  if (!viewingActiveSession || !session) {
+    flashStatusError('Select a live Tau tab first. The Herdr conversation will replace it here.');
+    return;
+  }
+  if (takeRequest || state.isStreaming || session.isStreaming || messageQueue.some(cmd => cmd.sessionId === session.id)
+    || sessionHasPendingWork(session.id) || dialogHandler.currentRequest?.sessionId === session.id) {
+    flashStatusError('Finish the current work, queued messages and dialogs before taking a session.');
+    return;
+  }
+  if (wsClient.ws?.readyState !== WebSocket.OPEN) {
+    flashStatusError('Reconnect to Tau before taking a session.');
+    return;
+  }
+  const target = captureCommandTarget(session.id);
+  if (!target) return;
+  const request = { id: crypto.randomUUID(), ...target };
+  takeRequest = request;
+  updateLiveSessionInputState();
+  try {
+    const response = await fetch('/api/rpc', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...request, type: 'prompt', message: '/take herdr' }),
+    });
+    const result = await response.json();
+    if (!response.ok || result.success !== true) throw new Error(result.error || 'Session takeover failed.');
+    // Pi's RPC select dialog supplies the picker. Its real prompt response is
+    // forwarded over the socket even if Tau stopped waiting after ten seconds.
+  } catch (error) {
+    if (takeRequest === request) {
+      takeRequest = null;
+      updateLiveSessionInputState();
+      flashStatusError(error instanceof Error ? error.message : 'Session takeover failed.');
+    }
+  }
+}
+
 // Command Palette
 const commandPaletteController = setupCommandPalette([
-  { icon: '🌳', label: 'Session tree', desc: 'Jump to any earlier point in the session tree', action: () => { void treeViewController.open(); } },
-  { icon: '🗜️', label: 'Compact', desc: 'Compact context to save tokens', action: () => { requestCompaction(); } },
+  { icon: '↙', label: 'Take from Herdr…', desc: 'Take an idle Herdr conversation into this Tau tab', available: () => viewingActiveSession, action: () => { void takeFromHerdr(); } },
+  { icon: '✨', label: 'New session', desc: 'Start over in this shared agent; every frontend moves with it', available: activeTabCanStartOver, action: () => { void newSharedSession(); } },
+  { icon: '🌳', label: 'Session tree', desc: 'Jump to any earlier point in the session tree', available: activeTabCanNavigate, action: () => { void treeViewController.open(); } },
+  { icon: '×', label: 'Clear agent queue everywhere…', desc: 'Remove all frontends’ queued input; keep returned text here for review', available: () => activeTabIsShared() && captureCommandTarget() !== null, action: () => { void clearSharedQueue(); } },
+  { icon: '×', label: 'Close agent', desc: 'Close this agent in every frontend', available: () => viewingActiveSession && !!activeLiveSessionId, action: () => { if (activeLiveSessionId) void closeLiveSession(activeLiveSessionId); } },
+  { icon: '🗜️', label: 'Compact', desc: 'Compact context to save tokens', available: () => viewingActiveSession && captureCommandTarget() !== null, action: () => { requestCompaction(); } },
   { icon: '📋', label: 'Export HTML', desc: 'Export session as HTML file', action: () => rpcExportHtml() },
   { icon: '📊', label: 'Session Stats', desc: 'Show session statistics', action: () => showSessionStats() },
-  { icon: '⬇️', label: 'Expand All Tools', desc: 'Expand all tool cards', action: () => toolCardRenderer.expandAll() },
-  { icon: '⬆️', label: 'Collapse All Tools', desc: 'Collapse all tool cards', action: () => toolCardRenderer.collapseAll() },
+  { icon: '⬇️', label: 'Expand All Steps', desc: 'Show all assistant activity', action: () => setAssistantBlocksExpanded(true) },
+  { icon: '⬆️', label: 'Collapse All Steps', desc: 'Show only results', action: () => setAssistantBlocksExpanded(false) },
+  { icon: '⬇️', label: 'Expand All Tools', desc: 'Show tool details and calls', action: () => toolCardRenderer.expandAll() },
+  { icon: '⬆️', label: 'Collapse All Tools', desc: 'Hide tool details and calls', action: () => toolCardRenderer.collapseAll() },
 ]);
 
 async function rpcCommand(cmd: RpcCommand, statusMsg = '') {
@@ -1963,10 +2700,19 @@ async function rpcCommand(cmd: RpcCommand, statusMsg = '') {
     const needsLiveSession = !cmd.sessionId && !cmd.filePath && !backendLocalCommands.has(cmd.type);
     if (needsLiveSession && (!viewingActiveSession || !activeLiveSessionId)) {
       const error = 'Select a live Tau tab first.';
-      setStatusMessage(error, wsClient.ws?.readyState === WebSocket.OPEN ? 'Connected' : 'Disconnected', 3000);
+      setStatusMessage(error, 3000);
       return { type: 'response', command: cmd.type, success: false, error };
     }
-    if (!cmd.sessionId && viewingActiveSession && activeLiveSessionId) cmd = { ...cmd, sessionId: activeLiveSessionId };
+    if (!cmd.sessionId && viewingActiveSession && activeLiveSessionId && !backendLocalCommands.has(cmd.type)) cmd = { ...cmd, sessionId: activeLiveSessionId };
+    const readOnly = new Set(['get_state', 'get_messages', 'get_commands', 'get_session_stats', 'get_tree', 'get_entries', 'live_session_snapshot_request']);
+    if (!backendLocalCommands.has(cmd.type) && !readOnly.has(cmd.type) && cmd.sessionId) {
+      const target = 'inputContext' in cmd ? { sessionId: cmd.sessionId, inputContext: cmd.inputContext as InputContext }
+        : captureCommandTarget(cmd.sessionId);
+      if (!target?.inputContext || !commandContextIsCurrent(target.sessionId, target.inputContext)) {
+        return { type: 'response', command: cmd.type, success: false, error: 'The conversation changed or is not ready. Nothing was sent.' };
+      }
+      cmd = { ...cmd, ...target };
+    }
     if (statusMsg) setStatusMessage(statusMsg);
     const resp = await fetch('/api/rpc', {
       method: 'POST',
@@ -1975,20 +2721,33 @@ async function rpcCommand(cmd: RpcCommand, statusMsg = '') {
     });
     const data = await resp.json();
     if (data.success) {
-      setStatusMessage('Done', 'Connected', 2000);
+      setStatusMessage('Done', 2000);
     } else {
-      setStatusMessage(data.error || 'Failed', 'Connected', 3000);
+      setStatusMessage(data.error || 'Failed', 3000);
     }
     return data;
   } catch (e) {
-    setStatusMessage('Error', 'Connected', 3000);
+    setStatusMessage('Error', 3000);
   }
+}
+
+/** Root agents can start over in place; workers stay on their file. */
+function activeTabCanStartOver() {
+  const session = liveSessions.find(s => s.id === activeLiveSessionId);
+  return viewingActiveSession && !!session && captureCommandTarget(session.id) !== null && session.attached?.placement !== 'worker';
+}
+
+async function newSharedSession() {
+  const session = liveSessions.find(s => s.id === activeLiveSessionId);
+  if (session?.isStreaming && !confirm('This agent is working. A new session stops that work, in every frontend. Start over?')) return;
+  const data = await rpcCommand({ type: 'new_session' }, 'Starting a new session...');
+  if (data?.success && data.data?.cancelled) flashStatusError('This agent refused a new session; workers stay on their session file.', 8000);
 }
 
 async function rpcExportHtml() {
   const data = await rpcCommand({ type: 'export_html' }, 'Exporting...');
   if (data?.success && data.data?.path) {
-    setStatusMessage(`Exported: ${data.data.path}`, 'Connected', 4000);
+    setStatusMessage(`Exported: ${data.data.path}`, 4000);
   }
 }
 
@@ -2008,28 +2767,79 @@ async function showSessionStats() {
   }
 }
 
+/** After opening something on purpose. A phone keeps its keyboard down, and an open dialog keeps the focus. */
+function focusComposer() {
+  if (!isMobile() && !dialogHandler.currentRequest) messageInput.focus();
+}
+
+/** Opening a known runtime does not depend on the overview's discovery cadence. */
+async function attachSharedAgent(muxId: string, selection = beginViewSelection()): Promise<boolean> {
+  try {
+    let target = liveSessions.find(session => session.attached?.muxId === muxId && session.inputReady !== false);
+    if (!target) {
+      const res = await fetch('/api/live-sessions/attach', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ muxId }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error || !data.session || data.session.attached?.muxId !== muxId) throw new Error(data.error || 'Could not open the agent');
+      rememberOpenedSession(data.session);
+      target = liveSessions.find(session => session.id === data.session.id);
+    }
+    if (!target) throw new Error('The agent closed before its view was ready');
+    // Attaching can take seconds; whatever the user opened meanwhile stays.
+    if (selection !== viewSelection) return false;
+    await selectLiveSession(target.id, true, selection);
+    return selection === viewSelection && viewingActiveSession && activeLiveSessionId === target.id;
+  } catch (error) {
+    if (selection === viewSelection) flashStatusError(error instanceof Error ? error.message : 'Could not open the agent', 8000);
+    return false;
+  }
+}
+
+// Agent overview: tapping a shared agent attaches a Tau tab to it, or selects
+// the tab already attached. Reconnect uses the same operation directly.
+const agentsPanel = setupAgentsPanel({
+  button: document.getElementById('agents-btn')!,
+  focusComposer,
+  async open(agent) {
+    if (agent.tabId && liveSessions.some(s => s.id === agent.tabId)) {
+      const selection = beginViewSelection();
+      await selectLiveSession(agent.tabId, true, selection);
+      return selection === viewSelection;
+    }
+    return attachSharedAgent(agent.muxId);
+  },
+});
+
 // Model Picker
 const modelPickerController = setupModelPicker({
   getActiveLiveSessionId: () => activeLiveSessionId,
   isViewingActiveSession: () => viewingActiveSession,
   rpcCommand,
+  captureCommandTarget,
+  commandContextIsCurrent,
   flashStatusError,
   escapeHtml,
   setContextWindowSize(value) { contextWindowSize = value; },
   updateContextPill,
+  focusComposer,
 });
 
 // Session tree view (modal opened from the header git-branch button, or the
 // command palette). Selecting an entry moves the session leaf server-side;
 // the conversation re-renders when the server broadcasts a fresh snapshot.
 const treeViewController = setupTreeView({
-  getActiveLiveSessionId: () => (viewingActiveSession && activeLiveSessionId ? activeLiveSessionId : null),
+  getActiveLiveSessionId: () => (activeTabCanNavigate() ? activeLiveSessionId : null),
   isStreaming: () => state.isStreaming,
-  setComposerText(text) {
-    messageInput.value = text;
-    // Trigger the textarea auto-resize handler.
-    messageInput.dispatchEvent(new Event('input'));
-    if (!isMobile()) messageInput.focus();
+  getViewSelection: () => viewSelection,
+  captureCommandTarget,
+  rpcCommand,
+  captureComposerText() {
+    const origin = composerContext ? copyInputContext(composerContext) : null;
+    return (text) => {
+      if (origin && text) unsentInput.keep(origin, { text, images: [] });
+      restoreUnsentInput();
+    };
   },
   flashStatusError,
 });
@@ -2043,13 +2853,23 @@ document.addEventListener('keydown', (e) => {
   // Escape — Abort streaming, or close sidebar on mobile
   if (e.key === 'Escape') {
     // Close palettes/panels first
-    if (modelPickerController.closeIfOpen()) return;
-    if (treeViewController.closeIfOpen()) return;
+    let closed = modelPickerController.closeIfOpen() || treeViewController.closeIfOpen() || commandPaletteController.closeIfOpen();
+    if (agentsPanel.isVisible()) {
+      agentsPanel.hide();
+      closed = true;
+    }
+    if (!newLiveSessionModal?.classList.contains('hidden')) {
+      closeNewLiveSessionModal();
+      closed = true;
+    }
     if (!settingsPanel.classList.contains('hidden')) {
       closeSettings();
+      closed = true;
+    }
+    if (closed) {
+      focusComposer();
       return;
     }
-    if (commandPaletteController.closeIfOpen()) return;
 
     if (viewingActiveSession && activeLiveSessionId && (state.isStreaming || sessionHasPendingWork(activeLiveSessionId))) {
       abortActiveSession();
@@ -2107,8 +2927,9 @@ refreshSessionsBtn.addEventListener('click', () => {
     return;
   }
   refreshSessionsBtn.classList.add('spinning');
-  sidebar.loadSessions().then(() => {
+  sidebar.loadProjects().then(() => {
     setTimeout(() => refreshSessionsBtn.classList.remove('spinning'), 600);
+    updateLiveSessionIndicators();
   });
 });
 
@@ -2151,7 +2972,6 @@ refreshSessionsBtn.addEventListener('click', () => {
   }, { passive: true });
 })();
 
-// Session search
 sessionSearchInput.addEventListener('input', () => {
   sidebar.setSearchQuery(sessionSearchInput.value);
 });
@@ -2170,22 +2990,15 @@ async function newSession() {
   if (!isMobile()) messageInput.focus();
 }
 
-async function handleSessionSelect(session: SidebarSession | null, project: SidebarProject | null) {
-  // A row built from a live tab selects that tab. It may have no file yet.
-  if (session?.liveSessionId) {
-    await selectLiveSession(session.liveSessionId);
-    if (isMobile()) {
-      sidebarEl.classList.add('collapsed');
-      sidebarOverlay.classList.remove('visible');
-    }
-    return;
-  }
+async function handleSessionSelect(session: SidebarSession | null) {
+  sessionLink.cancel();
   if (session) sidebar.setActive(session.filePath);
   sessionTotalCost = 0;
   lastInputTokens = 0;
   lastUsage = null;
   updateContextPill();
-  if (session) await switchSession(session.filePath, session, project);
+  if (session) await switchSession(session.filePath, session);
+  else await switchSession(null);
 
   // Close sidebar on mobile after selecting
   if (isMobile()) {
@@ -2194,18 +3007,110 @@ async function handleSessionSelect(session: SidebarSession | null, project: Side
   }
 }
 
-async function switchSession(sessionFile: string | null | undefined, session: SidebarSession | null = null, project: SidebarProject | null = null) {
+// ═══════════════════════════════════════
+// Read-only follow of a session another Pi process owns
+// ═══════════════════════════════════════
+
+/*
+ * A session file that an orchestration worker (tmux, Herdr, Emacs) is
+ * appending to must not be resumed here: two `pi` processes writing one JSONL
+ * file interleave entries and fork the conversation tree. Such a session is
+ * shown read-only instead, re-read from disk while it grows.
+ */
+
+const FOLLOW_POLL_MS = 3000;
+
+type SessionOwner = { name: string; host: string };
+type FollowedSession = {
+  dirName: string;
+  file: string;
+  offset: number;
+  entries: SessionHistoryEntry[];
+  owner: SessionOwner;
+  timer: ReturnType<typeof setInterval>;
+  selection: number;
+  polling: boolean;
+};
+
+let followed: FollowedSession | null = null;
+
+function sessionOwnerOf(value: unknown): SessionOwner | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const { name, host } = value as { name?: unknown; host?: unknown };
+  return typeof name === 'string' && typeof host === 'string' ? { name, host } : null;
+}
+
+function stopFollowing() {
+  if (!followed) return;
+  clearInterval(followed.timer);
+  followed = null;
+}
+
+async function readFollowedSession(dirName: string, file: string, since: number) {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(dirName)}/${encodeURIComponent(file)}?since=${since}`);
+  const data = await res.json();
+  if (!res.ok || data.error) throw new Error(data.error || 'Failed to read session file');
+  return data as { entries: SessionHistoryEntry[]; offset: number; reset: boolean };
+}
+
+function renderFollowedSession(current: FollowedSession) {
+  clearConversation();
+  messageRenderer.renderSystemMessage(
+    `Read-only: ${current.owner.name} is running this session on ${current.owner.host}. Open it again once that worker finishes to continue it here.`
+  );
+  renderSessionHistory(current.entries);
+  updateLiveSessionInputState();
+  updateUI();
+}
+
+async function pollFollowedSession() {
+  const current = followed;
+  if (!current || current.selection !== viewSelection || current.polling) return;
+  current.polling = true;
   try {
-    parkActiveView();
+    const chunk = await readFollowedSession(current.dirName, current.file, current.offset);
+    if (followed !== current || current.selection !== viewSelection) return;
+    current.offset = chunk.offset;
+    if (chunk.reset) current.entries = chunk.entries;
+    else if (chunk.entries.length) current.entries = current.entries.concat(chunk.entries);
+    else return;
+    renderFollowedSession(current);
+  } catch (e) {
+    if (followed !== current || current.selection !== viewSelection) return;
+    stopFollowing();
+    messageRenderer.renderError(e instanceof Error ? e.message : 'Stopped following this session');
+  } finally {
+    current.polling = false;
+  }
+}
+
+async function followSession(session: SidebarSession, owner: SessionOwner, selection: number) {
+  if (selection !== viewSelection) return;
+  stopFollowing();
+  const { dir: dirName, file } = session;
+  try {
+    const chunk = await readFollowedSession(dirName, file, 0);
+    if (selection !== viewSelection) return;
+    followed = { dirName, file, offset: chunk.offset, entries: chunk.entries, owner, selection, polling: false, timer: setInterval(pollFollowedSession, FOLLOW_POLL_MS) };
+    renderFollowedSession(followed);
+  } catch (e) {
+    if (selection === viewSelection) messageRenderer.renderError(e instanceof Error ? e.message : 'Failed to read session file');
+  }
+}
+
+async function switchSession(sessionFile: string | null | undefined, session: SidebarSession | null = null) {
+  const selection = beginViewSelection();
+  bindComposerContext(null);
+  voiceInput?.cancel();
+  try {
     // Clear any streaming state from previous session to prevent bleed
-    currentStreamingElement = null;
-    currentStreamingThinking = '';
-    currentStreamingText = '';
+    currentMessageSteps.clear();
     pendingAssistantError = null;
     retryStatusElement = null;
     dialogHandler.clearCurrentDialog();
     viewingActiveSession = false;
-    
+    stopFollowing();
+
     state.reset();
     showTypingIndicator(false);
     updateUI();
@@ -2217,37 +3122,47 @@ async function switchSession(sessionFile: string | null | undefined, session: Si
     if (sessionFile) {
       const live = liveSessions.find(s => s.sessionFile === sessionFile);
       if (live) {
-        await selectLiveSession(live.id);
+        await selectLiveSession(live.id, true, selection);
+        return;
+      }
+      const owner = session ? sessionOwnerOf(session.owner) : null;
+      if (owner) {
+        updateLiveSessionInputState();
+        await followSession(session!, owner, selection);
         return;
       }
       // No live tab yet — ask the server to resume this session.
       messageRenderer.renderSystemMessage('Resuming session…');
       try {
-        const resumeBody: Record<string, unknown> = { filePath: sessionFile };
-        if (project?.path) resumeBody.cwd = project.path;
+        // The server reads the project directory from the session's own
+        // header, so the resume request only has to name the file.
         const res = await fetch('/api/live-sessions/resume', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(resumeBody),
+          body: JSON.stringify({ filePath: sessionFile }),
         });
         const data = await res.json();
+        if (res.ok && !data.error && data.session) rememberOpenedSession(data.session);
+        if (selection !== viewSelection) return;
         if (!res.ok || data.error) {
           clearConversation();
-          messageRenderer.renderError(data.error || 'Failed to resume session');
           viewingActiveSession = false;
           updateLiveSessionInputState();
           updateUI();
+          // The listing was stale: another process took the session over
+          // between the click and the request.
+          const refused = sessionOwnerOf(data.owner);
+          if (refused && session) {
+            await followSession(session, refused, selection);
+            return;
+          }
+          messageRenderer.renderError(data.error || 'Failed to resume session');
           return;
         }
-        // If the server found an existing live tab (reused), just focus it.
-        if (data.reused && data.session) {
-          upsertLiveSession(data.session);
-          await selectLiveSession(data.session.id);
-          return;
-        }
-        upsertLiveSession(data.session);
-        await selectLiveSession(data.session.id);
+        if (!data.session) throw new Error('The resume response did not identify a live tab');
+        await selectLiveSession(data.session.id, true, selection);
       } catch (e) {
+        if (selection !== viewSelection) return;
         clearConversation();
         messageRenderer.renderError('Failed to resume session');
         viewingActiveSession = false;
@@ -2259,6 +3174,7 @@ async function switchSession(sessionFile: string | null | undefined, session: Si
 
     messageRenderer.renderWelcome();
   } catch (error) {
+    if (selection !== viewSelection) return;
     console.error('[App] Failed to switch session:', error);
     messageRenderer.renderError('Failed to switch session');
   }
@@ -2272,6 +3188,7 @@ function applyLiveSessionSnapshot(data: LiveSessionSnapshotData, requestedAtRevi
   console.log('[LiveSession] Received state snapshot:', data.entries?.length, 'entries');
   const sessionId = data.sessionId || activeLiveSessionId;
   if (!sessionId || !liveSessions.some(session => session.id === sessionId)) return;
+  if (Array.isArray(data.dialogs)) reconcileSharedDialogs(sessionId, data.dialogs, data.generation);
   const interactionRevision = interactionStates.get(sessionId)?.interactionRevision;
   const staleInteractions = interactionRevision !== undefined && data.interactionRevision !== undefined && data.interactionRevision < interactionRevision;
   const staleMetadata = staleInteractions || (requestedAtRevision !== undefined && requestedAtRevision !== (sessionStateRevisions.get(sessionId) || 0));
@@ -2287,13 +3204,16 @@ function applyLiveSessionSnapshot(data: LiveSessionSnapshotData, requestedAtRevi
   if (!staleMetadata) {
     if (data.session) upsertLiveSession(data.session);
     activeLiveSessionFile = data.sessionFile || data.session?.sessionFile || null;
-    sidebar.setActive(activeLiveSessionFile, sessionId);
+    sidebar.setActive(activeLiveSessionFile);
+    if (liveSessions.find(session => session.id === sessionId)?.attached && data.isStreaming === false) {
+      localAbortStates.delete(sessionId);
+    }
     state.setStreaming(!!data.isStreaming);
     showTypingIndicator(!!data.isStreaming);
   }
   updateLiveSessionInputState();
   updateUI();
-  syncSidebarOpenSessions();
+  updateLiveSessionIndicators();
 
   // Update model display — server is canonical, assign directly.
   if (!staleMetadata && data.model !== undefined) {
@@ -2305,24 +3225,16 @@ function applyLiveSessionSnapshot(data: LiveSessionSnapshotData, requestedAtRevi
     modelPickerController.setThinkingLevel(data.thinkingLevel || 'off');
   }
 
-  // Clear and render message history. Reset streaming handles after the
-  // snapshot arrives because live deltas may have created a streaming element
-  // while the snapshot request was in flight; that element is about to be
-  // removed from the DOM.
-  currentStreamingElement = null;
-  currentStreamingThinking = '';
-  currentStreamingText = '';
+  // A snapshot replaces live DOM, including any deltas received in flight.
   clearConversation();
   retryStatusElement = null;
   sessionTotalCost = 0;
-  costFromStats = false;
   lastInputTokens = 0;
   contextTokensEstimated = false;
   lastUsage = null;
 
   if (data.entries && data.entries.length > 0) {
-    const olderEntries = data.entriesStart && data.historyEpoch !== undefined ? data.entriesStart : 0;
-    renderSessionHistory(data.entries, olderEntries > 0 ? { sessionId, epoch: data.historyEpoch!, end: olderEntries } : null);
+    renderSessionHistory(data.entries);
   } else {
     messageRenderer.renderWelcome();
   }
@@ -2330,44 +3242,50 @@ function applyLiveSessionSnapshot(data: LiveSessionSnapshotData, requestedAtRevi
   // metadata already holds the newest of the snapshot and live events.
   const runningCompaction = liveSessions.find(session => session.id === sessionId)?.compaction;
   if (runningCompaction) showRunningCompaction(runningCompaction.reason, runningCompaction.startedAt);
-  activeViewReady = true;
+  assistantBlocks.setWorking(state.isStreaming);
+  if (state.isStreaming) messagesContainer.lastElementChild?.classList.remove('history');
 
   updateContextPill();
   // A snapshot means the session's entries/leaf may have moved (e.g. another
   // client ran navigate_tree) — refresh an open tree modal so it is not stale.
   treeViewController.notifyTreeChanged(data.sessionId || activeLiveSessionId);
+  renderCloseError(sessionId);
   // A live session just loaded — fetch its authoritative stats from pi.
   void sessionStatsCard.refresh();
   processQueuedExtensionUIRequest();
 }
 
-// The sidebar lists the live tabs' sessions first, each with a green dot.
-function syncSidebarOpenSessions() {
-  sidebar.setOpenSessions(liveSessions.map(session => ({
-    id: session.id,
-    filePath: session.sessionFile || null,
-    cwd: session.cwd || '',
-    name: session.sessionName || null,
-    openedAt: Date.parse(session.createdAt || '') || 0,
-  })));
+// Mark all live sessions in the sidebar with a green dot
+function updateLiveSessionIndicators() {
+  const liveFiles = new Set(liveInstances.map(i => i.sessionFile));
+  // Also include the current active live session
+  if (activeLiveSessionFile) liveFiles.add(activeLiveSessionFile);
+
+  document.querySelectorAll('.session-item').forEach(el => {
+    el.classList.toggle('has-live-session', liveFiles.has(el.dataset.filePath));
+  });
 }
 
 // Refresh live-session list for sidebar indicators if WS missed an update
 async function pollInstances() {
-  const requestedAtRevisions = new Map(sessionStateRevisions);
+  const requestedAtConnection = connectionRevision;
+  const requestedAtRevision = liveSessionsRevision;
   try {
     const res = await fetch('/api/live-sessions');
     if (res.ok) {
       const data = await res.json();
+      // Protect membership as well as row metadata: an old empty list must
+      // neither delete a newly attached tab nor resurrect a closed one.
+      if (requestedAtConnection !== connectionRevision || requestedAtRevision !== liveSessionsRevision) return;
       const wasActive = activeLiveSessionId;
-      const sessions = (data.sessions || []).map((session: LiveSession) =>
-        requestedAtRevisions.get(session.id) !== sessionStateRevisions.get(session.id)
-          ? liveSessions.find(current => current.id === session.id) || session
-          : session);
-      setLiveSessions(sessions);
+      const selectedMux = liveSessions.find(session => session.id === wasActive)?.attached?.muxId;
+      setLiveSessions(data.sessions || []);
       const activeSession = wasActive ? liveSessions.find(s => s.id === wasActive) : null;
       if (wasActive && !activeSession) {
-        handleLiveSessionClosed(wasActive);
+        const replacing = !!selectedMux && liveSessions.some(session => session.attached?.muxId === selectedMux);
+        if (replacing) reattachMuxId ??= selectedMux;
+        handleLiveSessionClosed(wasActive, undefined, false, replacing ? 'reconnected' : undefined);
+        if (replacing) restoreReconnectedView();
       } else if (activeSession && viewingActiveSession) {
         state.setStreaming(!!activeSession.isStreaming);
         showTypingIndicator(!!activeSession.isStreaming);
@@ -2386,465 +3304,160 @@ setInterval(pollInstances, 10000);
 function updateLiveSessionInputState() {
   const inputArea = document.querySelector('.input-area');
   const hasLiveSession = viewingActiveSession && !!activeLiveSessionId;
-  if (hasLiveSession) {
+  const inputReady = hasLiveSession && captureCommandTarget() !== null;
+  const closing = closePending();
+  if (inputReady && !closing) {
     messageInput.disabled = false;
-    sendBtn.disabled = false;
+    sendBtn.disabled = takeRequest?.sessionId === activeLiveSessionId;
     messageInput.placeholder = 'Message...';
     inputArea?.classList.remove('no-active-live-session');
   } else {
     messageInput.disabled = true;
     sendBtn.disabled = true;
-    messageInput.placeholder = hasReceivedInitialServerState ? 'Create or select a Tau tab to chat' : 'Connecting...';
-    inputArea?.classList.add('no-active-live-session');
+    messageInput.placeholder = closing ? 'Closing agent…' : hasLiveSession ? 'Waiting for the conversation to become ready…'
+      : hasReceivedInitialServerState ? 'Create or select a Tau tab to chat' : 'Connecting...';
+    inputArea?.classList.toggle('no-active-live-session', !hasLiveSession);
   }
+  takeHerdrBtn.disabled = closing;
+  takeHerdrBtn.setAttribute('aria-busy', String(takeRequest !== null));
+  takeHerdrBtn.classList.toggle('hidden', !hasLiveSession);
   document.getElementById('command-btn')!.disabled = !hasLiveSession;
-  modelPickerController.setEnabled(hasLiveSession);
-  treeViewController.setVisible(hasLiveSession);
+  modelPickerController.setEnabled(inputReady && !closing);
+  treeViewController.setVisible(inputReady && !closing && activeTabCanNavigate());
 }
 
 // ═══════════════════════════════════════
 // Session history rendering
 // ═══════════════════════════════════════
 
-// How many of the newest items are rendered synchronously before first paint;
-// everything older is prepended above in idle-scheduled chunks.
-const INITIAL_SYNC_ITEMS = 30;
-const HISTORY_CHUNK_ITEMS = 50;
-// Opening a session downloads only its newest entries first, then older
-// entries in pages, so the first paint does not wait for the whole history.
-const SNAPSHOT_TAIL_ENTRIES = 80;
-const HISTORY_PAGE_ENTRIES = 300;
-
-// Browsers with native scroll anchoring (Chrome, Firefox) keep the viewport
-// pinned to visible content when history is prepended above it; browsers
-// without it (Safari) need manual scrollTop compensation per chunk.
-const supportsScrollAnchoring =
-  typeof CSS !== 'undefined' && !!CSS.supports && CSS.supports('overflow-anchor', 'auto');
+// Chunk only at user/compaction boundaries: a deferred chunk must never split
+// one assistant activity block or steal the current live block's controller.
+const INITIAL_SYNC_GROUPS = 30;
+const HISTORY_CHUNK_GROUPS = 50;
+const supportsScrollAnchoring = typeof CSS !== 'undefined' && !!CSS.supports && CSS.supports('overflow-anchor', 'auto');
 messagesContainer.classList.toggle('native-scroll-anchoring', supportsScrollAnchoring);
-
-// Generation token for the progressive history fill. Bumping it invalidates
-// every scheduled chunk callback, so switching sessions (or re-applying a
-// snapshot) mid-fill cannot interleave stale chunks into the new conversation.
 let historyRenderToken = 0;
 
-// Older history items still waiting to be rendered above the shown ones.
-// Items render from the end of `items`, newest first. `older` describes the
-// entries not downloaded yet, when the history arrived newest part first.
-type OlderHistory = {
-  sessionId: string;
-  epoch: number;
-  /** Older entries end here; nothing is left to download at 0. */
-  end: number;
-  /** The downloaded entries, from `end` to where the snapshot ended. */
-  entries: SessionHistoryEntry[];
-  /** How many items the downloaded entries make. */
-  itemCount: number;
-  /** The cost of the downloaded replies. */
-  cost: number;
-};
-type HistoryFill = { items: HistoryItem[]; topAnchor: ChildNode | null; older: OlderHistory | null };
-let historyFill: HistoryFill | null = null;
-
-function cancelHistoryRender() {
-  historyRenderToken++;
-  historyFill = null;
+function setAssistantBlocksExpanded(expanded: boolean) {
+  expandedAssistantBlocks = expanded;
+  for (const blocks of assistantBlockControllers) blocks.setExpanded(expanded);
 }
 
-// Whether the shown conversation is complete enough to keep when the user
-// switches tabs: a snapshot was applied, and no reload is in flight.
-let activeViewReady = false;
-
-// Tear down the conversation view as one unit. Clearing the tool-card map
-// alongside the DOM matters: a stale map would hand out detached cards to
-// later toolCallId lookups (expand/collapse, live tool results).
 function clearConversation() {
-  cancelHistoryRender();
+  historyRenderToken++;
   resetCompactionRow();
+  messagesContainer.style.scrollBehavior = '';
+  currentMessageSteps.clear();
+  pendingAssistantError = null;
+  clearRetryStatus();
+  for (const blocks of assistantBlockControllers) blocks.clear();
+  assistantBlockControllers.clear();
+  assistantBlockControllers.add(assistantBlocks);
+  expandedAssistantBlocks = false;
   messageRenderer.clear();
   toolCardRenderer.clear();
   state.toolExecutions.clear();
-  activeViewReady = false;
 }
 
-function renderHistoryItem(item: HistoryItem, target: ParentNode) {
+function renderHistoryItem(item: HistoryItem, blocks: AssistantBlocks, target: HTMLElement) {
   if (item.kind === 'user') {
+    blocks.boundary();
     messageRenderer.renderUserMessage({ content: item.content, images: item.images }, true, target);
-  } else if (item.kind === 'assistant') {
-    messageRenderer.renderAssistantMessage({ content: item.content, usage: item.usage, error: item.error }, false, true, target);
   } else if (item.kind === 'compaction') {
+    blocks.boundary();
     target.appendChild(renderCompactionRow({
       status: 'done', summary: item.summary, tokensBefore: item.tokensBefore, estimatedTokensAfter: item.estimatedTokensAfter,
     }));
   } else {
-    toolCardRenderer.createHistoryCard(
-      {
+    let element: HTMLElement;
+    let label: string;
+    if (item.kind === 'assistant') {
+      element = messageRenderer.renderAssistantStep(item.step);
+      label = item.step.type;
+    } else if (item.kind === 'assistantError') {
+      element = messageRenderer.renderAssistantError(item.error);
+      label = 'error';
+    } else {
+      element = toolCardRenderer.createHistoryCard({
         toolCallId: item.toolCallId, toolName: item.toolName, args: item.args,
         status: item.result !== undefined ? (item.isError ? 'error' : 'complete') : 'pending',
-      },
-      target
-    );
-    if (item.result !== undefined || item.isError) {
-      toolCardRenderer.addHistoryResult(item.toolCallId, item.result ?? { content: [] }, !!item.isError);
+      }, document.createDocumentFragment());
+      if (item.result !== undefined || item.isError) {
+        toolCardRenderer.addHistoryResult(item.toolCallId, item.result ?? { content: [] }, !!item.isError);
+      }
+      label = item.toolName;
     }
+    blocks.append(element, label);
+    element.closest('.assistant-block')?.classList.add('history');
   }
 }
 
-function renderSessionHistory(entries: SessionHistoryEntry[], older: Pick<OlderHistory, 'sessionId' | 'epoch' | 'end'> | null = null) {
-  const { items, totalCost, lastInputTokens: builtInputTokens, contextTokensEstimated: builtEstimated, lastUsage: builtUsage } = buildHistoryItems(entries);
-  console.log(`[History] Rendering ${items.length} items from ${entries.length} entries`);
-  rememberHistoryToolCalls(items);
-
-  // Stats come from the pure pre-pass so the context pill is correct
-  // immediately, even though the DOM fills in newest-first below.
+function renderSessionHistory(entries: SessionHistoryEntry[]) {
+  const token = ++historyRenderToken;
+  const { items, totalCost, lastInputTokens: inputTokens, contextTokensEstimated: estimated, lastUsage: usage } = buildHistoryItems(entries);
+  const groups: HistoryItem[][] = [];
+  for (const item of items) {
+    if (!groups.length || item.kind === 'user' || item.kind === 'compaction') groups.push([]);
+    groups[groups.length - 1].push(item);
+    if (item.kind === 'toolCall') {
+      toolCardRenderer.rememberRoot({ toolCallId: item.toolCallId, toolName: item.toolName, args: item.args,
+        status: item.result !== undefined ? (item.isError ? 'error' : 'complete') : 'pending' });
+    }
+  }
+  // Stats are authoritative immediately, not accumulated by progressive DOM.
   sessionTotalCost = totalCost;
-  lastInputTokens = builtInputTokens;
-  contextTokensEstimated = builtEstimated;
-  lastUsage = builtUsage;
+  lastInputTokens = inputTokens;
+  contextTokensEstimated = estimated;
+  lastUsage = usage;
   updateContextPill();
   fetchContextWindow();
 
-  // Render the newest items synchronously so the first paint shows what the
-  // user actually looks at — the bottom of the conversation.
-  const cursor = Math.max(0, items.length - INITIAL_SYNC_ITEMS);
-  const tail = document.createDocumentFragment();
-  for (const item of items.slice(cursor)) renderHistoryItem(item, tail);
-  // Captured before insertion: after appendChild the fragment is empty.
-  const topAnchor: ChildNode | null = tail.firstChild;
-  messagesContainer.appendChild(tail);
-
-  // Jump to bottom instantly (no smooth scroll animation)
+  let cursor = Math.max(0, groups.length - INITIAL_SYNC_GROUPS);
+  const beforeTail = messagesContainer.lastChild;
+  for (const group of groups.slice(cursor)) {
+    for (const item of group) renderHistoryItem(item, assistantBlocks, messagesContainer);
+  }
+  let topAnchor = beforeTail ? beforeTail.nextSibling : messagesContainer.firstChild;
   messagesContainer.style.scrollBehavior = 'auto';
   requestAnimationFrame(() => {
+    if (token !== historyRenderToken) return;
     messagesContainer.scrollTop = messagesContainer.scrollHeight;
-    // Restore smooth scrolling after a frame
     requestAnimationFrame(() => {
-      messagesContainer.style.scrollBehavior = '';
+      if (token === historyRenderToken) messagesContainer.style.scrollBehavior = '';
     });
   });
 
-  if (cursor === 0 && !older) return;
-  const fill: HistoryFill = {
-    items: items.slice(0, cursor),
-    topAnchor,
-    older: older && { ...older, entries, itemCount: items.length, cost: totalCost },
-  };
-  continueHistoryFill(fill);
-  if (fill.older) void loadOlderHistory(fill, fill.older);
-}
-
-// Live events can name a tool call whose card is not rendered yet, so every
-// history tool call is known before its card exists.
-function rememberHistoryToolCalls(items: HistoryItem[]) {
-  for (const item of items) {
-    if (item.kind === 'toolCall') {
-      toolCardRenderer.rememberRoot({
-        toolCallId: item.toolCallId, toolName: item.toolName, args: item.args,
-        status: item.result !== undefined ? (item.isError ? 'error' : 'complete') : 'pending',
-      });
-    }
-  }
-}
-
-/** Whether a fill still belongs to the shown conversation or a kept view. */
-function historyFillInUse(fill: HistoryFill) {
-  return historyFill === fill || [...parkedViews.values()].some(view => view.fill === fill);
-}
-
-/**
- * Download the older history page by page, newest first, and queue its items
- * above the ones already shown. It keeps going while the tab is hidden, so
- * its kept view is complete when shown again.
- */
-async function loadOlderHistory(fill: HistoryFill, older: OlderHistory) {
-  while (older.end > 0 && fill.older === older && historyFillInUse(fill)) {
-    let page: { entries?: SessionHistoryEntry[]; start?: number };
-    try {
-      const params = new URLSearchParams({ end: String(older.end), limit: String(HISTORY_PAGE_ENTRIES), epoch: String(older.epoch) });
-      const res = await fetch(`/api/live-sessions/${encodeURIComponent(older.sessionId)}/entries?${params}`);
-      // The history was replaced, and the server sends a new snapshot for it.
-      if (res.status === 409) {
-        fill.older = null;
-        return;
-      }
-      page = await res.json();
-      if (!res.ok || !Array.isArray(page.entries) || typeof page.start !== 'number') throw new Error();
-    } catch {
-      fill.older = null;
-      if (historyFillInUse(fill)) showOlderHistoryError(fill);
-      return;
-    }
-    if (fill.older !== older || !historyFillInUse(fill)) return;
-
-    // Building items from all downloaded entries keeps each reply's error
-    // state right when it depends on a later retry in the same turn.
-    const entries = page.entries.concat(older.entries);
-    const built = buildHistoryItems(entries);
-    const added = built.items.slice(0, built.items.length - older.itemCount);
-    const addedCost = built.totalCost - older.cost;
-    older.entries = entries;
-    older.itemCount = built.items.length;
-    older.cost = built.totalCost;
-    older.end = page.start;
-    if (older.end === 0) fill.older = null;
-    fill.items = added.concat(fill.items);
-    if (historyFill === fill) rememberHistoryToolCalls(added);
-    addOlderHistoryTotals(fill, addedCost, built);
-    if (historyFill === fill) continueHistoryFill(fill);
-  }
-}
-
-// Older replies add to the session cost. When the newest part of the
-// history had no usage, the older part tells how full the context is.
-function addOlderHistoryTotals(fill: HistoryFill, addedCost: number, built: ReturnType<typeof buildHistoryItems>) {
-  if (historyFill === fill) {
-    if (!costFromStats) sessionTotalCost += addedCost;
-    if (!lastUsage && lastInputTokens === 0) {
-      lastInputTokens = built.lastInputTokens;
-      contextTokensEstimated = built.contextTokensEstimated;
-      lastUsage = built.lastUsage;
-    }
-    updateContextPill();
-    return;
-  }
-  const view = [...parkedViews.values()].find(view => view.fill === fill);
-  if (!view) return;
-  if (!view.costFromStats) view.totalCost += addedCost;
-  if (!view.usage && view.inputTokens === 0) {
-    view.inputTokens = built.lastInputTokens;
-    view.tokensEstimated = built.contextTokensEstimated;
-    view.usage = built.lastUsage;
-  }
-}
-
-function showOlderHistoryError(fill: HistoryFill) {
-  const note = document.createElement('div');
-  note.className = 'system-message';
-  note.textContent = 'Could not load older messages. Select the tab again to retry.';
-  if (fill.topAnchor?.parentNode) fill.topAnchor.parentNode.insertBefore(note, fill.topAnchor);
-  fill.topAnchor = note;
-}
-
-// Fill in older history above the shown items during idle time. Live
-// streaming messages keep appending at the container's end, below them, so
-// the two never interleave.
-function continueHistoryFill(fill: HistoryFill) {
-  const token = ++historyRenderToken;
-  historyFill = fill;
-
-  const scheduleChunk = (fn: () => void) =>
-    typeof requestIdleCallback === 'function' ? requestIdleCallback(fn, { timeout: 500 }) : setTimeout(fn, 16);
-
+  const scheduleChunk = (fn: () => void) => typeof requestIdleCallback === 'function'
+    ? requestIdleCallback(fn, { timeout: 500 }) : setTimeout(fn, 16);
   const renderOlderChunk = () => {
-    if (token !== historyRenderToken) return;
-    if (fill.topAnchor && !fill.topAnchor.isConnected) return;
-    if (fill.items.length === 0) {
-      if (!fill.older) historyFill = null;
-      return;
+    if (token !== historyRenderToken || !topAnchor?.isConnected) return;
+    const start = Math.max(0, cursor - HISTORY_CHUNK_GROUPS);
+    const target = document.createElement('div');
+    const blocks = new AssistantBlocks(target);
+    assistantBlockControllers.add(blocks);
+    for (const group of groups.slice(start, cursor)) {
+      for (const item of group) renderHistoryItem(item, blocks, target);
     }
-
-    const start = Math.max(0, fill.items.length - HISTORY_CHUNK_ITEMS);
+    blocks.setExpanded(expandedAssistantBlocks);
     const chunk = document.createDocumentFragment();
-    for (const item of fill.items.slice(start)) renderHistoryItem(item, chunk);
-    fill.items.length = start;
-    const newTop: ChildNode | null = chunk.firstChild;
-
+    chunk.append(...Array.from(target.childNodes));
+    const newTop = chunk.firstChild;
     if (supportsScrollAnchoring) {
-      // Native scroll anchoring keeps the reading position fixed when content
-      // is inserted above the viewport — including the deferred size
-      // refinements content-visibility applies after insertion, which a
-      // one-shot manual compensation cannot track.
-      messagesContainer.insertBefore(chunk, fill.topAnchor ?? messagesContainer.firstChild);
+      messagesContainer.insertBefore(chunk, topAnchor);
     } else {
-      // Fallback (Safari): compensate scrollTop for the added height in the
-      // same task, so nothing paints in between. scroll-behavior must be
-      // forced instant for the assignment — the container's CSS smooth
-      // behavior would animate it and lag behind the chunks.
-      const prevBehavior = messagesContainer.style.scrollBehavior;
+      const behavior = messagesContainer.style.scrollBehavior;
       messagesContainer.style.scrollBehavior = 'auto';
-      const prevHeight = messagesContainer.scrollHeight;
-      const prevTop = messagesContainer.scrollTop;
-      messagesContainer.insertBefore(chunk, fill.topAnchor ?? messagesContainer.firstChild);
-      messagesContainer.scrollTop = prevTop + (messagesContainer.scrollHeight - prevHeight);
-      messagesContainer.style.scrollBehavior = prevBehavior;
+      const height = messagesContainer.scrollHeight;
+      const top = messagesContainer.scrollTop;
+      messagesContainer.insertBefore(chunk, topAnchor);
+      messagesContainer.scrollTop = top + messagesContainer.scrollHeight - height;
+      messagesContainer.style.scrollBehavior = behavior;
     }
-
-    if (newTop) fill.topAnchor = newTop;
-    if (fill.items.length > 0) scheduleChunk(renderOlderChunk);
-    else if (!fill.older) historyFill = null;
+    if (newTop) topAnchor = newTop;
+    cursor = start;
+    if (cursor > 0) scheduleChunk(renderOlderChunk);
   };
-
-  scheduleChunk(renderOlderChunk);
-}
-
-// ═══════════════════════════════════════
-// Kept views of hidden tabs
-// ═══════════════════════════════════════
-
-// A tab's built conversation, kept while another tab is shown, so switching
-// back does not download and rebuild it. Events for the hidden tab are kept
-// too and replayed on return, which brings the view up to date.
-type ParkedView = {
-  nodes: DocumentFragment;
-  scrollTop: number;
-  atBottom: boolean;
-  toolCards: ToolCardState;
-  toolExecutions: Map<string, Record<string, unknown>>;
-  streamingElement: HTMLElement | null;
-  streamingText: string;
-  streamingThinking: string;
-  pendingAssistantError: PendingAssistantError | null;
-  retryStatusElement: HTMLElement | null;
-  compactionRow: CompactionRowRef | null;
-  fill: HistoryFill | null;
-  totalCost: number;
-  costFromStats: boolean;
-  inputTokens: number;
-  tokensEstimated: boolean;
-  usage: UsageRecord | null;
-  contextWindow: number;
-  lastSentMessage: string | null;
-  isStreaming: boolean;
-  events: AppEvent[];
-  /** Where each tool's latest output update sits in `events`. */
-  updateIndexes: Map<string, number>;
-};
-
-// Each kept view holds a whole conversation in memory. The least recently
-// shown views are dropped first and rebuilt from the server when needed.
-const MAX_PARKED_VIEWS = 4;
-// A tab that stays hidden through a lot of activity is rebuilt instead of
-// replaying everything it missed.
-const MAX_PARKED_EVENTS = 5000;
-const parkedViews = new Map<string, ParkedView>();
-
-/** Move the shown conversation out of the page and keep it for its tab. */
-function parkActiveView() {
-  if (wsClient.ws?.readyState !== WebSocket.OPEN || !activeViewReady || !viewingActiveSession || !activeLiveSessionId) return;
-  const sessionId = activeLiveSessionId;
-  const fill = historyFill;
-  cancelHistoryRender();
-  const atBottom = messagesContainer.scrollHeight - messagesContainer.scrollTop - messagesContainer.clientHeight < 150;
-  const view: ParkedView = {
-    nodes: document.createDocumentFragment(),
-    scrollTop: messagesContainer.scrollTop,
-    atBottom,
-    toolCards: toolCardRenderer.takeState(),
-    toolExecutions: state.toolExecutions,
-    streamingElement: currentStreamingElement,
-    streamingText: currentStreamingText,
-    streamingThinking: currentStreamingThinking,
-    pendingAssistantError,
-    retryStatusElement,
-    compactionRow,
-    fill,
-    totalCost: sessionTotalCost,
-    costFromStats,
-    inputTokens: lastInputTokens,
-    tokensEstimated: contextTokensEstimated,
-    usage: lastUsage,
-    contextWindow: contextWindowSize,
-    lastSentMessage,
-    isStreaming: state.isStreaming,
-    events: [],
-    updateIndexes: new Map(),
-  };
-  view.nodes.append(...messagesContainer.childNodes);
-  state.toolExecutions = new Map();
-  stopCompactionElapsedTimer();
-  compactionRow = null;
-  currentStreamingElement = null;
-  currentStreamingText = '';
-  currentStreamingThinking = '';
-  pendingAssistantError = null;
-  retryStatusElement = null;
-  activeViewReady = false;
-  parkedViews.delete(sessionId);
-  parkedViews.set(sessionId, view);
-  while (parkedViews.size > MAX_PARKED_VIEWS) parkedViews.delete(parkedViews.keys().next().value!);
-}
-
-/** Put a kept view back in the page and replay what its tab missed. */
-function restoreParkedView(sessionId: string, view: ParkedView, session: LiveSession) {
-  clearConversation();
-  messagesContainer.appendChild(view.nodes);
-  toolCardRenderer.restoreState(view.toolCards);
-  state.toolExecutions = view.toolExecutions;
-  currentStreamingElement = view.streamingElement;
-  currentStreamingText = view.streamingText;
-  currentStreamingThinking = view.streamingThinking;
-  pendingAssistantError = view.pendingAssistantError;
-  retryStatusElement = view.retryStatusElement;
-  sessionTotalCost = view.totalCost;
-  costFromStats = view.costFromStats;
-  lastInputTokens = view.inputTokens;
-  contextTokensEstimated = view.tokensEstimated;
-  lastUsage = view.usage;
-  contextWindowSize = view.contextWindow;
-  lastSentMessage = view.lastSentMessage;
-  if (view.compactionRow) {
-    compactionRow = view.compactionRow;
-    startCompactionElapsedTimer();
-  }
-  activeViewReady = true;
-
-  messagesContainer.style.scrollBehavior = 'auto';
-  messagesContainer.scrollTop = view.atBottom ? messagesContainer.scrollHeight : view.scrollTop;
-  messagesContainer.style.scrollBehavior = '';
-  messageRenderer.isNearBottom = view.atBottom;
-
-  applyingMissedEvents = true;
-  try {
-    state.setStreaming(view.isStreaming);
-    for (const event of view.events) handleRPCEvent(event, sessionId);
-    // The tab's metadata is newer than the events received while it was hidden.
-    state.setStreaming(!!session.isStreaming);
-    showTypingIndicator(!!session.isStreaming);
-  } finally {
-    applyingMissedEvents = false;
-  }
-  if (view.fill) continueHistoryFill(view.fill);
-
-  updateContextPill();
-  fetchContextWindow();
-  void sessionStatsCard.refresh();
-  updateUI();
-}
-
-/**
- * Keep an event for a hidden tab's view. Streaming text is merged into one
- * event, and only the newest output of each running tool is kept, so a busy
- * hidden tab replays a short list.
- */
-function bufferParkedEvent(sessionId: string, event: AppEvent) {
-  const view = parkedViews.get(sessionId);
-  if (!view) return;
-  // These do not change the conversation. Dialogs and notifications reach a
-  // hidden tab through other paths.
-  if (event.type === 'extension_ui_request' || event.type === 'extension_error' || event.type === 'session_name') return;
-  const events = view.events;
-  if (event.type === 'message_update') {
-    const update = event.assistantMessageEvent;
-    // Other updates describe tool calls, which message_end repeats in full.
-    if (update?.type !== 'text_delta' && update?.type !== 'thinking_delta') return;
-    const last = events[events.length - 1];
-    if (last?.type === 'message_update' && last.assistantMessageEvent?.type === update.type) {
-      events[events.length - 1] = {
-        ...last,
-        assistantMessageEvent: { ...last.assistantMessageEvent, delta: (last.assistantMessageEvent.delta || '') + (update.delta || '') },
-      };
-      return;
-    }
-  } else if (event.type === 'tool_execution_update' && event.toolCallId) {
-    const key = `${event.parentToolCallId ?? ''}\u001f${event.toolCallId}`;
-    const index = view.updateIndexes.get(key);
-    if (index !== undefined) {
-      events[index] = event;
-      return;
-    }
-    view.updateIndexes.set(key, events.length);
-  }
-  events.push(event);
-  if (events.length > MAX_PARKED_EVENTS) parkedViews.delete(sessionId);
+  if (cursor > 0) scheduleChunk(renderOlderChunk);
 }
 
 // ═══════════════════════════════════════
@@ -2864,7 +3477,7 @@ function updateContextPill() {
   const estimateNote = contextTokensEstimated ? ' (estimated after compaction)' : '';
   if (lastInputTokens > 0 && contextWindowSize > 0) {
     const pct = Math.round((lastInputTokens / contextWindowSize) * 100);
-    contextPillEl.textContent = `${approx}${pct === 0 ? '<1' : pct}%`;
+    contextPillEl.textContent = pct === 0 ? `${approx}<1%` : `${approx}${pct}%`;
     contextPillEl.classList.add('visible');
     contextPillEl.classList.remove('warning', 'critical');
     if (pct >= 80) {
@@ -2957,12 +3570,15 @@ function currentStatusText() {
 }
 
 function updateUI() {
+  updateLiveSessionInputState();
   const hasLiveSession = !!activeLiveSessionId && viewingActiveSession;
   const isStreaming = state.isStreaming && hasLiveSession;
   const hasPendingInteraction = hasLiveSession && pendingInteractionCount(activeLiveSessionId!) > 0;
   const stopping = hasLiveSession && abortState(activeLiveSessionId!) === 'stopping';
   const compacting = hasLiveSession && isCompacting(activeLiveSessionId!);
-  abortBtn.disabled = !!stopping;
+  const closing = closePending();
+  const inputReady = hasLiveSession && captureCommandTarget() !== null;
+  abortBtn.disabled = !!stopping || !inputReady;
   abortBtn.title = stopping ? 'Stopping…' : 'Abort';
   abortBtn.setAttribute('aria-label', stopping ? 'Stopping…' : 'Abort');
 
@@ -2976,17 +3592,18 @@ function updateUI() {
     statusText.textContent = currentStatusText();
   }
 
-  messageInput.disabled = !hasLiveSession;
-  sendBtn.disabled = !hasLiveSession;
+  messageInput.disabled = !inputReady || closing;
+  sendBtn.disabled = !inputReady || closing || takeRequest?.sessionId === activeLiveSessionId;
 
   if (isStreaming || hasPendingInteraction || stopping || compacting) {
     abortBtn.classList.remove('hidden');
-    sendBtn.classList.add('hidden');
+    // A shared tab can steer, and on a phone this button is how.
+    sendBtn.classList.toggle('hidden', !activeTabIsShared() || !!hasPendingInteraction || !!stopping);
   } else {
     abortBtn.classList.add('hidden');
     sendBtn.classList.remove('hidden');
   }
-  if (hasLiveSession && !isStreaming) flushQueue();
+  if (hasLiveSession && !isStreaming && !closing) flushQueue();
 }
 
 // ═══════════════════════════════════════
@@ -3019,7 +3636,7 @@ function buildThemeGrid() {
   themeGrid.innerHTML = '';
   const current = getCurrentTheme();
 
-  for (const [id, theme] of Object.entries(themes)) {
+  for (const [id, theme] of Object.entries(themes) as [ThemeId, (typeof themes)[ThemeId]][]) {
     const btn = document.createElement('button');
     btn.className = `theme-swatch${current === id ? ' active' : ''}`;
     const dots = (theme.colors || []).map(c => 
@@ -3027,7 +3644,7 @@ function buildThemeGrid() {
     ).join('');
     btn.innerHTML = `<span class="swatch-colors">${dots}</span>`;
     btn.addEventListener('click', () => {
-      applyTheme(id);
+      chooseTheme(id);
       themeGrid.querySelectorAll('.theme-swatch').forEach(s => s.classList.remove('active'));
       btn.classList.add('active');
     });
@@ -3098,8 +3715,10 @@ toggleAutoCompact.addEventListener('click', async () => {
 
 // Thinking level cycle (settings panel button)
 btnThinkingLevel.addEventListener('click', async () => {
-  const data = await rpcCommand({ type: 'cycle_thinking_level' });
-  if (data?.success && data.data?.level) {
+  const target = captureCommandTarget();
+  if (!target) return;
+  const data = await rpcCommand({ type: 'cycle_thinking_level', ...target });
+  if (commandContextIsCurrent(target.sessionId, target.inputContext) && data?.success && data.data?.level) {
     btnThinkingLevel.textContent = data.data.level;
     modelPickerController.setThinkingLevel(data.data.level);
   }
@@ -3114,8 +3733,44 @@ toggleShowThinking.addEventListener('click', () => {
   const isOn = toggleShowThinking.classList.contains('on');
   toggleShowThinking.className = `settings-toggle${isOn ? '' : ' on'}`;
   document.body.classList.toggle('hide-thinking', isOn);
+  for (const blocks of assistantBlockControllers) blocks.refreshThinking();
   localStorage.setItem('tau-show-thinking', String(!isOn));
 });
+
+// Fullscreen preference: on by default for touch devices, off for desktop;
+// an explicit choice is remembered. Browsers only enter fullscreen from a user
+// gesture, so while the preference is on, any tap outside fullscreen enters it
+// (also after the browser left fullscreen, e.g. on an app switch).
+const toggleFullscreen = document.getElementById('toggle-fullscreen')!;
+const installedFullscreen = matchMedia('(display-mode: fullscreen), (display-mode: standalone)').matches;
+if (document.fullscreenEnabled && !installedFullscreen) {
+  const savedFullscreen = localStorage.getItem('tau-fullscreen');
+  let preferFullscreen = savedFullscreen ? savedFullscreen === 'on' : matchMedia('(pointer: coarse)').matches;
+  const changeFullscreen = (enter: boolean) => {
+    if (enter === Boolean(document.fullscreenElement)) return;
+    const change = enter ? document.documentElement.requestFullscreen() : document.exitFullscreen();
+    change.catch((error: unknown) => console.warn('Fullscreen change failed', error));
+  };
+  const syncFullscreenToggle = () => {
+    toggleFullscreen.className = `settings-toggle${preferFullscreen ? ' on' : ''}`;
+  };
+  syncFullscreenToggle();
+  document.addEventListener('click', (event) => {
+    if (preferFullscreen && !(event.target instanceof Element && event.target.closest('#toggle-fullscreen'))) changeFullscreen(true);
+  }, true);
+  toggleFullscreen.addEventListener('click', () => {
+    preferFullscreen = !preferFullscreen;
+    localStorage.setItem('tau-fullscreen', preferFullscreen ? 'on' : 'off');
+    syncFullscreenToggle();
+    changeFullscreen(preferFullscreen);
+  });
+} else if (!installedFullscreen) {
+  // iPhone Safari has no element fullscreen; a Home Screen web app is.
+  document.getElementById('fullscreen-label')!.textContent = 'Fullscreen: add Tau to your Home Screen';
+  toggleFullscreen.style.display = 'none';
+} else {
+  document.getElementById('setting-fullscreen')!.style.display = 'none';
+}
 
 // Auth toggle
 const toggleAuth = document.getElementById('toggle-auth')!;
@@ -3133,9 +3788,7 @@ toggleAuth.addEventListener('click', async () => {
 
 
 
-// Restore saved theme
-const savedTheme = getCurrentTheme();
-applyTheme(savedTheme);
+applyTheme(getCurrentTheme());
 
 // ═══════════════════════════════════════
 // Session stats card (opened from the context pill)
@@ -3149,6 +3802,7 @@ applyTheme(savedTheme);
 async function fetchSessionStats(): Promise<SessionStats | null> {
   if (!viewingActiveSession || !activeLiveSessionId) return null;
   const requestSessionId = activeLiveSessionId;
+  const selection = viewSelection;
   try {
     const resp = await fetch('/api/rpc', {
       method: 'POST',
@@ -3157,16 +3811,13 @@ async function fetchSessionStats(): Promise<SessionStats | null> {
     });
     const data = await resp.json();
     if (!data?.success || !data.data) return null;
-    if (activeLiveSessionId !== requestSessionId || !viewingActiveSession) return null;
+    if (selection !== viewSelection || activeLiveSessionId !== requestSessionId || !viewingActiveSession) return null;
     const stats = data.data as SessionStats;
 
     // Sync authoritative numbers into the locally-tracked pill state so the
     // pill never drifts from what pi reports. contextUsage (and its fields)
     // may be null right after compaction — keep the last known values then.
-    if (typeof stats.cost === 'number') {
-      sessionTotalCost = stats.cost;
-      costFromStats = true;
-    }
+    if (typeof stats.cost === 'number') sessionTotalCost = stats.cost;
     const cu = stats.contextUsage;
     if (cu && typeof cu.contextWindow === 'number' && cu.contextWindow > 0) {
       contextWindowSize = cu.contextWindow;
@@ -3194,8 +3845,8 @@ const sessionStatsCard = setupSessionStatsCard({
   }),
 });
 
-// Voice Input
-setupVoiceInput(document.getElementById('mic-btn')!, messageInput);
+// Voice input (assigned once the DOM hooks below exist; session changes cancel it)
+voiceInput = setupVoiceInput(document.getElementById('mic-btn')!, messageInput as HTMLTextAreaElement, document.getElementById('voice-status')!);
 
 // ═══════════════════════════════════════
 // Initialize
@@ -3210,7 +3861,9 @@ if (isMobile()) {
 wsClient.connect();
 messageRenderer.renderWelcome();
 updateLiveSessionInputState();
-void sidebar.loadSessions();
+sidebar.loadProjects().then(() => {
+  updateLiveSessionIndicators();
+});
 launcherPanel.init();
 
 // Register service worker for PWA

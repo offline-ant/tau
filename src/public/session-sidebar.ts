@@ -1,69 +1,89 @@
 /**
- * Session Sidebar - Lists sessions grouped by project, handles switching
+ * Session Sidebar — lists projects, and the sessions of a project once it is
+ * expanded. Projects start collapsed and their sessions are fetched on demand,
+ * so opening the page costs one directory listing rather than a parse of every
+ * stored transcript.
  */
 
 import { isImeComposition } from './keyboard.js';
-import { arrangeProjects, type ArrangedProject, type OpenTab } from './session-order.js';
+import { limitSessions } from './session-limit.js';
+import type { CommandTarget } from './unsent-input.js';
 
 export type SidebarSession = {
-  filePath?: string;
-  file?: string;
+  filePath: string;
+  file: string;
+  dir: string;
+  id?: string;
   name?: string | null;
   firstMessage?: string | null;
   timestamp?: string;
-  sessionName?: string;
-  sessionTimestamp?: string;
-  tmux?: boolean;
-  /** Set on rows built from a live tab that the session list has no row for. */
-  liveSessionId?: string;
-  [key: string]: unknown;
+  mtime?: number;
+  live?: boolean;
+  owner?: unknown;
+  /** Mux id when another frontend shares this session through pimux: opening it attaches. */
+  shared?: string | null;
 };
 
 export type SidebarProject = {
-  path?: string;
-  dirName?: string;
-  sessions?: SidebarSession[];
-  [key: string]: unknown;
+  path: string;
+  dirName: string;
+  count: number;
+  lastActive: number;
 };
 
-type ArrangedEntry = ArrangedProject<SidebarSession, SidebarProject>;
-
-type SearchResult = SidebarSession & {
-  project?: string;
+type SearchResult = Pick<SidebarSession, 'filePath' | 'file' | 'dir' | 'live' | 'owner' | 'shared'> & {
+  project: string;
+  sessionName?: string;
+  sessionTimestamp?: string;
+  firstMessage?: string;
   matches: { snippet?: string }[];
 };
 
 export class SessionSidebar {
   container: HTMLElement;
-  onSessionSelect: (session: SidebarSession | null, project: SidebarProject | null) => void;
+  onSessionSelect: (session: SidebarSession | null) => void;
+  onNewSession: (cwd: string) => void;
+  onError: (message: string) => void;
+  captureCommandTarget: (file: string) => CommandTarget | null;
   activeSessionFile: string | null;
-  activeLiveSessionId: string | null = null;
   projects: SidebarProject[];
-  collapsedProjects: Set<string>;
+  sessionsByDir: Map<string, SidebarSession[]>;
+  expanded: Set<string>;
+  loading: Set<string>;
+  /** Projects whose loaded sessions are shown beyond the newest ten. */
   expandedProjects: Set<string>;
-  onNewSessionInProject: ((project: SidebarProject) => void) | null;
-  /** The live tabs. Their sessions are listed first and get a green dot. */
-  openTabs: OpenTab[] = [];
-  /** False until the first session list arrives, so the loading rows stay. */
-  loaded = false;
-  _loadRequest = 0;
+  /** Called after rebuilding rows so the app can restore live indicators. */
+  onRendered: (() => void) | null = null;
   searchQuery: string;
-  favourites: string[];
-  contextMenu: HTMLElement | null;
   _searchTimer: ReturnType<typeof setTimeout> | null = null;
   _searchResults: SearchResult[] | null = null;
+  _searchRequest = 0;
+  favourites: string[];
+  contextMenu: HTMLElement | null;
+  private generation = 0;
+  private nextSessionRequest = 0;
+  private sessionRequests = new Map<string, number>();
+  private projectsLoading = false;
+  private projectsError: string | null = null;
+  private sessionErrors = new Map<string, string>();
 
   constructor(
     container: HTMLElement,
-    onSessionSelect: (session: SidebarSession | null, project: SidebarProject | null) => void,
-    onNewSessionInProject: ((project: SidebarProject) => void) | null = null,
+    onSessionSelect: (session: SidebarSession | null) => void,
+    onNewSession: (cwd: string) => void,
+    onError: (message: string) => void,
+    captureCommandTarget: (file: string) => CommandTarget | null = () => null,
   ) {
     this.container = container;
     this.onSessionSelect = onSessionSelect;
-    this.onNewSessionInProject = onNewSessionInProject;
+    this.onNewSession = onNewSession;
+    this.onError = onError;
+    this.captureCommandTarget = captureCommandTarget;
     this.activeSessionFile = null;
     this.projects = [];
-    this.collapsedProjects = new Set();
+    this.sessionsByDir = new Map();
+    this.expanded = new Set();
+    this.loading = new Set();
     this.expandedProjects = new Set();
     this.searchQuery = '';
     this.favourites = JSON.parse(localStorage.getItem('tau-favourites') || '[]');
@@ -76,6 +96,132 @@ export class SessionSidebar {
       if (!(e.target as Element | null)?.closest('.session-item')) this.closeContextMenu();
     });
   }
+
+  // ═══════════════════════════════════════
+  // Loading
+  // ═══════════════════════════════════════
+
+  async loadProjects() {
+    await this.updateProjects(true);
+  }
+
+  /** Picks up sessions that appeared or changed, in place: no skeleton, and open lists stay open. */
+  async refresh() {
+    if (this.contextMenu || this.container.querySelector('.session-rename-input')) return;
+    await this.updateProjects(false);
+  }
+
+  private async updateProjects(reload: boolean) {
+    const generation = ++this.generation;
+    // A new summary also supersedes every list requested under the old summary.
+    this.sessionRequests.clear();
+    this.loading.clear();
+    this.projectsLoading = true;
+    this.projectsError = null;
+    if (reload) {
+      this.container.innerHTML = Array.from({ length: 6 }, () =>
+        '<div class="session-skeleton"><div class="session-skeleton-title"></div><div class="session-skeleton-meta"></div></div>'
+      ).join('');
+    } else this.render();
+    try {
+      const res = await fetch('/api/sessions');
+      if (!res.ok) throw new Error('Could not load projects');
+      const data = await res.json();
+      if (generation !== this.generation) return;
+      if (!Array.isArray(data.projects)) throw new Error('Invalid project list');
+      this.projects = data.projects;
+      const dirs = new Set(this.projects.map(project => project.dirName));
+      for (const dir of this.sessionsByDir.keys()) {
+        if (reload || !dirs.has(dir)) this.sessionsByDir.delete(dir);
+      }
+      for (const set of [this.expanded, this.expandedProjects]) {
+        for (const dir of set) if (!dirs.has(dir)) set.delete(dir);
+      }
+      for (const dir of this.sessionErrors.keys()) {
+        if (!dirs.has(dir)) this.sessionErrors.delete(dir);
+      }
+      this.projectsLoading = false;
+      const favourites = this.favouriteProjectDirs();
+      const needed = this.projects.filter(project => this.searchQuery || this.expanded.has(project.dirName)
+        || favourites.has(project.dirName) || (!reload && this.sessionsByDir.has(project.dirName)));
+      this.render();
+      if (generation !== this.generation) return;
+      await Promise.all(needed.map(project => this.loadSessions(project.dirName, !reload)));
+    } catch {
+      if (generation !== this.generation) return;
+      this.projectsLoading = false;
+      this.projectsError = 'Could not load projects.';
+      this.render();
+    }
+  }
+
+  /** A forced refresh supersedes this project's pending request without dropping usable rows. */
+  async loadSessions(dirName: string, refresh = false) {
+    if (this.projectsLoading || !this.projects.some(project => project.dirName === dirName)) return;
+    if (!refresh && (this.loading.has(dirName) || (this.sessionsByDir.has(dirName) && !this.sessionErrors.has(dirName)))) return;
+    const generation = this.generation;
+    const request = ++this.nextSessionRequest;
+    this.sessionRequests.set(dirName, request);
+    const isCurrent = () => generation === this.generation && this.sessionRequests.get(dirName) === request
+      && this.projects.some(project => project.dirName === dirName);
+    this.loading.add(dirName);
+    this.sessionErrors.delete(dirName);
+    this.render();
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(dirName)}`);
+      if (!res.ok) throw new Error('Could not load sessions');
+      const data = await res.json();
+      if (!isCurrent()) return;
+      if (!Array.isArray(data.sessions)) throw new Error('Invalid session list');
+      this.sessionsByDir.set(dirName, data.sessions);
+    } catch {
+      if (isCurrent()) this.sessionErrors.set(dirName, 'Could not load sessions.');
+    } finally {
+      if (isCurrent()) {
+        this.sessionRequests.delete(dirName);
+        this.loading.delete(dirName);
+        this.render();
+      }
+    }
+  }
+
+  private cancelSessionLoad(dirName: string) {
+    this.sessionRequests.delete(dirName);
+    this.loading.delete(dirName);
+  }
+
+  /** A completed mutation must not be undone by an older list response. */
+  private invalidateSessionList(filePath: string) {
+    const dir = filePath.split('/').at(-2);
+    if (!dir || !this.loading.has(dir)) return;
+    this.cancelSessionLoad(dir);
+    if (this.sessionsByDir.has(dir)) this.render();
+    else void this.loadSessions(dir);
+  }
+
+  private favouriteProjectDirs() {
+    return new Set(this.favourites.map(filePath => filePath.split('/').at(-2)));
+  }
+
+  /** Only favourites belonging to current projects can cause eager list requests. */
+  async loadFavouriteProjects() {
+    const dirs = this.favouriteProjectDirs();
+    await Promise.all(this.projects.filter(project => dirs.has(project.dirName)).map(project => this.loadSessions(project.dirName)));
+  }
+
+  favouriteSessions() {
+    const found: Array<{ session: SidebarSession; project: SidebarProject }> = [];
+    for (const project of this.projects) {
+      for (const session of this.sessionsByDir.get(project.dirName) || []) {
+        if (this.isFavourite(session.filePath)) found.push({ session, project });
+      }
+    }
+    return found;
+  }
+
+  // ═══════════════════════════════════════
+  // Favourites
+  // ═══════════════════════════════════════
 
   saveFavourites() {
     localStorage.setItem('tau-favourites', JSON.stringify(this.favourites));
@@ -98,68 +244,14 @@ export class SessionSidebar {
     this.render();
   }
 
-  /**
-   * Fetches the session list. A quiet load keeps the current rows until the
-   * new list arrives, instead of showing loading rows.
-   */
-  async loadSessions({ quiet = false } = {}) {
-    const request = ++this._loadRequest;
-    try {
-      if (!quiet) {
-        this.container.innerHTML = Array.from({length: 6}, () =>
-          '<div class="session-skeleton"><div class="session-skeleton-title"></div><div class="session-skeleton-meta"></div></div>'
-        ).join('');
-      }
-      const res = await fetch('/api/sessions');
-      const data = await res.json();
-      // A later load started while this one was in flight; its list is newer.
-      if (request !== this._loadRequest) return;
-      this.projects = data.projects || [];
-      this.loaded = true;
-      this.render();
-    } catch (error) {
-      if (request !== this._loadRequest) return;
-      console.error('[Sidebar] Failed to load sessions:', error);
-      if (!quiet) this.container.innerHTML = '<div class="session-loading">Failed to load sessions</div>';
-    }
-  }
-
-  /**
-   * Stores the live tabs. The rows are rebuilt only when the tabs change what
-   * the sidebar shows, because tab updates arrive often while a reply streams.
-   */
-  setOpenSessions(tabs: OpenTab[]) {
-    const closed = this.openTabs.some(old => !tabs.some(tab => tab.id === old.id));
-    const before = this.loaded ? this.arrangementKey() : '';
-    this.openTabs = tabs;
-    // A closed tab's session goes back among the other sessions by file time.
-    // Its file may be new or changed since the list was fetched.
-    if (closed && this.loaded) void this.loadSessions({ quiet: true });
-    if (!this.loaded || before === this.arrangementKey()) return;
-    this.render();
-    this.scrollActiveIntoView();
-  }
-
-  /** Scrolls the list just enough to show the open session's row. */
-  scrollActiveIntoView() {
-    const row = this.container.querySelector<HTMLElement>('.project-group .session-item.active');
-    if (!row || row.getClientRects().length === 0) return;
-    const box = this.container.getBoundingClientRect();
-    const rect = row.getBoundingClientRect();
-    if (rect.top < box.top) this.container.scrollTop -= box.top - rect.top;
-    else if (rect.bottom > box.bottom) this.container.scrollTop += rect.bottom - box.bottom;
-  }
-
-  isOpen(filePath?: string) {
-    return !!filePath && this.openTabs.some(tab => tab.filePath === filePath);
-  }
-
   setSearchQuery(query: string) {
     const wasSearching = !!this.searchQuery;
     this.searchQuery = query.toLowerCase().trim();
+    ++this._searchRequest;
+    this._searchResults = null;
+    this.renderSearchResults();
 
-    // Clear pending full-text search
-    if (this._searchTimer) clearTimeout(this._searchTimer);
+    this.scheduleMessageSearch();
 
     // Searching shows every session of every project, so the rows are rebuilt
     // whenever the search starts or ends.
@@ -172,13 +264,21 @@ export class SessionSidebar {
       return;
     }
 
-    // Instant: filter titles
+    // Keep ordinary browsing lazy. Explicit search loads all project titles,
+    // including sessions beyond the ten-row limit and collapsed projects.
+    for (const project of this.projects) void this.loadSessions(project.dirName);
     if (searchingChanged) this.render();
     else this.applySearch();
+  }
 
-    // Debounced: full-text search (300ms)
+  scheduleMessageSearch() {
+    if (this._searchTimer) clearTimeout(this._searchTimer);
+    this._searchTimer = null;
     if (this.searchQuery.length >= 2) {
-      this._searchTimer = setTimeout(() => this.fullTextSearch(this.searchQuery), 300);
+      this._searchTimer = setTimeout(() => {
+        this._searchTimer = null;
+        void this.fullTextSearch(this.searchQuery);
+      }, 300);
     }
   }
 
@@ -186,15 +286,18 @@ export class SessionSidebar {
     // Don't search if query changed since debounce
     if (query !== this.searchQuery) return;
 
+    const request = ++this._searchRequest;
     try {
       const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
       const data = await res.json();
-      if (query !== this.searchQuery) return; // stale
-
+      if (request !== this._searchRequest || query !== this.searchQuery) return;
+      if (!res.ok) throw new Error(data.error || 'Could not search session messages');
       this._searchResults = data.results || [];
       this.renderSearchResults();
     } catch (err) {
-      console.error('[Sidebar] Search failed:', err);
+      if (request === this._searchRequest && query === this.searchQuery) {
+        this.onError(err instanceof Error ? err.message : 'Could not search session messages');
+      }
     }
   }
 
@@ -223,8 +326,14 @@ export class SessionSidebar {
       if (result.filePath === this.activeSessionFile) {
         item.classList.add('active');
       }
-      item.classList.toggle('has-live-session', this.isOpen(result.filePath));
 
+      // Server-supplied identifiers also work before the lazy title list arrives.
+      const sessionForResult = (): SidebarSession => ({
+        ...this.sessionsByDir.get(result.dir)?.find(session => session.filePath === result.filePath),
+        filePath: result.filePath, file: result.file, dir: result.dir,
+        name: result.sessionName, firstMessage: result.firstMessage,
+        timestamp: result.sessionTimestamp, live: result.live, owner: result.owner, shared: result.shared,
+      });
       const title = result.sessionName || result.firstMessage || 'Untitled';
       const snippet = result.matches[0]?.snippet || '';
       const matchCount = result.matches.length;
@@ -237,22 +346,14 @@ export class SessionSidebar {
         <div class="search-snippet">${this.highlightMatch(snippet, this.searchQuery)}</div>
         <div class="session-meta">${time}${matchCount > 1 ? ` · ${matchCount} matches` : ''}</div>
       `;
-
       const titleEl = item.querySelector<HTMLElement>('.session-title')!;
       titleEl.textContent = title;
       titleEl.title = title;
 
-      // Find the matching project/session to pass to onSessionSelect
-      item.addEventListener('click', () => {
-        for (const project of this.projects) {
-          const session = project.sessions?.find(s => s.filePath === result.filePath);
-          if (session) {
-            this.onSessionSelect(session, project);
-            return;
-          }
-        }
-        // Session not in loaded list (unlikely) — try switching by path
-        this.onSessionSelect({ filePath: result.filePath, name: result.sessionName }, { path: result.project });
+      item.addEventListener('click', () => this.onSessionSelect(sessionForResult()));
+      item.addEventListener('contextmenu', event => {
+        const project = this.projects.find(project => project.dirName === result.dir);
+        if (project) this.showContextMenu(event, sessionForResult(), project, item);
       });
 
       sessionsDiv.appendChild(item);
@@ -261,20 +362,25 @@ export class SessionSidebar {
     group.appendChild(sessionsDiv);
     // Insert at top of container
     this.container.insertBefore(group, this.container.firstChild);
+    this.onRendered?.();
   }
 
   highlightMatch(text: string, query: string) {
     if (!query) return this.escapeHtml(text);
-    const escaped = this.escapeHtml(text);
-    const re = new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
-    return escaped.replace(re, '<mark>$1</mark>');
+    const re = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+    let html = '', cursor = 0;
+    for (const match of text.matchAll(re)) {
+      html += this.escapeHtml(text.slice(cursor, match.index)) + `<mark>${this.escapeHtml(match[0])}</mark>`;
+      cursor = match.index + match[0].length;
+    }
+    return html + this.escapeHtml(text.slice(cursor));
   }
 
   applySearch() {
     if (!this.searchQuery) {
       this.container.querySelectorAll('.session-item').forEach(el => el.classList.remove('hidden'));
-      this.container.querySelectorAll('.project-group').forEach(el => el.style.display = '');
-      const favSection = this.container.querySelector('.favourites-group');
+      this.container.querySelectorAll<HTMLElement>('.project-group').forEach(el => el.style.display = '');
+      const favSection = this.container.querySelector<HTMLElement>('.favourites-group');
       if (favSection) favSection.style.display = '';
       // Remove full-text results
       const searchGroup = this.container.querySelector('.search-results-group');
@@ -283,7 +389,7 @@ export class SessionSidebar {
     }
 
     // Search favourites section
-    const favSection = this.container.querySelector('.favourites-group');
+    const favSection = this.container.querySelector<HTMLElement>('.favourites-group');
     if (favSection) {
       let hasVisible = false;
       favSection.querySelectorAll('.session-item').forEach(item => {
@@ -295,7 +401,7 @@ export class SessionSidebar {
       favSection.style.display = hasVisible ? '' : 'none';
     }
 
-    this.container.querySelectorAll('.project-group').forEach(group => {
+    this.container.querySelectorAll<HTMLElement>('.project-group').forEach(group => {
       let hasVisible = false;
       group.querySelectorAll('.session-item').forEach(item => {
         const title = (item.querySelector('.session-title')?.textContent || '').toLowerCase();
@@ -303,71 +409,75 @@ export class SessionSidebar {
         item.classList.toggle('hidden', !matches);
         if (matches) hasVisible = true;
       });
-      group.style.display = hasVisible ? '' : 'none';
+      // Failed or pending title loads must remain visible so search can be retried.
+      group.style.display = hasVisible || group.querySelector('.session-loading') ? '' : 'none';
     });
   }
 
-  /** The key that projects use in the collapsed and expanded sets. */
-  projectKey(project: SidebarProject) {
-    return project.dirName ?? `path:${project.path || ''}`;
+  /** The file paths of every session row the projects currently show. */
+  visibleSessionKey() {
+    return this.projects
+      .map(project => this.visibleSessions(project).visible.map(s => s.filePath).join('|'))
+      .join('\n');
   }
 
-  /** The projects in display order, with the session rows each one shows. */
-  arrange(): ArrangedEntry[] {
-    return arrangeProjects<SidebarSession, SidebarProject>({
-      projects: this.projects,
-      openTabs: this.openTabs,
-      isExpanded: project => this.expandedProjects.has(this.projectKey(project)),
+  visibleSessions(project: SidebarProject) {
+    return limitSessions({
+      sessions: this.sessionsByDir.get(project.dirName) || [],
+      expanded: this.expandedProjects.has(project.dirName),
       searching: !!this.searchQuery,
+      activeFilePath: this.activeSessionFile,
     });
   }
 
-  /** Changes whenever the projects, their order, or their rows would change. */
-  arrangementKey() {
-    return this.arrange().map(entry => [
-      entry.project ? this.projectKey(entry.project) : `new:${entry.path}`,
-      entry.open.map(({ tab, session }) => session ? session.filePath : `tab:${tab.id}:${tab.filePath}:${tab.name}`).join('|'),
-      entry.visible.map(s => s.filePath).join('|'),
-      entry.total,
-    ].join('\n')).join('\n\n');
-  }
-
-  isActive(filePath?: string, liveSessionId?: string) {
-    return (!!filePath && filePath === this.activeSessionFile)
-      || (!!liveSessionId && liveSessionId === this.activeLiveSessionId);
-  }
-
-  setActive(filePath?: string | null, liveSessionId?: string | null) {
-    const changed = this.activeSessionFile !== (filePath ?? null)
-      || this.activeLiveSessionId !== (liveSessionId ?? null);
+  setActive(filePath?: string | null) {
+    const before = this.visibleSessionKey();
     this.activeSessionFile = filePath ?? null;
-    this.activeLiveSessionId = liveSessionId ?? null;
-    this.container.querySelectorAll('.session-item').forEach(el => {
-      el.classList.toggle('active', this.isActive(el.dataset.filePath, el.dataset.liveSessionId));
+    // The open session is always listed, so the rows can change with it.
+    if (before !== this.visibleSessionKey()) {
+      this.render();
+      return;
+    }
+    this.container.querySelectorAll<HTMLElement>('.session-item').forEach(el => {
+      el.classList.toggle('active', el.dataset.filePath === filePath);
     });
-    if (changed) this.scrollActiveIntoView();
   }
 
   clearActive() {
-    this.setActive(null);
+    const before = this.visibleSessionKey();
+    this.activeSessionFile = null;
+    if (before !== this.visibleSessionKey()) {
+      this.render();
+      return;
+    }
+    this.container.querySelectorAll('.session-item').forEach(el => el.classList.remove('active'));
   }
 
   /** Shows a new name for the open session in every row that lists it. */
   setActiveSessionName(name: string) {
-    const filePath = this.activeSessionFile;
-    if (!filePath) return;
+    if (this.activeSessionFile) this.setSessionName(this.activeSessionFile, name);
+  }
+
+  setSessionName(filePath: string, name: string) {
+    ++this._searchRequest;
+    for (const result of this._searchResults || []) {
+      if (result.filePath === filePath) result.sessionName = name;
+    }
     for (const project of this.projects) {
-      for (const session of project.sessions || []) {
+      for (const session of this.sessionsByDir.get(project.dirName) || []) {
         if (session.filePath === filePath) session.name = name;
       }
     }
-    this.container.querySelectorAll('.session-item').forEach(el => {
+    this.container.querySelectorAll<HTMLElement>('.session-item').forEach(el => {
       if (el.dataset.filePath !== filePath) return;
       const title = el.querySelector('.session-title');
       if (!title) return;
       title.textContent = name;
       title.setAttribute('title', name);
     });
+    this.invalidateSessionList(filePath);
+    this.applySearch();
+    this.scheduleMessageSearch();
   }
 
   // ═══════════════════════════════════════
@@ -386,7 +496,7 @@ export class SessionSidebar {
       { icon: isFav ? '★' : '☆', label: isFav ? 'Unfavourite' : 'Favourite', action: () => this.toggleFavourite(session.filePath) },
       { icon: '✎', label: 'Rename', action: () => this.startRename(itemEl, session) },
       { icon: '📋', label: 'Export HTML', action: () => this.exportSession(session) },
-      { icon: '🗑', label: 'Delete', action: () => this.deleteSession(session) },
+      { icon: '🗑', label: 'Delete', action: () => this.deleteSession(session, project) },
     ];
 
     for (const item of items) {
@@ -422,6 +532,7 @@ export class SessionSidebar {
   }
 
   startRename(itemEl: HTMLElement, session: SidebarSession) {
+    const target = this.captureCommandTarget(session.filePath);
     const titleEl = itemEl.querySelector('.session-title');
     if (!titleEl) return;
     const currentName = titleEl.textContent;
@@ -434,22 +545,26 @@ export class SessionSidebar {
     input.select();
 
     const commit = async () => {
-      const newName = input.value.trim();
-      if (newName && newName !== currentName) {
+      let name = input.value.trim() || currentName;
+      if (name !== currentName) {
         try {
-          await fetch('/api/rpc', {
+          const data = await (await fetch('/api/rpc', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ type: 'set_session_name', name: newName, filePath: session.filePath }),
-          });
-          // Keep the stored name so a later rebuild of the rows shows it.
-          session.name = newName;
-        } catch { /* silent */ }
+            body: JSON.stringify({ type: 'set_session_name', name, filePath: session.filePath, ...target }),
+          })).json();
+          if (data.success === false) throw new Error(data.error || 'Could not rename the session');
+          session.name = name;
+          this.setSessionName(session.filePath, name);
+        } catch (error) {
+          this.onError(error instanceof Error ? error.message : 'Could not rename the session');
+          name = currentName;
+        }
       }
       const newTitle = document.createElement('div');
       newTitle.className = 'session-title';
-      newTitle.title = newName || currentName;
-      newTitle.textContent = newName || currentName;
+      newTitle.title = name;
+      newTitle.textContent = name;
       input.replaceWith(newTitle);
     };
 
@@ -461,7 +576,7 @@ export class SessionSidebar {
     });
   }
 
-  async deleteSession(session: SidebarSession) {
+  async deleteSession(session: SidebarSession, project: SidebarProject) {
     if (!confirm(`Delete "${session.name || session.firstMessage || 'this session'}"?`)) return;
     try {
       const res = await fetch('/api/sessions/delete', {
@@ -469,41 +584,42 @@ export class SessionSidebar {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ filePath: session.filePath }),
       });
-      if (res.ok) {
-        // Drop the session from the stored list so the rows can be rebuilt
-        // and a project that was cut off at 10 shows the next older session.
-        for (const project of this.projects) {
-          project.sessions = (project.sessions || []).filter(s => s.filePath !== session.filePath);
-        }
-        this._searchResults = this._searchResults?.filter(result => result.filePath !== session.filePath) ?? null;
-        // Remove from favourites if present
-        if (session.filePath) {
-          const favIdx = this.favourites.indexOf(session.filePath);
-          if (favIdx >= 0) {
-            this.favourites.splice(favIdx, 1);
-            this.saveFavourites();
-          }
-        }
-        // If this was the active session, clear it
-        if (session.filePath === this.activeSessionFile) {
-          this.clearActive();
-          this.render();
-          if (this.onSessionSelect) this.onSessionSelect(null, null);
-        } else {
-          this.render();
-        }
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        this.onError(data?.error || 'Could not delete the session');
+        return;
       }
+      ++this._searchRequest;
+      this.scheduleMessageSearch();
+      this._searchResults = this._searchResults?.filter(result => result.filePath !== session.filePath) ?? null;
+      const sessions = this.sessionsByDir.get(project.dirName);
+      if (sessions) this.sessionsByDir.set(project.dirName, sessions.filter(s => s.filePath !== session.filePath));
+      const currentProject = this.projects.find(current => current.dirName === project.dirName);
+      if (currentProject) currentProject.count = Math.max(0, currentProject.count - 1);
+      const favIdx = this.favourites.indexOf(session.filePath);
+      if (favIdx >= 0) {
+        this.favourites.splice(favIdx, 1);
+        this.saveFavourites();
+      }
+      if (session.filePath === this.activeSessionFile) {
+        this.clearActive();
+        this.onSessionSelect(null);
+      }
+      this.invalidateSessionList(session.filePath);
+      this.render();
     } catch (e) {
       console.error('[Sidebar] Delete failed:', e);
+      this.onError('Could not delete the session');
     }
   }
 
   async exportSession(session: SidebarSession) {
+    const target = this.captureCommandTarget(session.filePath);
     try {
       const data = await (await fetch('/api/rpc', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'export_html', filePath: session.filePath }),
+        body: JSON.stringify({ type: 'export_html', filePath: session.filePath, ...target }),
       })).json();
       if (data?.success && data.data?.path) {
         await fetch('/api/open', {
@@ -522,24 +638,22 @@ export class SessionSidebar {
   buildSessionItem(session: SidebarSession, project: SidebarProject) {
     const item = document.createElement('div');
     item.className = 'session-item';
-    if (session.filePath) item.dataset.filePath = session.filePath;
-    if (session.liveSessionId) item.dataset.liveSessionId = session.liveSessionId;
+    item.dataset.filePath = session.filePath;
 
-    if (this.isActive(session.filePath, session.liveSessionId)) {
+    if (session.filePath === this.activeSessionFile) {
       item.classList.add('active');
     }
-    if (session.liveSessionId || this.isOpen(session.filePath)) item.classList.add('has-live-session');
 
-    const title = session.name || session.firstMessage || (session.liveSessionId ? 'New session' : 'Empty session');
+    const title = session.name || session.firstMessage || 'Empty session';
     const time = this.formatTime(session.timestamp);
-    const tmuxTag = session.tmux ? '<span class="session-tag tmux-tag">tmux</span>' : '';
+    const liveTag = session.live ? '<span class="session-tag tmux-tag">live</span>' : '';
     const favIcon = this.isFavourite(session.filePath) ? '<span class="session-fav-icon">★</span>' : '';
 
     item.innerHTML = `
       <div class="session-title-row">
         ${favIcon}
         <div class="session-title"></div>
-        ${tmuxTag}
+        ${liveTag}
       </div>
       <div class="session-meta">${time}</div>
     `;
@@ -548,45 +662,90 @@ export class SessionSidebar {
     titleEl.textContent = title;
     titleEl.title = title;
 
-    item.addEventListener('click', () => this.onSessionSelect(session, project));
-    // A row built from a live tab may have no file on disk yet, so the file
-    // actions (favourite, rename, export, delete) are not offered for it.
-    if (!session.liveSessionId) {
-      item.addEventListener('contextmenu', (e) => this.showContextMenu(e, session, project, item));
-    }
+    item.addEventListener('click', () => this.onSessionSelect(session));
+    item.addEventListener('contextmenu', (e) => this.showContextMenu(e, session, project, item));
 
     return item;
   }
 
-  /** A row for a live tab that the session list has no row for. */
-  tabSession(tab: OpenTab): SidebarSession {
-    return {
-      filePath: tab.filePath ?? undefined,
-      name: tab.name,
-      timestamp: new Date(tab.openedAt).toISOString(),
-      liveSessionId: tab.id,
-    };
+  buildProjectGroup(project: SidebarProject) {
+    const group = document.createElement('div');
+    group.className = 'project-group';
+    const isExpanded = this.expanded.has(project.dirName) || !!this.searchQuery;
+
+    const header = document.createElement('div');
+    header.className = `project-header${isExpanded ? '' : ' collapsed'}`;
+
+    const shortPath = project.path.split('/').filter(Boolean).pop() || project.path || project.dirName;
+    header.innerHTML = `
+      <span class="chevron">▼</span>
+      <span title="${this.escapeHtml(project.path)}">${this.escapeHtml(shortPath)}</span>
+      <span class="project-count">${project.count}</span>
+    `;
+    header.addEventListener('click', () => this.toggleProject(project));
+
+    const addBtn = document.createElement('button');
+    addBtn.className = 'project-add-btn';
+    addBtn.type = 'button';
+    addBtn.textContent = '+';
+    addBtn.title = `New session in ${project.path || shortPath}`;
+    addBtn.setAttribute('aria-label', 'New session in this project');
+    addBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.onNewSession(project.path);
+    });
+    header.appendChild(addBtn);
+    group.appendChild(header);
+
+    if (isExpanded) {
+      const sessionsDiv = document.createElement('div');
+      sessionsDiv.className = 'project-sessions';
+      this.fillProjectSessions(sessionsDiv, project);
+      group.appendChild(sessionsDiv);
+    }
+
+    return group;
+  }
+
+  toggleProject(project: SidebarProject) {
+    if (!this.projects.some(current => current.dirName === project.dirName)) return;
+    if (this.expanded.has(project.dirName)) {
+      this.expanded.delete(project.dirName);
+      if (!this.searchQuery && !this.favouriteProjectDirs().has(project.dirName)) this.cancelSessionLoad(project.dirName);
+      this.render();
+      return;
+    }
+    this.expanded.add(project.dirName);
+    this.render();
+    void this.loadSessions(project.dirName);
+  }
+
+  private buildRetryState(message: string, retry: () => void) {
+    const status = document.createElement('div');
+    status.className = 'session-loading';
+    status.setAttribute('role', 'status');
+    status.append(document.createTextNode(`${message} `));
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'session-retry-btn';
+    button.textContent = 'Retry';
+    button.addEventListener('click', event => { event.stopPropagation(); retry(); });
+    status.appendChild(button);
+    return status;
   }
 
   render() {
-    const arranged = this.arrange();
-    if (arranged.length === 0) {
-      this.container.innerHTML = '<div class="session-loading">No sessions found</div>';
+    this.container.innerHTML = '';
+    if (this.projectsError) {
+      this.container.appendChild(this.buildRetryState(this.projectsError, () => void this.loadProjects()));
+    }
+    if (this.projects.length === 0) {
+      if (!this.projectsError) this.container.innerHTML = '<div class="session-loading">No sessions found</div>';
+      this.onRendered?.();
       return;
     }
 
-    this.container.innerHTML = '';
-
-    // Favourites section — collect from all projects
-    const favSessions = [];
-    for (const project of this.projects) {
-      for (const session of project.sessions || []) {
-        if (this.isFavourite(session.filePath)) {
-          favSessions.push({ session, project });
-        }
-      }
-    }
-
+    const favSessions = this.favouriteSessions();
     if (favSessions.length > 0) {
       const favGroup = document.createElement('div');
       favGroup.className = 'favourites-group';
@@ -605,103 +764,48 @@ export class SessionSidebar {
       this.container.appendChild(favGroup);
     }
 
-    // Project groups: projects with open sessions first
-    for (const entry of arranged) {
-      // A directory with open tabs but no saved sessions has no listed project.
-      const project = entry.project ?? { path: entry.path, sessions: [] };
-      const key = this.projectKey(project);
-      const group = document.createElement('div');
-      group.className = 'project-group';
-      const isCollapsed = this.collapsedProjects.has(key);
-
-      const header = document.createElement('div');
-      header.className = `project-header${isCollapsed ? ' collapsed' : ''}`;
-
-      const pathParts = (project.path || '').split('/').filter(Boolean);
-      const shortPath = pathParts.length > 0 ? pathParts[pathParts.length - 1] : (project.path || '');
-
-      header.innerHTML = `
-        <span class="chevron">▼</span>
-        <span title="${this.escapeHtml(project.path)}">${this.escapeHtml(shortPath)}</span>
-        <span class="project-count">${entry.total}</span>
-      `;
-
-      if (this.onNewSessionInProject && project.path) {
-        header.appendChild(this.buildNewSessionButton(project));
-      }
-
-      header.addEventListener('click', () => {
-        if (this.collapsedProjects.has(key)) {
-          this.collapsedProjects.delete(key);
-        } else {
-          this.collapsedProjects.add(key);
-        }
-        header.classList.toggle('collapsed');
-        sessionsDiv.classList.toggle('collapsed');
-      });
-
-      group.appendChild(header);
-
-      const sessionsDiv = document.createElement('div');
-      sessionsDiv.className = `project-sessions${isCollapsed ? ' collapsed' : ''}`;
-      this.fillProjectSessions(sessionsDiv, project, entry);
-
-      group.appendChild(sessionsDiv);
-      this.container.appendChild(group);
+    for (const project of this.projects) {
+      this.container.appendChild(this.buildProjectGroup(project));
     }
-
     if (this.searchQuery) {
       this.applySearch();
       this.renderSearchResults();
     }
+    this.onRendered?.();
   }
 
-  buildNewSessionButton(project: SidebarProject) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'project-add-btn';
-    button.title = 'New session in this project';
-    button.setAttribute('aria-label', 'New session in this project');
-    button.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>';
-    button.addEventListener('click', (e) => {
-      // The header's own click handler would collapse the project.
-      e.stopPropagation();
-      this.onNewSessionInProject?.(project);
-    });
-    return button;
-  }
-
-  /**
-   * Fills a project's session list: the open sessions, the other sessions to
-   * show, then the show-all toggle if needed.
-   */
-  fillProjectSessions(sessionsDiv: HTMLElement, project: SidebarProject, entry: ArrangedEntry) {
+  /** Show the loaded cache through the upstream limit/active-row policy. */
+  fillProjectSessions(sessionsDiv: HTMLElement, project: SidebarProject) {
     sessionsDiv.innerHTML = '';
-    const { open, visible, limited, total } = entry;
-
-    for (const { tab, session } of open) {
-      sessionsDiv.appendChild(this.buildSessionItem(session ?? this.tabSession(tab), project));
+    const { visible, limited } = this.visibleSessions(project);
+    for (const session of visible) sessionsDiv.appendChild(this.buildSessionItem(session, project));
+    const sessions = this.sessionsByDir.get(project.dirName);
+    if (limited && !this.searchQuery) {
+      const expanded = this.expandedProjects.has(project.dirName);
+      const toggle = document.createElement('button');
+      toggle.type = 'button';
+      toggle.className = `project-more-btn${expanded ? ' expanded' : ''}`;
+      toggle.innerHTML = `<span class="chevron">▼</span><span>${expanded ? 'Show fewer' : `Show all ${sessions?.length || 0}`}</span>`;
+      toggle.addEventListener('click', () => {
+        if (!this.projects.some(current => current.dirName === project.dirName)) return;
+        if (expanded) this.expandedProjects.delete(project.dirName);
+        else this.expandedProjects.add(project.dirName);
+        this.fillProjectSessions(sessionsDiv, project);
+        this.onRendered?.();
+      });
+      sessionsDiv.appendChild(toggle);
     }
-    for (const session of visible) {
-      sessionsDiv.appendChild(this.buildSessionItem(session, project));
+    const error = this.sessionErrors.get(project.dirName);
+    if (error) {
+      sessionsDiv.appendChild(this.buildRetryState(error, () => void this.loadSessions(project.dirName, true)));
+    } else if (this.loading.has(project.dirName) || (!sessions && this.projectsLoading)) {
+      const status = document.createElement('div');
+      status.className = 'session-loading';
+      status.textContent = sessions ? 'Updating sessions…' : 'Loading sessions…';
+      sessionsDiv.appendChild(status);
+    } else if (!sessions) {
+      sessionsDiv.appendChild(this.buildRetryState('Sessions not loaded.', () => void this.loadSessions(project.dirName)));
     }
-
-    // While searching, every session is listed and the toggle has no use.
-    if (!limited || this.searchQuery) return;
-
-    const key = this.projectKey(project);
-    const expanded = this.expandedProjects.has(key);
-    const toggle = document.createElement('button');
-    toggle.type = 'button';
-    toggle.className = `project-more-btn${expanded ? ' expanded' : ''}`;
-    toggle.innerHTML = `<span class="chevron">▼</span><span>${expanded ? 'Show fewer' : `Show all ${total}`}</span>`;
-    toggle.addEventListener('click', () => {
-      if (expanded) this.expandedProjects.delete(key);
-      else this.expandedProjects.add(key);
-      const updated = this.arrange().find(other => other.project === entry.project);
-      if (updated) this.fillProjectSessions(sessionsDiv, project, updated);
-    });
-    sessionsDiv.appendChild(toggle);
   }
 
   formatTime(isoTimestamp?: string) {
@@ -724,9 +828,10 @@ export class SessionSidebar {
     }
   }
 
+  /** Also used inside quoted attributes, so quotes are escaped too. */
   escapeHtml(text: unknown) {
     const div = document.createElement('div');
     div.textContent = String(text ?? '');
-    return div.innerHTML;
+    return div.innerHTML.replace(/"/g, '&quot;');
   }
 }

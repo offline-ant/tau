@@ -22,6 +22,7 @@ const vendorDir = path.join(projectRoot, 'public', 'vendor', 'katex');
 const fontsDir = path.join(vendorDir, 'fonts');
 
 fs.mkdirSync(fontsDir, { recursive: true });
+fs.copyFileSync(path.join(katexDist, '..', 'LICENSE'), path.join(vendorDir, 'LICENSE'));
 for (const file of ['katex.min.js', 'katex.min.css']) {
   fs.copyFileSync(path.join(katexDist, file), path.join(vendorDir, file));
 }

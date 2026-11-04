@@ -46,7 +46,8 @@ test('codemode arguments are safe highlighted JavaScript in live and reloaded ca
   );
   await page.reload();
   await card.waitFor({ state: 'attached' });
-  await card.locator('.tool-card-header').click();
+  assert.equal(await card.locator('.tool-card-header').getAttribute('aria-expanded'), 'true', 'grouped history keeps the tool body readable');
+  assert.equal(await card.locator('.tool-args code').isVisible(), true);
   await assertSource();
   assert.equal(await card.locator('.tool-args code').innerHTML(), liveHtml);
   assert.equal(await card.locator('.tool-output').textContent(), 'Plain tool output <script>');
@@ -68,8 +69,9 @@ test('codemode source stays readable and safe when highlighting assets cannot lo
   const { page, errors, card, broadcast, id } = await openNestedPage(t, { blockServiceWorkers: true });
   await page.route('**/vendor/highlight/*.js', route => route.abort());
   await page.reload();
-  await page.waitForFunction((count: number) =>
-    document.querySelectorAll('#messages > .message').length === count, B_ROUNDS * 2);
+  await page.waitForFunction((rounds: number) =>
+    document.querySelectorAll('#messages > .message.user').length === rounds &&
+    document.querySelectorAll('#messages > .assistant-block').length === rounds, B_ROUNDS);
   const source = 'const html = "<img src=x onerror=alert(1)>";\nreturn "```";\n';
   broadcast({ type: 'tool_execution_start', toolCallId: id, toolName: 'codemode', args: { code: source } });
   await card.waitFor({ state: 'attached' });
@@ -325,10 +327,22 @@ test('built-in bash, edit, read, and write tool calls render cleanly in live, ne
     assert.ok(await nestedWriteRow.locator('.nested-call-arguments .hljs-keyword').count() > 0);
   };
 
+  const activity = page.locator('#messages > .assistant-block').filter({ has: bashCard });
+  assert.equal(await activity.count(), 1);
+  assert.deepEqual(await activity.locator('.tool-card').evaluateAll(cards => cards.map(card => (card as HTMLElement).dataset.toolCallId)),
+    [...toolCalls.map(call => call.id), nestedRootId], 'root tool cards retain their order inside one activity block');
+  assert.equal(await activity.locator('.assistant-block-toggle').getAttribute('aria-expanded'), 'false');
+  assert.equal(await bashCard.isVisible(), false, 'collapsed activity shows its last result, not earlier tool steps');
+  await activity.locator('.assistant-block-toggle').click();
   for (const tc of toolCalls) {
-    await page.locator(`.tool-card[data-tool-call-id="${tc.id}"] .tool-card-header`).click();
+    const header = page.locator(`.tool-card[data-tool-call-id="${tc.id}"] .tool-card-header`);
+    assert.equal(await header.getAttribute('aria-expanded'), 'true', 'grouped tool bodies start open');
+    await header.click();
+    assert.equal(await header.getAttribute('aria-expanded'), 'false', 'individual tool details can still be collapsed');
+    await header.click();
   }
-  await nestedRootCard.locator('.tool-card-header').click();
+  assert.equal(await nestedRootCard.locator('.tool-card-header').getAttribute('aria-expanded'), 'true');
+  assert.equal(await nestedRootCard.locator('.nested-calls-toggle').getAttribute('aria-expanded'), 'false', 'a clean completed call list has its own collapsed state');
   await nestedRootCard.locator('.nested-calls-toggle').click();
   await assertCards();
 
@@ -360,6 +374,10 @@ test('built-in bash, edit, read, and write tool calls render cleanly in live, ne
 
   await page.reload();
   await writeTxtCard.waitFor({ state: 'attached' });
+  assert.equal(await activity.locator('.assistant-block-toggle').getAttribute('aria-expanded'), 'false');
+  assert.deepEqual(await activity.locator('.tool-card').evaluateAll(cards => cards.map(card => (card as HTMLElement).dataset.toolCallId)),
+    [...toolCalls.map(call => call.id), nestedRootId], 'reloaded history preserves the live root-card group and order');
+  await activity.locator('.assistant-block-toggle').click();
   await toolCommand(page, 'Expand All Tools');
   for (let i = 0; i < nestedCallsList.length; i++) {
     await nestedRootCard.locator('.nested-call-row').nth(i).locator('.nested-call-toggle').click();
@@ -525,69 +543,5 @@ test('long write labels keep Copy code visible and usable on narrow screens', as
       assert.equal(await page.evaluate(() => navigator.clipboard.readText()), content);
     }
   }
-  await assertNoPageErrors(errors);
-});
-
-test('a history thinking block shows its text when opened, and copying the reply includes it', async (t: TestContext) => {
-  if (skipUnlessBrowser(t)) return;
-  const { page, errors, session } = await openNestedPage(t);
-  await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
-  const thinking = 'history thinking <b>not markup</b>';
-  session.entries.push({ type: 'message', message: { role: 'assistant', content: [
-    { type: 'thinking', thinking },
-    { type: 'text', text: 'history reply text' },
-  ] } });
-  await page.reload();
-  const message = page.locator('#messages > .message.assistant').filter({ hasText: 'history reply text' });
-  await message.waitFor();
-  const content = message.locator('.thinking-content');
-  assert.equal(await content.textContent(), '');
-
-  await message.locator('.thinking-toggle').click();
-  assert.equal(await content.textContent(), thinking);
-  assert.equal(await content.evaluate(element => element.classList.contains('expanded')), true);
-  await message.locator('.thinking-toggle').click();
-  assert.equal(await content.evaluate(element => element.classList.contains('expanded')), false);
-
-  // Copying a reply whose thinking was never opened copies the same text.
-  await page.reload();
-  await message.waitFor();
-  await message.hover();
-  await message.locator('.message-copy-btn').click();
-  await page.waitForFunction(() => navigator.clipboard.readText().then(text => text.includes('history reply text')));
-  assert.match(await page.evaluate(() => navigator.clipboard.readText()), /history thinking <b>not markup<\/b>[\s\S]*history reply text/);
-  await assertNoPageErrors(errors);
-});
-
-test('history images load from links when shown, and tool result images show as images instead of their data', async (t: TestContext) => {
-  if (skipUnlessBrowser(t)) return;
-  const { page, errors, session, broadcast } = await openNestedPage(t);
-  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
-  session.entries.push(
-    { type: 'message', message: { role: 'user', content: [{ type: 'text', text: 'history image question' }, { type: 'image', data: png, mimeType: 'image/png' }] } },
-    { type: 'message', message: { role: 'assistant', content: [{ type: 'toolCall', id: 'history-shot', name: 'screenshot', arguments: {} }] } },
-    { type: 'message', message: { role: 'toolResult', toolCallId: 'history-shot', toolName: 'screenshot', isError: false, timestamp: Date.now(),
-      content: [{ type: 'text', text: 'captured' }, { type: 'image', data: png, mimeType: 'image/png' }] } },
-  );
-  await page.reload();
-  const userImage = page.locator('#messages > .message.user').filter({ hasText: 'history image question' }).locator('img.message-image');
-  await userImage.waitFor();
-  assert.match(await userImage.getAttribute('src') || '', /^\/api\/live-sessions\/[^/]+\/images\/0\/\d+\/1$/);
-  assert.equal(await userImage.getAttribute('loading'), 'lazy');
-  await page.waitForFunction(() => (document.querySelector('img.message-image') as HTMLImageElement | null)?.naturalWidth === 1);
-
-  const historyCard = page.locator('.tool-card[data-tool-call-id="history-shot"]');
-  await historyCard.locator('.tool-card-header').click();
-  assert.equal(await historyCard.locator('.tool-output').textContent(), 'captured');
-  assert.match(await historyCard.locator('.tool-output-images img').getAttribute('src') || '', /\/images\/0\/\d+\/1$/);
-
-  broadcast({ type: 'tool_execution_start', toolCallId: 'live-shot', toolName: 'screenshot', args: {} });
-  broadcast({ type: 'tool_execution_end', toolCallId: 'live-shot', toolName: 'screenshot', isError: false,
-    result: { content: [{ type: 'image', data: png, mimeType: 'image/png' }], details: {} } });
-  const liveCard = page.locator('.tool-card[data-tool-call-id="live-shot"]');
-  await liveCard.locator('.tool-output-images img').waitFor({ state: 'attached' });
-  assert.equal(await liveCard.locator('.tool-output').textContent(), '');
-  assert.equal(await liveCard.locator('.tool-output-images img').getAttribute('src'), `data:image/png;base64,${png}`);
-  assert.ok(!(await page.locator('#messages').textContent())?.includes(png), 'image data must not show as text');
   await assertNoPageErrors(errors);
 });

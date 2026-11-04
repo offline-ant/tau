@@ -1,22 +1,15 @@
+import { PROJECTS_DIR, runtimeEnvironment } from './http-test-environment.ts';
 import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { EventEmitter } from 'node:events';
-import { PassThrough } from 'node:stream';
-
-// Loopback host so computeUrls() sets a localhost lanUrl; isolate settings.
-process.env.TAU_HOST = '127.0.0.1';
-process.env.PI_CODING_AGENT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-http-'));
-process.env.PI_CODING_AGENT_SESSION_DIR = path.join(process.env.PI_CODING_AGENT_DIR, 'sessions');
-// Configure a projects dir so /api/projects has something to list.
-const PROJECTS_DIR = path.join(process.env.PI_CODING_AGENT_DIR, 'projects');
-process.env.TAU_PROJECTS_DIR = PROJECTS_DIR;
-
-// Load the server after the env is in place: the module reads it at load
-// time, and ESM hoists static imports ahead of this body.
-const { server, computeUrls, liveManager, SESSIONS_DIR, _setSpawnPiForTest, shouldCompress } = (await import('../bin/tau.js')) as any;
+import { FakeRuntimeLauncher } from './runtime-launcher.ts';
+import { RuntimeOperationError } from '@phimacs/pimux/runtime';
+import { until } from './fake-pimux.ts';
+import { server, computeUrls, liveManager, SESSIONS_DIR, PiRpcSession, shouldCompress } from '../bin/tau.js';
+import { SessionOpenError } from '../bin/sessions.js';
+import type { AddressInfo } from 'node:net';
 import type { TestContext } from 'node:test';
 
 let base = '';
@@ -46,7 +39,7 @@ interface FakeHttpSession {
   sessionName: string | null;
   contextUsage: { tokens?: number; usage?: { input_tokens: number; output_tokens: number } } | null;
   metadata: () => { id: string; cwd: string; model: string; isStreaming: boolean; sessionFile: string };
-  snapshot: () => { session: { id: string }; entries: unknown[]; model: string; isStreaming: boolean; sessionFile: string };
+  snapshot: () => Promise<{ session: { id: string }; entries: unknown[]; model: string; isStreaming: boolean; sessionFile: string }>;
   terminate: () => Promise<void>;
 }
 
@@ -62,27 +55,23 @@ function fakeSession(id: string): FakeHttpSession {
     sessionName: null,
     contextUsage: null,
     metadata: () => ({ id, cwd: '/tmp/proj', model: 'openai/gpt-5.5', isStreaming: false, sessionFile: `/tmp/${id}.jsonl` }),
-    snapshot: () => ({ session: { id }, entries: [], model: 'openai/gpt-5.5', isStreaming: false, sessionFile: `/tmp/${id}.jsonl` }),
+    snapshot: async () => ({ session: { id }, entries: [], model: 'openai/gpt-5.5', isStreaming: false, sessionFile: `/tmp/${id}.jsonl` }),
     terminate: async () => {},
   };
 }
 
-// A realistic fake `pi` child: real streams so start()'s setEncoding/on('data')
-// wiring works, and an EventEmitter so on('error')/on('exit') resolve startup.
-function makeFakeChild() {
-  const child: any = new EventEmitter();
-  child.stdin = new PassThrough();
-  child.stdout = new PassThrough();
-  child.stderr = new PassThrough();
-  child.pid = 12345;
-  child.kill = (sig: string) => { child.killedSignal = sig; };
-  return child;
+function installFakeRuntime(t: TestContext) {
+  const launcher = new FakeRuntimeLauncher();
+  const original = liveManager.runtime.start;
+  liveManager.runtime.start = launcher.start;
+  t.after(async () => { liveManager.runtime.start = original; await liveManager.shutdown().catch(() => {}); await launcher.close(); });
+  return launcher;
 }
 
 before(async () => {
   await new Promise<void>((resolve) => {
     server.listen(0, '127.0.0.1', () => {
-      const port = server.address().port;
+      const port = (server.address() as AddressInfo).port;
       computeUrls(port);
       base = `http://127.0.0.1:${port}`;
       resolve();
@@ -91,10 +80,13 @@ before(async () => {
 });
 
 after(async () => {
+  await liveManager.shutdown().catch(() => {});
   await new Promise<void>((resolve) => server.close(() => resolve()));
+  fs.rmSync(runtimeEnvironment.root, { recursive: true, force: true });
 });
 
-beforeEach(() => {
+beforeEach(async () => {
+  await liveManager.shutdown().catch(() => {});
   liveManager.sessions.clear();
 });
 
@@ -110,7 +102,7 @@ test('GET /api/health reports server health and live session count', async () =>
   assert.equal(body.status, 'ok');
   assert.equal(body.role, 'rpc-session-manager');
   assert.equal(body.liveSessionCount, 1);
-  assert.match(body.lanUrl, /^http:\/\/localhost:\d+$/);
+  assert.match(body.lanUrl, /^https:\/\/localhost:\d+$/);
 });
 
 test('GET /api/live-sessions lists managed sessions', async () => {
@@ -317,25 +309,134 @@ test('GET /api/sessions/:project/:file returns 404 for a missing file', async ()
   assert.equal(res.status, 404);
 });
 
-test('GET /api/search returns matching session entries', async () => {
-  writeSessionFile([
-    { type: 'session', id: 's', timestamp: '2026-01-01T00:00:00.000Z' },
-    { type: 'message', message: { role: 'user', content: 'please find the unique keyword here' } },
-  ]);
-  const res = await fetch(`${base}/api/search?q=keyword`);
-  assert.equal(res.status, 200);
-  const body = await jsonBody(res);
-  assert.equal(body.results.length, 1);
-  assert.equal(body.results[0].sessionId, 's');
-  assert.match(body.results[0].matches[0].snippet, /keyword/);
+test('GET /api/sessions/:project/:file reads only what was appended since a byte offset', async () => {
+  writeSessionFile([{ type: 'session', id: 'tail' }, { type: 'message', message: { role: 'user', content: 'first' } }]);
+  const initial = await jsonBody(await fetch(`${base}/api/sessions/--tmp--httpproj/s.jsonl`));
+  assert.equal(initial.entries.length, 2);
+  assert.equal(initial.offset, fs.statSync(SESSION_FILE).size);
+  assert.equal(initial.reset, false);
+
+  const empty = await jsonBody(await fetch(`${base}/api/sessions/--tmp--httpproj/s.jsonl?since=${initial.offset}`));
+  assert.deepEqual(empty.entries, []);
+  assert.equal(empty.offset, initial.offset);
+
+  fs.appendFileSync(SESSION_FILE, `${JSON.stringify({ type: 'message', message: { role: 'assistant', content: 'second' } })}\n`);
+  const appended = await jsonBody(await fetch(`${base}/api/sessions/--tmp--httpproj/s.jsonl?since=${initial.offset}`));
+  assert.equal(appended.entries.length, 1);
+  assert.equal(appended.entries[0].message.content, 'second');
+  assert.equal(appended.offset, fs.statSync(SESSION_FILE).size);
+
+  // A partial final line is left for the next read, so entries never split.
+  fs.appendFileSync(SESSION_FILE, '{"type":"message"');
+  const partial = await jsonBody(await fetch(`${base}/api/sessions/--tmp--httpproj/s.jsonl?since=${appended.offset}`));
+  assert.deepEqual(partial.entries, []);
+  assert.equal(partial.offset, appended.offset);
+
+  // A rewritten (shorter) file answers from the start rather than mid-record.
+  writeSessionFile([{ type: 'session', id: 'tail' }]);
+  const rewritten = await jsonBody(await fetch(`${base}/api/sessions/--tmp--httpproj/s.jsonl?since=${appended.offset}`));
+  assert.equal(rewritten.reset, true);
+  assert.equal(rewritten.entries.length, 1);
+
+  const invalid = await fetch(`${base}/api/sessions/--tmp--httpproj/s.jsonl?since=-1`);
+  assert.equal(invalid.status, 400);
 });
 
-test('GET /api/search returns an empty result list for a too-short query', async () => {
-  writeSessionFile([{ type: 'session', id: 's' }]);
-  const res = await fetch(`${base}/api/search?q=a`);
-  assert.equal(res.status, 200);
-  const body = await jsonBody(res);
-  assert.deepEqual(body.results, []);
+test('a terminal-owned conversation remains read-only and force never overrides it', async t => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-owned-'));
+  const file = writeSessionFileAt(PROJ_DIR, 'owned.jsonl', [{ type: 'session', id: 'owned', cwd }]);
+  const registry = path.join(os.tmpdir(), 'pi-orchestration-targets');
+  fs.mkdirSync(registry, { recursive: true });
+  const record = path.join(registry, 'delegate-7.json');
+  fs.writeFileSync(record, JSON.stringify({ target: { host: 'tmux', name: 'delegate-7', id: '%3', kind: 'pi', sessionFile: file } }));
+  t.after(() => fs.rmSync(record, { force: true }));
+  const listing = await jsonBody(await fetch(`${base}/api/sessions/--tmp--httpproj`));
+  assert.deepEqual(listing.sessions.find((item: { file: string }) => item.file === 'owned.jsonl').owner, { name: 'delegate-7', host: 'tmux' });
+  const launcher = installFakeRuntime(t);
+  for (const force of [false, true]) {
+    const response = await fetch(`${base}/api/live-sessions/resume`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filePath: file, force }) });
+    assert.equal(response.status, 409);
+    assert.equal((await jsonBody(response)).childStopped, undefined);
+  }
+  assert.equal(launcher.calls.length, 0);
+});
+
+test('GET /api/sessions lists projects without parsing their transcripts', async () => {
+  const projectDir = path.join(SESSIONS_DIR, '--tmp--listproj');
+  writeSessionFileAt(projectDir, 'older.jsonl', [
+    { type: 'session', id: 'older', timestamp: '2026-01-01T00:00:00.000Z', cwd: '/tmp/listproj' },
+    { type: 'message', message: { role: 'user', content: 'older session' } },
+  ]);
+  writeSessionFileAt(projectDir, 'newer.jsonl', [
+    { type: 'session', id: 'newer', timestamp: '2026-01-02T00:00:00.000Z', cwd: '/tmp/listproj' },
+    { type: 'message', message: { role: 'user', content: 'newer session' } },
+  ]);
+
+  const body = await jsonBody(await fetch(`${base}/api/sessions`));
+  const project = body.projects.find((p: { dirName: string }) => p.dirName === '--tmp--listproj');
+  assert.equal(project.path, path.resolve('/tmp/listproj'));
+  assert.equal(project.count, 2);
+  assert.ok(project.lastActive > 0);
+  assert.equal(project.sessions, undefined);
+});
+
+test('GET /api/sessions/:project summarises the sessions of that project, newest first', async () => {
+  const projectDir = path.join(SESSIONS_DIR, '--tmp--summaryproj');
+  writeSessionFileAt(projectDir, 'older.jsonl', [
+    { type: 'session', id: 'older', timestamp: '2026-01-01T00:00:00.000Z', cwd: '/tmp/summaryproj' },
+    { type: 'message', message: { role: 'user', content: 'older session' } },
+  ]);
+  writeSessionFileAt(projectDir, 'newer.jsonl', [
+    { type: 'session', id: 'newer', timestamp: '2026-01-02T00:00:00.000Z', cwd: '/tmp/summaryproj' },
+    { type: 'message', message: { role: 'user', content: 'newer session' } },
+  ]);
+
+  const body = await jsonBody(await fetch(`${base}/api/sessions/--tmp--summaryproj`));
+  assert.deepEqual(body.sessions.map((s: { id: string }) => s.id), ['newer', 'older']);
+  assert.equal(body.sessions[0].firstMessage, 'Newer session');
+  assert.equal(body.sessions[0].file, 'newer.jsonl');
+  assert.equal(body.sessions[0].dir, '--tmp--summaryproj');
+  assert.equal(body.sessions[0].live, false);
+  assert.equal(body.sessions[0].owner, null);
+});
+
+test('GET /api/sessions/:project summarises a transcript larger than the read window from both ends', async () => {
+  const filler = { type: 'message', message: { role: 'assistant', content: 'x'.repeat(4096) } };
+  writeSessionFileAt(PROJ_DIR, 'big.jsonl', [
+    { type: 'session', id: 'big', timestamp: '2026-01-03T00:00:00.000Z', cwd: '/tmp/httpproj' },
+    { type: 'message', message: { role: 'user', content: 'opening question' } },
+    ...Array.from({ length: 40 }, () => filler),
+    { type: 'session_info', name: 'Renamed after a long chat' },
+  ]);
+
+  const body = await jsonBody(await fetch(`${base}/api/sessions/--tmp--httpproj`));
+  const big = body.sessions.find((s: { file: string }) => s.file === 'big.jsonl');
+  assert.equal(big.id, 'big');
+  assert.equal(big.firstMessage, 'Opening question');
+  assert.equal(big.name, 'Renamed after a long chat');
+});
+
+test('GET /api/sessions/:project finds the first user message behind system records larger than the read window', async () => {
+  // Multi-byte text exercises window boundaries that split a character.
+  const system = { type: 'message', message: { role: 'system', content: 'é'.repeat(50 * 1024) } };
+  writeSessionFileAt(PROJ_DIR, 'system.jsonl', [
+    { type: 'session', id: 'system', timestamp: '2026-01-04T00:00:00.000Z', cwd: '/tmp/httpproj' },
+    system, system,
+    { type: 'message', message: { role: 'user', content: 'question after the prompt' } },
+    { type: 'message', message: { role: 'assistant', content: 'short answer' } },
+    { type: 'session_info', name: 'Named at the end' },
+  ]);
+
+  const body = await jsonBody(await fetch(`${base}/api/sessions/--tmp--httpproj`));
+  const session = body.sessions.find((s: { file: string }) => s.file === 'system.jsonl');
+  assert.equal(session.id, 'system');
+  assert.equal(session.firstMessage, 'Question after the prompt');
+  assert.equal(session.name, 'Named at the end');
+});
+
+test('GET /api/sessions/:project returns 404 for an unknown project', async () => {
+  const res = await fetch(`${base}/api/sessions/--tmp--nosuchproject`);
+  assert.equal(res.status, 404);
 });
 
 test('GET /api/sessions preserves hyphenated project cwd from the session header', async () => {
@@ -355,21 +456,6 @@ test('GET /api/sessions preserves hyphenated project cwd from the session header
   assert.ok(project);
   assert.equal(path.basename(project.path), 'agent-scratch');
   assert.ok(!project.path.includes(`${path.sep}agent${path.sep}scratch`));
-});
-
-test('GET /api/search returns the hyphenated project cwd from the session header', async () => {
-  const projectPath = path.join(PROJECTS_DIR, 'agent-scratch');
-  const encodedDir = path.join(SESSIONS_DIR, '--tmp--agent-scratch-search');
-  writeSessionFileAt(encodedDir, 'hyphen-search.jsonl', [
-    { type: 'session', id: 'hyphen-search', timestamp: '2026-01-01T00:00:00.000Z', cwd: projectPath },
-    { type: 'message', message: { role: 'user', content: 'please find hyphenneedle here' } },
-  ]);
-
-  const res = await fetch(`${base}/api/search?q=hyphenneedle`);
-  assert.equal(res.status, 200);
-  const body = await jsonBody(res);
-  assert.equal(body.results.length, 1);
-  assert.equal(body.results[0].project, path.resolve(projectPath));
 });
 
 test('GET /api/projects lists project directories under the configured projects dir', async () => {
@@ -466,9 +552,7 @@ test('POST /api/rpc with a malformed JSON body returns 400', async () => {
 });
 
 test('POST /api/live-sessions creates a live session and returns 200', async (t: TestContext) => {
-  const child = makeFakeChild();
-  _setSpawnPiForTest(() => child);
-  t.after(() => _setSpawnPiForTest(null));
+  installFakeRuntime(t);
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-post-create-'));
   const res = await fetch(`${base}/api/live-sessions`, {
     method: 'POST',
@@ -480,9 +564,7 @@ test('POST /api/live-sessions creates a live session and returns 200', async (t:
   assert.equal(body.session.id.startsWith('tau_'), true);
   assert.equal(body.session.cwd, path.resolve(cwd));
   assert.equal(body.session.modelSpec, 'openai/gpt-5.5');
-  // end the fake stdin so start()'s 250ms get_state/get_session_stats probes
-  // reject immediately instead of scheduling long pending timers.
-  child.stdin.end();
+  // No more RPC commands are expected after this request.
 });
 
 test('POST /api/live-sessions/resume rejects missing filePath with 400', async () => {
@@ -502,7 +584,9 @@ test('POST /api/live-sessions/resume rejects a filePath outside SESSIONS_DIR wit
     body: JSON.stringify({ filePath: '/etc/hosts' }),
   });
   assert.equal(res.status, 400);
-  assert.match((await jsonBody(res)).error, /Invalid session file/);
+  const body = await jsonBody(res);
+  assert.match(body.error, /Invalid session file/);
+  assert.equal(body.childStopped, undefined);
 });
 
 test('POST /api/live-sessions/resume creates a live session with matching sessionFile', async (t: TestContext) => {
@@ -515,9 +599,7 @@ test('POST /api/live-sessions/resume creates a live session with matching sessio
   ]);
   const sessionFile = path.join(PROJ_DIR, 'resume.jsonl');
 
-  const child = makeFakeChild();
-  _setSpawnPiForTest(() => child);
-  t.after(() => _setSpawnPiForTest(null));
+  installFakeRuntime(t);
 
   const res = await fetch(`${base}/api/live-sessions/resume`, {
     method: 'POST',
@@ -530,25 +612,23 @@ test('POST /api/live-sessions/resume creates a live session with matching sessio
   assert.equal(body.session.sessionFile, path.resolve(sessionFile));
   assert.equal(body.session.sessionName, 'Named Chat');
   assert.equal(body.reused, undefined);
+  assert.equal(body.started, true);
   // Verify the session was added to liveManager.
   assert.equal(liveManager.get(body.session.id)?.sessionFile, path.resolve(sessionFile));
-  child.stdin.end();
 });
 
 test('POST /api/live-sessions/resume exposes historical entries through the live snapshot', async (t: TestContext) => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-resume-snapshot-'));
   const entries = [
     { type: 'session', id: 'resume-snapshot-sess', timestamp: '2026-01-01T00:00:00.000Z', cwd },
-    { type: 'message', message: { role: 'user', content: 'resume this historical thread' } },
-    { type: 'message', message: { role: 'assistant', content: [{ type: 'text', text: 'historical reply' }] } },
-    { type: 'session_info', name: 'Snapshot Chat' },
+    { id: 'user', parentId: null, type: 'message', message: { role: 'user', content: 'resume this historical thread' } },
+    { id: 'answer', parentId: 'user', type: 'message', message: { role: 'assistant', content: [{ type: 'text', text: 'historical reply' }] } },
+    { id: 'name', parentId: 'answer', type: 'session_info', name: 'Snapshot Chat' },
   ];
   writeSessionFileAt(PROJ_DIR, 'resume-snapshot.jsonl', entries);
   const sessionFile = path.join(PROJ_DIR, 'resume-snapshot.jsonl');
 
-  const child = makeFakeChild();
-  _setSpawnPiForTest(() => child);
-  t.after(() => _setSpawnPiForTest(null));
+  installFakeRuntime(t);
 
   const resumeRes = await fetch(`${base}/api/live-sessions/resume`, {
     method: 'POST',
@@ -564,125 +644,10 @@ test('POST /api/live-sessions/resume exposes historical entries through the live
   assert.equal(snapshot.session.id, resumeBody.session.id);
   assert.equal(snapshot.session.sessionFile, path.resolve(sessionFile));
   assert.equal(snapshot.session.sessionName, 'Snapshot Chat');
-  assert.deepEqual(snapshot.entries, entries);
-  child.stdin.end();
+  assert.deepEqual(snapshot.entries, entries.slice(1));
 });
 
-test('the live snapshot can send the newest entries first, and older entries come in pages that keep tool results with their calls', async (t: TestContext) => {
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-history-pages-'));
-  const entries: Array<Record<string, unknown>> = [{ type: 'session', id: 'history-pages-sess', timestamp: '2026-01-01T00:00:00.000Z', cwd }];
-  for (let i = 0; i < 6; i++) {
-    entries.push({ type: 'message', message: { role: 'user', content: `question ${i}` } });
-    entries.push({ type: 'message', message: { role: 'assistant', content: [{ type: 'toolCall', id: `call-${i}`, name: 'bash', arguments: { command: 'ls' } }] } });
-    entries.push({ type: 'message', message: { role: 'toolResult', toolCallId: `call-${i}`, content: [{ type: 'text', text: `output ${i}` }] } });
-    entries.push({ type: 'message', message: { role: 'assistant', content: [{ type: 'text', text: `answer ${i}` }] } });
-  }
-  writeSessionFileAt(PROJ_DIR, 'history-pages.jsonl', entries);
-  const child = makeFakeChild();
-  _setSpawnPiForTest(() => child);
-  t.after(() => { _setSpawnPiForTest(null); child.stdin.end(); });
-  const resumeRes = await fetch(`${base}/api/live-sessions/resume`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Origin: base, Host: new URL(base).host },
-    body: JSON.stringify({ filePath: path.join(PROJ_DIR, 'history-pages.jsonl') }),
-  });
-  const id = encodeURIComponent((await jsonBody(resumeRes)).session.id);
-  const startsAMessage = (entry: any) => entry.type === 'message' && ['user', 'assistant'].includes(entry.message.role);
-
-  const full = await jsonBody(await fetch(`${base}/api/live-sessions/${id}/snapshot`));
-  assert.equal(full.entriesStart, 0);
-  assert.deepEqual(full.entries, entries);
-
-  // Asking for the newest 3 entries starts at the reply that called the tool
-  // whose result is among them.
-  const tail = await jsonBody(await fetch(`${base}/api/live-sessions/${id}/snapshot?tail=3`));
-  assert.equal(tail.historyEpoch, 0);
-  assert.equal(tail.entriesStart, entries.length - 3);
-  assert.deepEqual(tail.entries, entries.slice(-3));
-  const tail2 = await jsonBody(await fetch(`${base}/api/live-sessions/${id}/snapshot?tail=2`));
-  assert.equal(tail2.entriesStart, entries.length - 3);
-
-  const pages: Array<Record<string, unknown>[]> = [tail.entries];
-  let end = tail.entriesStart;
-  while (end > 0) {
-    const res = await fetch(`${base}/api/live-sessions/${id}/entries?end=${end}&limit=5&epoch=0`);
-    assert.equal(res.status, 200);
-    const page = await jsonBody(res);
-    assert.ok(page.start < end && end - page.start >= Math.min(5, end));
-    if (page.start > 0) assert.ok(startsAMessage(page.entries[0]), 'a page starts at a user or assistant message');
-    pages.unshift(page.entries);
-    end = page.start;
-  }
-  assert.deepEqual(pages.flat(), entries);
-
-  assert.equal((await fetch(`${base}/api/live-sessions/${id}/entries?end=4&limit=5&epoch=1`)).status, 409);
-  assert.equal((await fetch(`${base}/api/live-sessions/${id}/entries?end=999&limit=5&epoch=0`)).status, 409);
-  assert.equal((await fetch(`${base}/api/live-sessions/${id}/entries?end=4&limit=0&epoch=0`)).status, 400);
-  assert.equal((await fetch(`${base}/api/live-sessions/${id}/entries?end=4&epoch=0`)).status, 400);
-  // Replacing the history, as a tree navigation does, makes older pages unavailable.
-  liveManager.get(decodeURIComponent(id)).historyEpoch++;
-  assert.equal((await fetch(`${base}/api/live-sessions/${id}/entries?end=4&limit=5&epoch=0`)).status, 409);
-});
-
-test('large history responses are compressed only for remote browsers that accept gzip', () => {
-  const large = 64 * 1024;
-  assert.equal(shouldCompress('100.64.0.2', 'gzip, deflate, br', large), true);
-  assert.equal(shouldCompress('192.168.1.20', 'gzip', large), true);
-  assert.equal(shouldCompress('100.64.0.2', 'gzip', 1000), false, 'small responses are sent as they are');
-  assert.equal(shouldCompress('100.64.0.2', 'br', large), false, 'the browser must accept gzip');
-  assert.equal(shouldCompress('100.64.0.2', undefined, large), false);
-  for (const loopback of ['127.0.0.1', '::1', '::ffff:127.0.0.1']) assert.equal(shouldCompress(loopback, 'gzip', large), false);
-});
-
-test('history snapshots link to images instead of carrying their data, and the links serve the image', async (t: TestContext) => {
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-history-images-'));
-  const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex').toString('base64');
-  const entries: Array<Record<string, unknown>> = [
-    { type: 'session', id: 'history-images-sess', timestamp: '2026-01-01T00:00:00.000Z', cwd },
-    { type: 'message', message: { role: 'user', content: [{ type: 'text', text: 'look' }, { type: 'image', data: png, mimeType: 'image/png' }] } },
-    { type: 'message', message: { role: 'assistant', content: [{ type: 'toolCall', id: 'shot', name: 'screenshot', arguments: {} }] } },
-    { type: 'message', message: { role: 'toolResult', toolCallId: 'shot', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/svg+xml', data: png } }] } },
-  ];
-  writeSessionFileAt(PROJ_DIR, 'history-images.jsonl', entries);
-  const child = makeFakeChild();
-  _setSpawnPiForTest(() => child);
-  t.after(() => { _setSpawnPiForTest(null); child.stdin.end(); });
-  const resumeRes = await fetch(`${base}/api/live-sessions/resume`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Origin: base, Host: new URL(base).host },
-    body: JSON.stringify({ filePath: path.join(PROJ_DIR, 'history-images.jsonl') }),
-  });
-  const sessionId = (await jsonBody(resumeRes)).session.id;
-  const id = encodeURIComponent(sessionId);
-
-  const snapshot = await jsonBody(await fetch(`${base}/api/live-sessions/${id}/snapshot`));
-  const userImage = snapshot.entries[1].message.content[1];
-  assert.deepEqual(userImage, { type: 'image', mimeType: 'image/png', url: `/api/live-sessions/${id}/images/0/1/1` });
-  assert.equal(snapshot.entries[1].message.content[0].text, 'look');
-  assert.ok(!JSON.stringify(snapshot).includes(png), 'no image data in the snapshot');
-  // Entries without images are sent as they are.
-  assert.deepEqual(snapshot.entries[2], entries[2]);
-  // The live session keeps the image data.
-  assert.equal(liveManager.get(sessionId).entries[1].message.content[1].data, png);
-
-  const image = await fetch(`${base}${userImage.url}`);
-  assert.equal(image.status, 200);
-  assert.equal(image.headers.get('content-type'), 'image/png');
-  assert.equal(image.headers.get('x-content-type-options'), 'nosniff');
-  assert.equal(Buffer.from(await image.arrayBuffer()).toString('base64'), png);
-
-  // A type that could run script is never served as an image.
-  const toolImage = snapshot.entries[3].message.content[0];
-  assert.equal(toolImage.url, `/api/live-sessions/${id}/images/0/3/0`);
-  assert.equal((await fetch(`${base}${toolImage.url}`)).headers.get('content-type'), 'application/octet-stream');
-
-  assert.equal((await fetch(`${base}/api/live-sessions/${id}/images/0/1/0`)).status, 404);
-  assert.equal((await fetch(`${base}/api/live-sessions/${id}/images/0/99/0`)).status, 404);
-  liveManager.get(sessionId).historyEpoch++;
-  assert.equal((await fetch(`${base}${userImage.url}`)).status, 404);
-});
-
-test('POST /api/live-sessions/resume falls back to the first user message for generic or missing names', async (t: TestContext) => {
+test('POST /api/live-sessions/resume does not invent a name when the runtime has none', async (t: TestContext) => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-resume-title-'));
   writeSessionFileAt(PROJ_DIR, 'resume-title.jsonl', [
     { type: 'session', id: 'resume-title-sess', timestamp: '2026-01-01T00:00:00.000Z', cwd },
@@ -691,9 +656,7 @@ test('POST /api/live-sessions/resume falls back to the first user message for ge
   ]);
   const sessionFile = path.join(PROJ_DIR, 'resume-title.jsonl');
 
-  const child = makeFakeChild();
-  _setSpawnPiForTest(() => child);
-  t.after(() => _setSpawnPiForTest(null));
+  installFakeRuntime(t);
 
   const res = await fetch(`${base}/api/live-sessions/resume`, {
     method: 'POST',
@@ -702,8 +665,7 @@ test('POST /api/live-sessions/resume falls back to the first user message for ge
   });
   assert.equal(res.status, 200);
   const body = await jsonBody(res);
-  assert.equal(body.session.sessionName, 'Investigate the flaky tab switching behavior');
-  child.stdin.end();
+  assert.equal(body.session.sessionName, null, 'runtime names are authoritative; a frontend never invents a shared rename');
 });
 
 test('POST /api/live-sessions/resume returns reused:true when a live session already exists for the file', async (t: TestContext) => {
@@ -713,9 +675,7 @@ test('POST /api/live-sessions/resume returns reused:true when a live session alr
   ]);
   const sessionFile = path.join(PROJ_DIR, 'reuse.jsonl');
 
-  const child = makeFakeChild();
-  _setSpawnPiForTest(() => child);
-  t.after(() => _setSpawnPiForTest(null));
+  installFakeRuntime(t);
 
   // First resume creates the session.
   const res1 = await fetch(`${base}/api/live-sessions/resume`, {
@@ -736,10 +696,11 @@ test('POST /api/live-sessions/resume returns reused:true when a live session alr
   assert.equal(res2.status, 200);
   const body2 = await jsonBody(res2);
   assert.equal(body2.reused, true);
+  assert.equal(body1.started, true);
+  assert.equal(body2.started, false);
   assert.equal(body2.session.id, body1.session.id);
   // Only one session in the manager.
   assert.equal(liveManager.sessions.size, 1);
-  child.stdin.end();
 });
 
 test('POST /api/live-sessions/resume rejects when the session header cwd no longer exists', async () => {
@@ -754,19 +715,104 @@ test('POST /api/live-sessions/resume rejects when the session header cwd no long
     body: JSON.stringify({ filePath: sessionFile }),
   });
   assert.equal(res.status, 400);
-  assert.match((await jsonBody(res)).error, /Cannot resume session because its project directory no longer exists/);
+  const body = await jsonBody(res);
+  assert.match(body.error, /Cannot resume session because its project directory no longer exists/);
+  assert.equal(body.childStopped, undefined);
 });
 
-test('POST /api/live-sessions returns 400 when the cwd does not exist', async (t: TestContext) => {
-  _setSpawnPiForTest(() => makeFakeChild());
-  t.after(() => _setSpawnPiForTest(null));
-  const res = await fetch(`${base}/api/live-sessions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Origin: base, Host: new URL(base).host },
-    body: JSON.stringify({ cwd: '/definitely/not/a/real/path/tau' }),
+test('POST /api/live-sessions rejects a missing cwd before managed launch', async t => {
+  const launcher = installFakeRuntime(t);
+  const response = await fetch(`${base}/api/live-sessions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cwd: '/definitely/not/a/real/path/tau' }) });
+  assert.equal(response.status, 400);
+  assert.match((await jsonBody(response)).error, /Directory not found/);
+  assert.equal(launcher.calls.length, 0);
+});
+
+test('resume forwards validated arguments/environment and malformed overrides never launch', async t => {
+  const file = writeSessionFileAt(PROJ_DIR, 'overrides.jsonl', [{ type: 'session', id: 'overrides', cwd: PROJECTS_DIR }]);
+  const launcher = installFakeRuntime(t);
+  const request = (body: Record<string, unknown>) => fetch(`${base}/api/live-sessions/resume`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filePath: file, ...body }) });
+  for (const invalid of [{ args: '--model' }, { args: [42] }, { env: { KEY: 2 } }, { env: { 'BAD KEY': 'value' } }, { model: 42 }, { refresh: 'true' }, { refresh: null }]) {
+    const response = await request(invalid);
+    assert.equal(response.status, 400);
+    assert.equal((await jsonBody(response)).childStopped, undefined);
+  }
+  assert.equal(launcher.calls.length, 0);
+  const args = ['--provider', 'example', '--model', 'model', '--thinking', 'high'];
+  const env = { PI_CODING_AGENT_DIR: '/synthetic/agent', HERDR_SOCKET_PATH: '/synthetic/herdr.sock' };
+  const response = await request({ args, env });
+  assert.equal(response.status, 200);
+  assert.deepEqual(launcher.calls[0].args.slice(-args.length), args);
+  for (const [key, value] of Object.entries(env)) assert.equal(launcher.calls[0].env?.[key], value);
+});
+
+test('invalid resume input never makes writer-exit or rollback claims', async t => {
+  const file = writeSessionFileAt(PROJ_DIR, 'validation-writer.jsonl', [{ type: 'session', id: 'writer', cwd: PROJECTS_DIR }]);
+  const launcher = installFakeRuntime(t);
+  for (const args of [[42], '--bad']) {
+    const response = await fetch(`${base}/api/live-sessions/resume`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filePath: file, args }) });
+    assert.equal(response.status, 400);
+    assert.equal((await jsonBody(response)).childStopped, undefined);
+  }
+  assert.equal(launcher.calls.length, 0);
+});
+
+test('validation during an in-progress create cannot authorize rollback or duplicate launch', async t => {
+  const file = writeSessionFileAt(PROJ_DIR, 'creating-writer.jsonl', [{ type: 'session', id: 'creating', cwd: PROJECTS_DIR }]);
+  const launcher = installFakeRuntime(t);
+  let proceed!: () => void;
+  launcher.gate = new Promise(resolve => { proceed = resolve; });
+  const creating = liveManager.create({ cwd: PROJECTS_DIR, sessionFile: file, model: undefined, args: undefined, env: undefined });
+  try {
+    await until(() => launcher.calls.length === 1, 'managed launch pending');
+    assert.equal(liveManager.hasPendingResume(file), true);
+    const response = await fetch(`${base}/api/live-sessions/resume`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filePath: file, env: [] }) });
+    assert.equal(response.status, 400);
+    assert.equal((await jsonBody(response)).childStopped, undefined);
+    assert.equal(launcher.calls.length, 1);
+  } finally { proceed(); await creating; }
+});
+
+test('unidentified and unexpected resume errors do not authorize rollback', async (t: TestContext) => {
+  for (const body of ['{bad-json', '{}', '{"filePath":42}']) {
+    const response = await fetch(`${base}/api/live-sessions/resume`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+    });
+    assert.equal(response.status, 400);
+    assert.equal((await jsonBody(response)).childStopped, undefined);
+  }
+  const file = writeSessionFileAt(PROJ_DIR, 'unexpected.jsonl', [{ type: 'session', id: 'unexpected', cwd: PROJECTS_DIR }]);
+  t.mock.method(liveManager, 'findBySessionFile', () => { throw new Error('unexpected lookup failure'); });
+  const response = await fetch(`${base}/api/live-sessions/resume`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filePath: file }),
   });
-  assert.equal(res.status, 400);
-  assert.match((await jsonBody(res)).error, /Directory not found/);
+  assert.equal(response.status, 400);
+  const body = await jsonBody(response);
+  assert.equal(body.error, 'unexpected lookup failure');
+  assert.equal(body.childStopped, undefined);
+});
+
+test('ambiguous managed startup reports operation/runtime identity without claiming Pi exit', async t => {
+  const file = writeSessionFileAt(PROJ_DIR, 'failed-start.jsonl', [{ type: 'session', id: 'failed', cwd: PROJECTS_DIR }]);
+  const launcher = installFakeRuntime(t);
+  launcher.failure = new RuntimeOperationError('cannot load state; retained for reconciliation', 'operation-x', 'runtime-x');
+  const response = await fetch(`${base}/api/live-sessions/resume`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filePath: file }) });
+  const body = await jsonBody(response);
+  assert.equal(response.status, 503);
+  assert.equal(body.muxId, 'runtime-x');
+  assert.match(body.error, /operation-x/);
+  assert.equal(body.childStopped, undefined);
+  assert.equal(liveManager.sessions.size, 0);
+});
+
+test('disconnect uncertainty is an explicit error and retains the view without a writer-exit claim', async () => {
+  const session = fakeSession('uncertain');
+  session.terminate = async () => { throw new SessionOpenError('disconnect not confirmed', 503); };
+  liveManager.sessions.set(session.id, session);
+  const response = await fetch(`${base}/api/live-sessions/${session.id}`, { method: 'DELETE' });
+  assert.equal(response.status, 503);
+  assert.deepEqual(await jsonBody(response), { error: 'disconnect not confirmed' });
+  assert.equal(liveManager.get(session.id), session);
 });
 
 test('GET /api/files filters dotfiles and ignored directories from the listing', async () => {
@@ -823,4 +869,109 @@ test('GET /api/complete/directories expands ~ to the home directory', async () =
   const body = await jsonBody(await fetch(`${base}/api/complete/directories?prefix=${encodeURIComponent('~/')}`));
   const home = process.env.HOME || os.homedir();
   for (const item of body.items) assert.equal(path.dirname(item.path), path.resolve(home));
+});
+
+test('refresh bootstraps the same runtime and never reopens its file, including while busy', async t => {
+  const file = writeSessionFileAt(PROJ_DIR, 'refresh.jsonl', [{ type: 'session', id: 'refresh', cwd: PROJECTS_DIR }]);
+  const launcher = installFakeRuntime(t);
+  const request = (refresh?: boolean) => fetch(`${base}/api/live-sessions/resume`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filePath: file, refresh }) });
+  const created = await jsonBody(await request(true));
+  assert.equal(created.started, true);
+  const mux = launcher.muxes[0];
+  mux.entries = [{ id: 'latest', parentId: null, type: 'message', message: { role: 'user', content: 'latest' } }];
+  mux.leafId = 'latest';
+  mux.idle = false;
+  mux.replay = [{ type: 'agent_start' }];
+  const reused = await jsonBody(await request());
+  assert.equal(reused.session.id, created.session.id);
+  assert.equal(reused.started, false);
+  const refreshed = await jsonBody(await request(true));
+  assert.equal(refreshed.refreshed, true);
+  assert.equal(refreshed.session.id, created.session.id);
+  assert.equal(refreshed.session.isStreaming, true);
+  assert.equal(liveManager.get(created.session.id)?.entries.at(-1)?.id, 'latest');
+  assert.equal(launcher.calls.length, 1);
+  assert.equal(mux.commands.some(command => ['switch_session', 'abort', 'pimux_stop'].includes(String(command.type))), false);
+  const arbitrary = await jsonBody(await fetch(`${base}/api/rpc`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'switch_session', sessionId: created.session.id, sessionPath: file }) }));
+  assert.equal(arbitrary.success, false);
+});
+
+test('refresh refuses a terminal owner until that owner releases it', async t => {
+  const file = writeSessionFileAt(PROJ_DIR, 'refresh-owner.jsonl', [{ type: 'session', id: 'owner-refresh', cwd: PROJECTS_DIR }]);
+  const launcher = installFakeRuntime(t);
+  const registry = path.join(os.tmpdir(), 'pi-orchestration-targets');
+  fs.mkdirSync(registry, { recursive: true });
+  const record = path.join(registry, 'refresh-source.json');
+  fs.writeFileSync(record, JSON.stringify({ target: { host: 'herdr', name: 'source', id: 'p1', kind: 'pi', sessionFile: file } }));
+  t.after(() => fs.rmSync(record, { force: true }));
+  const request = () => fetch(`${base}/api/live-sessions/resume`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filePath: file, refresh: true, force: true }) });
+  assert.equal((await request()).status, 409);
+  assert.equal(launcher.calls.length, 0);
+  fs.rmSync(record);
+  assert.equal((await request()).status, 200);
+  assert.equal(launcher.calls.length, 1);
+});
+
+test('idle Close needs no confirmation and uses only the selected runtime identity', async t => {
+  const launcher = installFakeRuntime(t);
+  const created = await jsonBody(await fetch(`${base}/api/live-sessions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cwd: PROJECTS_DIR }) }));
+  const calls: string[] = [];
+  const stop = liveManager.runtime.stop;
+  liveManager.runtime.stop = async (muxId: string, options: { operationId?: string } = {}) => {
+    calls.push(muxId);
+    return { protocol: 2, muxId, operationId: options.operationId ?? 'stop-operation', state: 'stopped', code: 0, signal: null, stoppedAt: 'synthetic-time' };
+  };
+  t.after(() => { liveManager.runtime.stop = stop; });
+  const route = `${base}/api/live-sessions/${created.session.id}/stop`;
+  const request = (body: object) => fetch(route, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  assert.equal((await request({ operationId: 42 })).status, 400);
+  assert.deepEqual(calls, []);
+  const stopped = await request({ operationId: 'explicit-close' });
+  assert.equal(stopped.status, 200);
+  assert.equal((await jsonBody(stopped)).receipt.operationId, 'explicit-close');
+  assert.deepEqual(calls, [launcher.muxes[0].muxId]);
+  assert.equal(liveManager.get(created.session.id), undefined);
+});
+
+test('failed Close retains the exact view and returns its uncertainty instead of disconnecting', async t => {
+  installFakeRuntime(t);
+  const session = await liveManager.create({ cwd: PROJECTS_DIR, model: undefined, sessionFile: undefined, args: undefined, env: undefined });
+  t.mock.method(liveManager.runtime, 'stop', async () => { throw new SessionOpenError('Agent exit is uncertain; reconcile this runtime', 503, session.attachment!.muxId); });
+  const response = await fetch(`${base}/api/live-sessions/${session.id}/stop`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  assert.equal(response.status, 503);
+  assert.match((await jsonBody(response)).error, /exit is uncertain/);
+  assert.equal(liveManager.get(session.id), session);
+  assert.equal(session.terminating, false);
+});
+
+test('large history responses are compressed only for remote browsers that accept gzip', () => {
+  const large = 64 * 1024;
+  assert.equal(shouldCompress('100.64.0.2', 'gzip, deflate, br', large), true);
+  assert.equal(shouldCompress('192.168.1.20', 'gzip', large), true);
+  assert.equal(shouldCompress('100.64.0.2', 'gzip', 1000), false, 'small responses are sent as they are');
+  assert.equal(shouldCompress('100.64.0.2', 'br', large), false, 'the browser must accept gzip');
+  assert.equal(shouldCompress('100.64.0.2', undefined, large), false);
+  for (const loopback of ['127.0.0.1', '::1', '::ffff:127.0.0.1']) assert.equal(shouldCompress(loopback, 'gzip', large), false);
+});
+
+test('history images are served from their links, only as raster types, and only for the current history', async (t: TestContext) => {
+  const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex').toString('base64');
+  const session = new PiRpcSession(liveManager, { cwd: os.tmpdir() });
+  session.entries = [
+    { type: 'message', message: { role: 'user', content: [{ type: 'text', text: 'look' }, { type: 'image', data: png, mimeType: 'image/png' }] } },
+    { type: 'message', message: { role: 'toolResult', toolCallId: 'shot', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/svg+xml', data: png } }] } },
+  ];
+  liveManager.sessions.set(session.id, session);
+  t.after(() => liveManager.sessions.delete(session.id));
+  const id = encodeURIComponent(session.id);
+  const image = await fetch(`${base}/api/live-sessions/${id}/images/0/0/1`);
+  assert.equal(image.status, 200);
+  assert.equal(image.headers.get('content-type'), 'image/png');
+  assert.equal(image.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(Buffer.from(await image.arrayBuffer()).toString('base64'), png);
+  // A type that could run script is never served as an image.
+  assert.equal((await fetch(`${base}/api/live-sessions/${id}/images/0/1/0`)).headers.get('content-type'), 'application/octet-stream');
+  assert.equal((await fetch(`${base}/api/live-sessions/${id}/images/0/0/0`)).status, 404);
+  session.historyEpoch++;
+  assert.equal((await fetch(`${base}/api/live-sessions/${id}/images/0/0/1`)).status, 404);
 });

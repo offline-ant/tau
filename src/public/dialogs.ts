@@ -2,7 +2,8 @@
  * Dialogs - Handles extension UI dialogs
  */
 
-import { isImeComposition } from './keyboard.js';
+import { activateRow, isImeComposition, moveListFocus } from './keyboard.js';
+import type { InputContext } from './unsent-input.js';
 
 export type DialogRequest = {
   id?: string;
@@ -15,6 +16,7 @@ export type DialogRequest = {
   createdAt?: number;
   expiresAt?: number;
   sessionId?: string;
+  inputContext?: InputContext | null;
   method?: string;
   [key: string]: unknown;
 };
@@ -62,13 +64,14 @@ export class DialogHandler {
       const optionDiv = document.createElement('div');
       optionDiv.className = 'dialog-option';
       optionDiv.textContent = option;
+      optionDiv.tabIndex = 0;
       optionDiv.onclick = () => {
         this.respond(id, { value: option }, sessionId);
       };
       optionsContainer.appendChild(optionDiv);
     });
 
-    dialog.querySelector('#dialog-cancel')!.onclick = () => {
+    dialog.querySelector<HTMLButtonElement>('#dialog-cancel')!.onclick = () => {
       this.respond(id, { cancelled: true }, sessionId);
     };
 
@@ -91,11 +94,11 @@ export class DialogHandler {
       </div>
     `;
 
-    dialog.querySelector('#dialog-yes')!.onclick = () => {
+    dialog.querySelector<HTMLButtonElement>('#dialog-yes')!.onclick = () => {
       this.respond(id, { confirmed: true }, sessionId);
     };
 
-    dialog.querySelector('#dialog-no')!.onclick = () => {
+    dialog.querySelector<HTMLButtonElement>('#dialog-no')!.onclick = () => {
       this.respond(id, { confirmed: false }, sessionId);
     };
 
@@ -111,7 +114,7 @@ export class DialogHandler {
     dialog.className = 'dialog';
     dialog.innerHTML = `
       <div class="dialog-title">${this.escapeHtml(title || 'Input')}</div>
-      <input type="text" class="dialog-input" id="dialog-input" placeholder="${this.escapeHtml(placeholder || '')}" />
+      <input type="text" class="dialog-input" id="dialog-input" />
       <div class="dialog-actions">
         <button id="dialog-cancel">Cancel</button>
         <button id="dialog-submit">Submit</button>
@@ -120,6 +123,7 @@ export class DialogHandler {
 
     const input = dialog.querySelector<HTMLInputElement>('#dialog-input');
     if (!input) return;
+    input.placeholder = placeholder || '';
     
     const submit = () => {
       const value = input.value.trim();
@@ -131,15 +135,12 @@ export class DialogHandler {
       if (e.key === 'Enter') submit();
     });
 
-    dialog.querySelector('#dialog-submit')!.onclick = submit;
-    dialog.querySelector('#dialog-cancel')!.onclick = () => {
+    dialog.querySelector<HTMLButtonElement>('#dialog-submit')!.onclick = submit;
+    dialog.querySelector<HTMLButtonElement>('#dialog-cancel')!.onclick = () => {
       this.respond(id, { cancelled: true }, sessionId);
     };
 
     this.showDialog(dialog, timeout, id, sessionId, request);
-    
-    // Focus input after a short delay
-    setTimeout(() => input.focus(), 100);
   }
 
   showEditor(request: DialogRequest) {
@@ -161,19 +162,16 @@ export class DialogHandler {
     const textarea = dialog.querySelector<HTMLTextAreaElement>('#dialog-textarea');
     if (!textarea) return;
 
-    dialog.querySelector('#dialog-save')!.onclick = () => {
+    dialog.querySelector<HTMLButtonElement>('#dialog-save')!.onclick = () => {
       const value = textarea.value;
       this.respond(id, value ? { value } : { cancelled: true }, sessionId);
     };
 
-    dialog.querySelector('#dialog-cancel')!.onclick = () => {
+    dialog.querySelector<HTMLButtonElement>('#dialog-cancel')!.onclick = () => {
       this.respond(id, { cancelled: true }, sessionId);
     };
 
     this.showDialog(dialog, timeout, id, sessionId, request);
-    
-    // Focus textarea after a short delay
-    setTimeout(() => textarea.focus(), 100);
   }
 
   showNotification(request: DialogRequest) {
@@ -181,8 +179,9 @@ export class DialogHandler {
     
     // Create a temporary notification element
     const notification = document.createElement('div');
-    notification.className = 'error-message';
-    notification.textContent = `${notifyType === 'error' ? '⚠️' : notifyType === 'warning' ? '⚠️' : 'ℹ️'} ${message}`;
+    const failed = notifyType === 'error' || notifyType === 'warning';
+    notification.className = failed ? 'error-message' : 'system-message';
+    notification.textContent = `${failed ? '⚠️' : 'ℹ️'} ${message}`;
     
     // Add to messages container temporarily
     const messagesContainer = document.getElementById('messages');
@@ -205,6 +204,20 @@ export class DialogHandler {
     this.container.innerHTML = '';
     this.container.appendChild(dialogElement);
     this.container.classList.remove('hidden');
+
+    // A dialog owns the keyboard: Escape cancels it instead of aborting the run behind it.
+    dialogElement.addEventListener('keydown', (e: KeyboardEvent) => {
+      if (isImeComposition(e)) return;
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        this.respond(requestId, { cancelled: true }, sessionId);
+        return;
+      }
+      const options = Array.from(dialogElement.querySelectorAll<HTMLElement>('.dialog-option'));
+      if (moveListFocus(e, options)) return;
+      if (options.includes(e.target as HTMLElement)) activateRow(e, e.target as HTMLElement);
+    });
+    dialogElement.querySelector<HTMLElement>('.dialog-option, input, textarea, button')?.focus();
 
     // Pi and Tau own expiry. Use the original absolute deadline, never a
     // fresh timeout when a snapshot or tab switch renders the request again.
@@ -241,6 +254,7 @@ export class DialogHandler {
       await this.transport.send({
         type: 'extension_ui_response', id,
         sessionId: sessionId || this.getSessionId?.(),
+        inputContext: current.request?.inputContext ?? null,
         ...response,
       });
       // A successful write is not operation completion. The full server

@@ -1,4 +1,5 @@
-import type { MessageContentBlock } from './app-types.js';
+import type { MessageContentBlock, RpcCommand } from './app-types.js';
+import type { CommandTarget } from './unsent-input.js';
 import { isImeComposition } from './keyboard.js';
 
 // ═══════════════════════════════════════
@@ -32,6 +33,8 @@ type TreeEntry = {
   thinkingLevel?: string;
   name?: string;
   label?: string;
+  targetId?: string;
+  replacement?: unknown;
   [key: string]: unknown;
 };
 
@@ -47,7 +50,10 @@ type FlatRow = { node: TreeNode; depth: number };
 type TreeViewOptions = {
   getActiveLiveSessionId(): string | null;
   isStreaming(): boolean;
-  setComposerText(text: string): void;
+  getViewSelection(): number;
+  captureCommandTarget(sessionId?: string | null): CommandTarget | null;
+  rpcCommand(command: RpcCommand): Promise<{ success?: boolean; error?: string; data?: { editorText?: string } } | undefined>;
+  captureComposerText(): (text: string) => void;
   flashStatusError(message: string, ms?: number): void;
 };
 
@@ -89,7 +95,7 @@ function messageText(msg: TreeEntryMessage | undefined) {
 }
 
 // Classify an entry for glyph + filtering, and produce the one-line snippet.
-function describeEntry(entry: TreeEntry): { kind: string; text: string } {
+export function describeEntry(entry: TreeEntry): { kind: string; text: string } {
   if (entry.type === 'message') {
     const role = entry.message?.role || '';
     if (role === 'user') return { kind: 'user', text: firstLine(messageText(entry.message)) || '(empty message)' };
@@ -121,11 +127,13 @@ function describeEntry(entry: TreeEntry): { kind: string; text: string } {
   if (entry.type === 'thinking_level_change') return { kind: 'meta', text: `thinking → ${entry.thinkingLevel || ''}` };
   if (entry.type === 'session_info') return { kind: 'meta', text: `name → ${entry.name || ''}` };
   if (entry.type === 'label') return { kind: 'meta', text: `label → ${entry.label || ''}` };
+  // Edits only future model context; the target itself stays in the tree.
+  if (entry.type === 'context_edit') return { kind: 'meta', text: `context ${entry.replacement === null ? 'omit' : 'replace'} → ${entry.targetId || ''}` };
   return { kind: 'meta', text: entry.type || 'entry' };
 }
 
 export function setupTreeView(options: TreeViewOptions) {
-  const { getActiveLiveSessionId, isStreaming, setComposerText, flashStatusError } = options;
+  const { getActiveLiveSessionId, isStreaming, getViewSelection, captureCommandTarget, rpcCommand, captureComposerText, flashStatusError } = options;
 
   // Static index.html shell elements — assert non-null at the query site,
   // matching the other setup modules.
@@ -144,6 +152,7 @@ export function setupTreeView(options: TreeViewOptions) {
   let rowEls: HTMLButtonElement[] = [];
   let activeIndex = -1;
   let openSessionId: string | null = null;
+  let openTarget: CommandTarget | null = null;
   let navigating = false;
 
   function isOpen() {
@@ -170,14 +179,15 @@ export function setupTreeView(options: TreeViewOptions) {
   // entry would have had), so the branch structure stays readable in
   // messages-only mode. "Messages only" mirrors pi's no-tools filter: tool
   // results and housekeeping entries (model/thinking/name changes, custom
-  // meta entries) are hidden, messages and compactions stay. tau's internal
-  // navigation markers are plumbing and are hidden in every mode.
+  // meta entries, context edits) are hidden, messages and compactions stay.
+  // tau's internal navigation markers and pi's usage records (e.g. cache
+  // warming) are plumbing and are hidden in every mode, as in pi's /tree.
   function flatten(nodes: TreeNode[], depth: number, out: FlatRow[]) {
     for (const node of nodes) {
       const entry = node.entry;
-      const isInternalMarker = entry.type === 'custom' && entry.customType === NAVIGATION_MARKER_TYPE;
+      const isPlumbing = entry.type === 'usage' || (entry.type === 'custom' && entry.customType === NAVIGATION_MARKER_TYPE);
       const kind = describeEntry(entry).kind;
-      const hidden = isInternalMarker || (!showAll && (kind === 'tool' || kind === 'meta'));
+      const hidden = isPlumbing || (!showAll && (kind === 'tool' || kind === 'meta'));
       if (!hidden) out.push({ node, depth });
       const childDepth = depth + ((node.children || []).length > 1 ? 1 : 0);
       flatten(node.children, childDepth, out);
@@ -319,31 +329,27 @@ export function setupTreeView(options: TreeViewOptions) {
       return;
     }
     const sessionId = openSessionId || getActiveLiveSessionId();
-    if (!sessionId) {
-      setMessage('Select a live Tau tab first.', true);
+    if (!sessionId || !openTarget || openTarget.sessionId !== sessionId) {
+      setMessage('Select a ready live Tau tab first.', true);
       return;
     }
+    const selection = getViewSelection();
+    const keepComposerText = captureComposerText();
     navigating = true;
     setMessage('Jumping…', false);
     try {
-      const resp = await fetch('/api/rpc', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'navigate_tree', sessionId, entryId }),
-      });
-      const data = await resp.json();
+      const data = await rpcCommand({ type: 'navigate_tree', ...openTarget, entryId });
       if (data?.success) {
         const editorText = data.data?.editorText;
-        close();
-        // The conversation re-renders when the server broadcasts a fresh
-        // snapshot; we only need to hand the message text to the composer.
-        if (typeof editorText === 'string') setComposerText(editorText);
-      } else {
+        if (typeof editorText === 'string') keepComposerText(editorText);
+        if (selection === getViewSelection() && openSessionId === sessionId) close();
+      } else if (selection === getViewSelection() && openSessionId === sessionId) {
         const error = data?.error || 'Failed to navigate the session tree';
         setMessage(error, true);
         flashStatusError(error);
       }
     } catch {
+      if (selection !== getViewSelection() || openSessionId !== sessionId) return;
       const error = 'Failed to navigate the session tree';
       setMessage(error, true);
       flashStatusError(error);
@@ -438,6 +444,11 @@ export function setupTreeView(options: TreeViewOptions) {
       flashStatusError('Select a live Tau tab first.');
       return;
     }
+    openTarget = captureCommandTarget(sessionId);
+    if (!openTarget) {
+      flashStatusError('Wait for the conversation to become ready before navigating.');
+      return;
+    }
     openSessionId = sessionId;
     treeData = [];
     leafId = null;
@@ -470,6 +481,7 @@ export function setupTreeView(options: TreeViewOptions) {
     rowEls = [];
     activeIndex = -1;
     openSessionId = null;
+    openTarget = null;
     // Hand focus back to the button that opened the dialog.
     if (hadFocus && treeBtn instanceof HTMLElement && !treeBtn.classList.contains('hidden')) treeBtn.focus();
   }

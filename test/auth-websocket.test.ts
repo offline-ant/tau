@@ -1,6 +1,7 @@
 import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import os from 'node:os';
 import { WebSocket } from 'ws';
@@ -150,6 +151,42 @@ test('/api/health is reachable without credentials even when auth is enabled', a
   assert.equal(res.status, 200);
   const body = await res.json();
   assert.equal(body.status, 'ok');
+});
+
+/** A request with this exact target: `fetch` would normalize it first. */
+function rawRequest(target: string, headers: http.OutgoingHttpHeaders = {}): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(base);
+    const request = http.request({ host: url.hostname, port: url.port, path: target, headers, agent: false });
+    request.on('response', (res) => { res.resume(); resolve(res.statusCode!); });
+    request.on('error', reject);
+    request.end();
+  });
+}
+
+const HEALTH_ALIASES = [
+  '/api/health/../live-sessions', '/api/health/%2e%2e/live-sessions', '/api/health/%2E%2E/live-sessions',
+  '/api/health/.%2e/live-sessions', '/api/health\\..\\live-sessions', '/api/health/..%2flive-sessions',
+  '/api/health%2f..%2flive-sessions', '/api/health/../../api/live-sessions', '/api/health/./../live-sessions',
+  '/api/healthz', '/api/health/', '/api/health/x', '//api/health', 'http://localhost/api/health',
+];
+
+test('only the exact health route is open: no path spelling reaches another route', async () => {
+  _setAuthForTest(true);
+  for (const target of HEALTH_ALIASES) assert.equal(await rawRequest(target), 401, target);
+  assert.equal(await rawRequest('/api/health'), 200);
+  assert.equal(await rawRequest('/api/health?probe=1'), 200);
+  assert.equal(await rawRequest('/api/live-sessions/../health'), 200, 'it normalizes to the health route');
+  const good = Buffer.from('admin:s3cret').toString('base64');
+  assert.equal(await rawRequest('/api/health/../live-sessions', { Authorization: `Basic ${good}` }), 200, 'credentials still route it');
+});
+
+test('no path spelling upgrades without credentials', async () => {
+  _setAuthForTest(true);
+  const upgrade = { Connection: 'Upgrade', Upgrade: 'websocket', 'Sec-WebSocket-Version': '13', 'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==' };
+  for (const target of ['/ws', '/api/health/../../ws', '/api/health/%2e%2e/%2e%2e/ws', '/api/health', '/api/voice']) {
+    assert.equal(await rawRequest(target, upgrade), 401, target);
+  }
 });
 
 test('auth-enabled WebSocket upgrade without credentials is rejected', async () => {

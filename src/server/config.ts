@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { verifyHost, type HostIdentity } from '@phimacs/pimux/host';
 
 import type { TauArgs, TauSettings, TauSettingsFile } from './types.js';
 
@@ -28,17 +29,21 @@ export function expandHome(p: string) {
   return p.startsWith('~') ? path.join(USER_HOME, p.slice(1)) : p;
 }
 
-// The executable Tau runs for every Pi call: RPC tabs, the model list, and
-// HTML export. It can be a name on PATH or a path, such as a Pi fork
-// (`pi-bolt`) or a wrapper script. It runs without a shell, so the value is
-// one executable with no extra arguments.
+// Every operation uses the release's physical Pi package, never a global PATH
+// command. Overrides select another explicitly validated immutable release.
 export function resolvePiCommand(args: TauArgs, env: NodeJS.ProcessEnv = process.env): string {
   const flag = typeof args['pi-command'] === 'string' ? args['pi-command'].trim() : '';
-  return expandHome(flag || (env.TAU_PI_COMMAND || '').trim() || 'pi');
+  const command = expandHome(flag || (env.TAU_PI_COMMAND || '').trim()
+    || fileURLToPath(new URL('./cli.js', import.meta.resolve('@earendil-works/pi-coding-agent'))));
+  return verifyHost(command, { version: env.PHIMACS_PI_VERSION, sha256: env.PHIMACS_PI_SHA256 }).executable;
 }
 
 export const PI_COMMAND = resolvePiCommand(ARGS);
-
+const selectedHost = verifyHost(PI_COMMAND, { version: process.env.PHIMACS_PI_VERSION, sha256: process.env.PHIMACS_PI_SHA256 });
+/** Recheck on every launch/metadata/export operation, not just module load. */
+export function releaseHost(): HostIdentity {
+  return verifyHost(PI_COMMAND, { version: selectedHost.version, sha256: selectedHost.sha256 });
+}
 export function loadTauSettings(): TauSettings {
   let settings: TauSettingsFile['tau'] = {};
   try {
@@ -46,10 +51,14 @@ export function loadTauSettings(): TauSettings {
     settings = ((JSON.parse(fs.readFileSync(settingsPath, 'utf8')) as TauSettingsFile).tau || {});
   } catch {}
   return {
-    port: parseInt(String(ARGS.port || process.env.TAU_PORT || settings.port || '3001'), 10),
-    host: ARGS.host || process.env.TAU_HOST || settings.host || '0.0.0.0',
-    user: process.env.TAU_USER || settings.user || '',
-    pass: process.env.TAU_PASS || settings.pass || '',
+    port: parseInt(String(ARGS.port || process.env.TAU_PORT || settings.port || '3443'), 10),
+    httpPort: parseInt(String(ARGS['http-port'] || process.env.TAU_HTTP_PORT || settings.httpPort || '3001'), 10),
+    host: ARGS.host || process.env.TAU_HOST || settings.host || '127.0.0.1',
+    hostnames: process.env.TAU_HOSTNAMES !== undefined
+      ? process.env.TAU_HOSTNAMES.split(',').map((name) => name.trim()).filter(Boolean)
+      : settings.hostnames ?? [],
+    user: process.env.TAU_USER ?? settings.user ?? '',
+    pass: process.env.TAU_PASS ?? settings.pass ?? '',
     authEnabled: settings.authEnabled,
     cookieSecret: process.env.TAU_COOKIE_SECRET || settings.cookieSecret || '',
     projectsDir: expandHome(ARGS['projects-dir'] || process.env.TAU_PROJECTS_DIR || settings.projectsDir || ''),
@@ -57,9 +66,21 @@ export function loadTauSettings(): TauSettings {
 }
 
 export const TAU_SETTINGS = loadTauSettings();
-export const AUTH_CONFIGURED = !!(TAU_SETTINGS.user && TAU_SETTINGS.pass);
+export const AUTH_CONFIGURED = typeof TAU_SETTINGS.user === 'string' && TAU_SETTINGS.user.length > 0
+  && typeof TAU_SETTINGS.pass === 'string' && TAU_SETTINGS.pass.length > 0;
+
+/** Validate before opening either listener; missing credentials never disable auth. */
+export function requireTauCredentials(settings: Pick<TauSettings, 'user' | 'pass'>): void {
+  if (typeof settings.user !== 'string' || !settings.user || typeof settings.pass !== 'string' || !settings.pass) {
+    throw new Error('Authentication requires a nonempty username and password. Set TAU_USER and TAU_PASS, or tau.user and tau.pass in settings.json. To explicitly run without authentication, set tau.authEnabled to false.');
+  }
+}
+/** HTTPS port: the only listener reachable from the network. */
 export const PORT = TAU_SETTINGS.port;
 export const HOST = TAU_SETTINGS.host;
+/** Plain HTTP port, always bound to loopback, for local Pi orchestration. */
+export const HTTP_PORT = TAU_SETTINGS.httpPort;
+export const TLS_DIR = path.join(PI_AGENT_DIR, 'tau', 'tls');
 export const STATIC_DIR = process.env.TAU_STATIC_DIR || findPublicDir();
 
 function findPublicDir() {

@@ -1,20 +1,16 @@
+import { runtimeEnvironment, launcher, installFakeRuntime, closeFakeRuntime, launchBrowser, listenFakeServer, liveManager } from './fake-browser-runtime.ts';
 import { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { EventEmitter } from 'node:events';
-import { PassThrough } from 'node:stream';
-import { chromium } from 'playwright';
 import type { TestContext } from 'node:test';
 import type { Browser, Page } from 'playwright';
 import type { JsonAgentSessionEvent } from '@earendil-works/pi-coding-agent';
 
 // Shared setup for the real-browser tests of session history and tool cards.
-// They drive the actual UI against the in-process server, with the pi child
-// process mocked the same way test/http-routes.test.ts does. Run them via
-// `npm run test:e2e` (scripts/e2e.sh provides Playwright browsers through Nix
-// when needed); each test skips itself when no browser install is available.
+// They drive the actual UI and server through protocol-2 Unix sockets.
+// The injected launch transaction creates only isolated fake runtimes.
 //
 // Each test file runs in its own process, so every file that imports this
 // module gets its own server, session directories, and browser. Call
@@ -22,35 +18,14 @@ import type { JsonAgentSessionEvent } from '@earendil-works/pi-coding-agent';
 
 export type ToolResultMessage = Extract<Extract<JsonAgentSessionEvent, { type: 'message_end' }>['message'], { role: 'toolResult' }>;
 
-// Loopback host; isolate session/settings dirs before loading the server.
-process.env.TAU_HOST = '127.0.0.1';
-process.env.PI_CODING_AGENT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-e2e-'));
-process.env.PI_CODING_AGENT_SESSION_DIR = path.join(process.env.PI_CODING_AGENT_DIR, 'sessions');
-process.env.TAU_PROJECTS_DIR = path.join(process.env.PI_CODING_AGENT_DIR, 'projects');
-
-// Load the server after the env is in place: the module reads it at load
-// time, and ESM hoists static imports ahead of this body.
-const tau = (await import('../../bin/tau.js')) as any;
-const { server, computeUrls, SESSIONS_DIR, _setSpawnPiForTest, _setExecFileForTest } = tau;
-export const liveManager = tau.liveManager;
+export { liveManager };
+const SESSIONS_DIR = runtimeEnvironment.sessions;
 
 let base = '';
 let browser: Browser | null = null;
 let browserUnavailable = '';
 
 const PROJ_DIR = path.join(SESSIONS_DIR, '--tmp--e2eproj');
-
-// Same realistic fake `pi` child as test/http-routes.test.ts: real streams so
-// the RPC wiring works, an EventEmitter so error/exit listeners resolve.
-function makeFakeChild() {
-  const child: any = new EventEmitter();
-  child.stdin = new PassThrough();
-  child.stdout = new PassThrough();
-  child.stderr = new PassThrough();
-  child.pid = 12345;
-  child.kill = () => {};
-  return child;
-}
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
 // Session A: a large conversation. Every round is user + assistant; every
@@ -59,8 +34,9 @@ function makeFakeChild() {
 export const ROUNDS = 700;
 export const TOOL_EVERY = 5;
 const LAST_USAGE = { input: 12000, cacheRead: 30000, cost: { total: 0.001 } };
-// user + assistant per round, plus one toolCall item per tool round.
-export const TOTAL_ITEMS = ROUNDS * 2 + Math.ceil(ROUNDS / TOOL_EVERY);
+// Top-level visual rows: one user plus one grouped assistant block per round.
+// Tool items stay inside their owning block, not alongside it.
+export const TOTAL_ITEMS = ROUNDS * 2;
 export const LAST_MARKER = `msg-asst-${String(ROUNDS - 1).padStart(4, '0')}`;
 
 function buildLargeSession(cwd: string) {
@@ -109,10 +85,12 @@ function buildSmallSession(cwd: string) {
   return entries;
 }
 
-export function writeSession(fileName: string, lines: Array<Record<string, unknown>>) {
+function writeSession(fileName: string, lines: Array<Record<string, unknown>>) {
   fs.mkdirSync(PROJ_DIR, { recursive: true });
   const filePath = path.join(PROJ_DIR, fileName);
-  fs.writeFileSync(filePath, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+  const entries = lines.map((entry, index) => index === 0 ? entry
+    : { ...entry, id: `entry-${index}`, parentId: index === 1 ? null : `entry-${index - 1}` });
+  fs.writeFileSync(filePath, entries.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
   return filePath;
 }
 
@@ -127,22 +105,33 @@ export function setupHistoryE2E() {
     largeFile = writeSession('large.jsonl', buildLargeSession(cwd));
     smallFile = writeSession('small.jsonl', buildSmallSession(cwd));
 
-    _setSpawnPiForTest(() => makeFakeChild());
-    _setExecFileForTest((_file: string, _args: string[], _opts: object, cb: (err: Error | null, stdout: string, stderr: string) => void) =>
-      cb(null, '', '')
-    );
+    installFakeRuntime();
+    // Consumers append synthetic saved entries to their session fixture. Publish
+    // those entries as the mock writer's tree at the next socket boundary.
+    launcher.configure = mux => {
+      const snapshot = mux.snapshot.bind(mux);
+      mux.snapshot = (socket, reason, generation) => {
+        const file = (mux.entry.session as Record<string, unknown>).file;
+        const session = typeof file === 'string' ? liveManager.findBySessionFile(file) : undefined;
+        if (session) {
+          let parentId: string | null = null;
+          mux.entries = session.entries.map((entry: Record<string, unknown>, index: number) => {
+            const id = typeof entry.id === 'string' ? entry.id : `fixture-${index}`;
+            const record = { ...entry, id, parentId };
+            parentId = id;
+            return record;
+          });
+          mux.leafId = parentId;
+          mux.idle = !session.isStreaming;
+        }
+        snapshot(socket, reason, generation);
+      };
+    };
 
-    await new Promise<void>((resolve) => {
-      server.listen(0, '127.0.0.1', () => {
-        const port = server.address().port;
-        computeUrls(port);
-        base = `http://127.0.0.1:${port}`;
-        resolve();
-      });
-    });
+    base = await listenFakeServer();
 
     try {
-      browser = await chromium.launch();
+      browser = await launchBrowser();
     } catch (e) {
       browserUnavailable = `Playwright browser unavailable (${(e as Error).message.split('\n')[0]}). Run via: npm run test:e2e`;
     }
@@ -150,10 +139,7 @@ export function setupHistoryE2E() {
 
   after(async () => {
     if (browser) await browser.close().catch(() => {});
-    await liveManager.shutdown();
-    _setSpawnPiForTest(null);
-    _setExecFileForTest(null);
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await closeFakeRuntime();
   });
 }
 
@@ -212,6 +198,8 @@ export async function openPage(t: TestContext, options: OpenPageOptions = {}) {
     // manual branch. Disable it so this page behaves like stable Safari.
     await page.addStyleTag({ content: '.messages { overflow-anchor: none !important; }' });
   }
+  // Projects are loaded first; their transcript lists are fetched on expansion.
+  await page.locator('.project-group .project-header').first().click();
   await page.waitForSelector('.session-item', { timeout: 15000 });
   return { page, errors };
 }
@@ -241,7 +229,9 @@ export async function openNestedPage(t: TestContext, options: OpenPageOptions = 
   assert.ok(session);
   const id = `owner/with/slashes-${number}`;
   const card = page.locator(`.tool-card[data-tool-call-id="${id}"]`);
-  const broadcast = (event: JsonAgentSessionEvent) => liveManager.broadcast({ type: 'event', sessionId: session.id, event });
+  const mux = launcher.muxes.find(runtime => (runtime.entry.session as Record<string, unknown>).file === file);
+  assert.ok(mux);
+  const broadcast = (event: JsonAgentSessionEvent) => mux.broadcast(event);
   const start = (suffix = '', parentToolCallId?: string, toolName = 'read', args = { path: '/tmp/child.txt' }) =>
     broadcast({ type: 'tool_execution_start', toolCallId: id + suffix, toolName, args, ...(parentToolCallId ? { parentToolCallId } : {}) });
   const end = (suffix = '', parentToolCallId?: string, isError = false, text = 'private child output') =>

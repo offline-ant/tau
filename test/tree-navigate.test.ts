@@ -21,7 +21,7 @@ const {
   liveManager,
   navigateTree,
   selectNavigationTarget,
-  flattenTree,
+  entriesById,
   pathFromRoot,
   leafDescendsFrom,
   NAVIGATE_COMMAND,
@@ -92,22 +92,19 @@ test('selectNavigationTarget: assistant / other entries → the entry itself, no
 // tree helpers
 // ═══════════════════════════════════════
 
-function sampleTree() {
+function sampleEntries() {
   // u1 → a1 → { u2 → a2, marker }
-  return [{
-    entry: { id: 'u1', parentId: null, type: 'message' },
-    children: [{
-      entry: { id: 'a1', parentId: 'u1', type: 'message' },
-      children: [
-        { entry: { id: 'u2', parentId: 'a1', type: 'message' }, children: [{ entry: { id: 'a2', parentId: 'u2', type: 'message' }, children: [] }] },
-        { entry: { id: 'm1', parentId: 'a1', type: 'custom' }, children: [] },
-      ],
-    }],
-  }];
+  return [
+    { id: 'u1', parentId: null, type: 'message' },
+    { id: 'a1', parentId: 'u1', type: 'message' },
+    { id: 'u2', parentId: 'a1', type: 'message' },
+    { id: 'a2', parentId: 'u2', type: 'message' },
+    { id: 'm1', parentId: 'a1', type: 'custom' },
+  ];
 }
 
-test('flattenTree/pathFromRoot/leafDescendsFrom walk the get_tree payload', () => {
-  const byId = flattenTree(sampleTree());
+test('entriesById/pathFromRoot/leafDescendsFrom walk the flat get_entries payload', () => {
+  const byId = entriesById(sampleEntries());
   assert.equal(byId.size, 5);
   assert.deepEqual(pathFromRoot(byId, 'm1').map((e: Json) => e.id), ['u1', 'a1', 'm1']);
   assert.deepEqual(pathFromRoot(byId, null), []);
@@ -205,7 +202,7 @@ test('extension handler refuses empty args, unknown entries, a busy agent, and c
 // ═══════════════════════════════════════
 
 // In-memory stand-in for a pi child with the tau extension loaded: answers
-// get_tree/get_commands and emulates the /tau-tree-navigate handler on
+// get_entries/get_commands and emulates the /tau-tree-navigate handler on
 // prompt, including its selection semantics and marker append.
 function fakeSession(opts: { isStreaming?: boolean; entries?: Json[]; leafId?: string; extensionLoaded?: boolean; extensionError?: string } = {}) {
   const state = {
@@ -216,17 +213,6 @@ function fakeSession(opts: { isStreaming?: boolean; entries?: Json[]; leafId?: s
   const sent: Json[] = [];
   const broadcasts: Json[] = [];
   const updated: string[] = [];
-
-  function treeNodes(): Json[] {
-    const nodes = new Map<string, Json>(state.entries.map((e) => [e.id, { entry: e, children: [] as Json[] }]));
-    const roots: Json[] = [];
-    for (const node of nodes.values()) {
-      const parent = node.entry.parentId ? nodes.get(node.entry.parentId) : undefined;
-      if (parent) parent.children.push(node);
-      else roots.push(node);
-    }
-    return roots;
-  }
 
   const session = {
     id: 'live_1',
@@ -241,8 +227,8 @@ function fakeSession(opts: { isStreaming?: boolean; entries?: Json[]; leafId?: s
     state,
     async send(command: Json) {
       sent.push(command);
-      if (command.type === 'get_tree') {
-        return { type: 'response', command: 'get_tree', success: true, data: { tree: treeNodes(), leafId: state.leafId } };
+      if (command.type === 'get_entries') {
+        return { type: 'response', command: 'get_entries', success: true, data: { entries: state.entries, leafId: state.leafId } };
       }
       if (command.type === 'get_commands') {
         const commands = opts.extensionLoaded === false ? [] : [{ name: NAVIGATE_COMMAND, source: 'extension' }];
@@ -285,10 +271,10 @@ test('navigateTree drives the extension command, re-derives the active path, and
   const result = await navigateTree(session, 'u2');
   assert.equal(result.editorText, 'second user message');
 
-  // Preflight get_tree resolves the target, get_commands confirms the child
+  // Preflight get_entries resolves the target, get_commands confirms the child
   // loaded tau's extension, then the slash command moves the leaf in-process
-  // and the follow-up get_tree verifies it.
-  assert.deepEqual(session.sent.map((c: Json) => c.type), ['get_tree', 'get_commands', 'prompt', 'get_tree']);
+  // and the follow-up get_entries verifies it.
+  assert.deepEqual(session.sent.map((c: Json) => c.type), ['get_entries', 'get_commands', 'prompt', 'get_entries']);
   assert.equal(session.sent[2].message, `/${NAVIGATE_COMMAND} u2`);
 
   // entries now hold the new active path root → target (marker included).
@@ -320,14 +306,14 @@ test('navigating to the current position skips the child round-trip', async () =
   let session = fakeSession({ leafId: 'a2' });
   let result = await navigateTree(session, 'a2');
   assert.equal(result.editorText, undefined);
-  assert.deepEqual(session.sent.map((c: Json) => c.type), ['get_tree']);
+  assert.deepEqual(session.sent.map((c: Json) => c.type), ['get_entries']);
 
   // …and a user message whose parent already is the leaf: no move, but the
   // text still goes back so the composer gets prefilled for edit + resubmit.
   session = fakeSession({ leafId: 'a1' });
   result = await navigateTree(session, 'u2');
   assert.equal(result.editorText, 'second user message');
-  assert.deepEqual(session.sent.map((c: Json) => c.type), ['get_tree']);
+  assert.deepEqual(session.sent.map((c: Json) => c.type), ['get_entries']);
 });
 
 test('navigateTree refuses while the session is streaming', async () => {
@@ -486,7 +472,7 @@ test('the bundled extension moves a real pi child\'s leaf, invisibly to the LLM,
 
   // Wait for the child to accept RPC commands.
   await new Promise((r) => setTimeout(r, 1500));
-  const before = await pi.send({ type: 'get_tree' });
+  const before = await pi.send({ type: 'get_entries' });
   assert.equal(before.success, true);
 
   const session = {
@@ -525,9 +511,9 @@ test('the bundled extension moves a real pi child\'s leaf, invisibly to the LLM,
   pi.child.kill('SIGKILL');
   const revived = spawnPi(t, file);
   await new Promise((r) => setTimeout(r, 1500));
-  const afterRestart = await revived.send({ type: 'get_tree' });
+  const afterRestart = await revived.send({ type: 'get_entries' });
   assert.equal(afterRestart.success, true);
-  const byId = flattenTree(afterRestart.data.tree);
+  const byId = entriesById(afterRestart.data.entries);
   assert.ok(leafDescendsFrom(byId, afterRestart.data.leafId, marker.id));
   assert.ok(leafDescendsFrom(byId, afterRestart.data.leafId, 'a1'));
 });

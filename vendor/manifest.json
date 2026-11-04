@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "inputs": [
+    {
+      "name": "@phimacs/pimux",
+      "version": "0.1.0",
+      "file": "phimacs-pimux-0.1.0-943308be88ad.tgz",
+      "sha256": "943308be88ad26df0037ae9209ffc54baa251b6a4ed71fe19f2aa9062c74e472",
+      "sourceRepository": "https://github.com/offline-ant/phimacs",
+      "sourceRevision": "fe60159664a65c60d2b1df486e527f943d071dd6",
+      "sourceArchive": "phimacs-source-fe60159.tgz",
+      "sourceArchiveSha256": "47990af7b1e9cfc8f47b9b8148a25d8c95be686dfdc101d2dca6dc55f177974b",
+      "sourceDirectory": "packages/pimux",
+      "license": "MIT"
+    },
+    {
+      "name": "pi-orchestration",
+      "version": "0.1.0",
+      "file": "pi-orchestration-0.1.0-c0ce15b13564.tgz",
+      "sha256": "c0ce15b135646db514465c8da1218dc44ecfa47ce172173dace9535962670507",
+      "sourceRepository": "https://github.com/offline-ant/phimacs",
+      "sourceRevision": "fe60159664a65c60d2b1df486e527f943d071dd6",
+      "sourceArchive": "phimacs-source-fe60159.tgz",
+      "sourceArchiveSha256": "47990af7b1e9cfc8f47b9b8148a25d8c95be686dfdc101d2dca6dc55f177974b",
+      "sourceDirectory": "packages/orchestration",
+      "license": "MIT"
+    },
+    {
+      "name": "pi-sound",
+      "version": "0.1.0",
+      "file": "pi-sound-0.1.0.tgz",
+      "sha256": "5d3981e98f35e9cb61964b03490ad62eb30cda2b6a593111fa2ae2b1d93aeb99",
+      "sourceRepository": "https://github.com/offline-ant/phimacs",
+      "sourceRevision": "b95885c1b96b82fb866efa981bce7656aa287d40",
+      "sourceDirectory": "packages/sound",
+      "license": "MIT AND Apache-2.0"
+    }
+  ]
+}

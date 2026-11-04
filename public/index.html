@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, interactive-widget=resizes-content">
   <title>Tau</title>
   <link rel="icon" type="image/png" href="icons/tau-192.png">
   <link rel="manifest" href="manifest.json">
@@ -10,7 +10,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="Tau">
-  <meta name="theme-color" content="#f5f3ef">
+  <meta name="theme-color" content="#3390ec">
   <link rel="stylesheet" href="style.css">
   <link rel="stylesheet" href="vendor/katex/katex.min.css">
 </head>
@@ -22,7 +22,7 @@
         <div class="mode-toggle" id="mode-toggle">
           <span class="mode-link active" title="Chat"><img src="icons/tau-192.png" alt="τ" class="tau-icon"></span>
         </div>
-        <input type="text" id="session-search-input" class="sidebar-search-input" placeholder="Search..." autocomplete="off" />
+        <input type="search" id="session-search-input" class="sidebar-search-input" placeholder="Search sessions…" aria-label="Search sessions" autocomplete="off" />
         <div class="sidebar-actions">
           <button class="icon-btn" id="new-session-btn" title="New session" aria-label="New session"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>
           <button class="icon-btn" id="refresh-sessions-btn" title="Refresh sessions" aria-label="Refresh sessions"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg></button>
@@ -42,6 +42,7 @@
       <div class="header">
         <div class="header-left">
           <button class="sidebar-toggle" id="sidebar-toggle" title="Toggle sidebar" aria-label="Toggle sidebar"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg></button>
+          <button class="agents-btn" id="agents-btn" type="button" aria-label="Agents" data-urgency="none"><span class="agents-btn-icon" aria-hidden="true">◉</span><span class="agents-count"></span></button>
           <button class="model-input" id="model-input" type="button"
                   title="Choose model and (optionally) thinking level for this session"
                   aria-label="Choose model and thinking level"><span class="model-input-label" id="model-input-label">Model</span></button>
@@ -70,30 +71,33 @@
       <!-- In-page Tau live-session tabs -->
       <div class="live-tabs" id="live-tabs">
         <div class="live-tabs-list" id="live-tabs-list"></div>
+        <button class="live-tab-add" id="take-herdr-btn" type="button" title="Take an idle Herdr conversation into the current Tau tab" aria-label="Take from Herdr…">↙</button>
         <button class="live-tab-add" id="live-tab-add" title="New Tau tab" aria-label="New Tau tab">+</button>
       </div>
 
       <!-- Launcher (project picker) -->
       <div class="launcher hidden" id="launcher"></div>
 
-      <!-- Messages Container -->
-      <div class="messages" id="messages">
-        <div class="welcome">
-          <div class="welcome-icon"><img src="icons/tau-192.png" alt="τ" class="tau-icon-welcome"></div>
-          <p>Welcome to Tau</p>
-          <p class="hint">Type a message below to start chatting with Pi, or select a session from the sidebar.</p>
-          <div class="shortcuts-hint">
-            <span>/ Focus input</span>
-            <span>Esc Abort</span>
+      <!-- Messages, with the scroll-to-bottom button pinned above the composer -->
+      <div class="messages-pane">
+        <div class="messages" id="messages">
+          <div class="welcome">
+            <div class="welcome-icon"><img src="icons/tau-192.png" alt="τ" class="tau-icon-welcome"></div>
+            <p>Welcome to Tau</p>
+            <p class="hint">Open an agent or a session from the sidebar, or create a Tau tab with +.</p>
+            <div class="shortcuts-hint">
+              <span>/ Focus input</span>
+              <span>Esc Abort</span>
+            </div>
           </div>
         </div>
-      </div>
 
-      <!-- Scroll to bottom + new message indicator -->
-      <button class="scroll-bottom-btn hidden" id="scroll-bottom-btn">
-        <span class="scroll-bottom-badge hidden" id="scroll-bottom-badge">New <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg></span>
-        <span class="scroll-bottom-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg></span>
-      </button>
+        <!-- Scroll to bottom + new message indicator -->
+        <button class="scroll-bottom-btn hidden" id="scroll-bottom-btn">
+          <span class="scroll-bottom-badge hidden" id="scroll-bottom-badge">New <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg></span>
+          <span class="scroll-bottom-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg></span>
+        </button>
+      </div>
 
       <!-- Typing indicator (hidden, kept for JS reference) -->
       <div class="typing-indicator hidden" id="typing-indicator"></div>
@@ -102,6 +106,7 @@
       <div class="input-area">
         <div class="queued-messages hidden" id="queued-messages"></div>
         <div class="image-previews hidden" id="image-previews"></div>
+        <div class="voice-status hidden" id="voice-status" role="status" aria-live="polite"></div>
         <form id="chat-form">
           <div class="input-left-actions">
             <button type="button" class="input-icon-btn" id="command-btn" title="Commands" aria-label="Open commands" tabindex="-1">
@@ -182,6 +187,10 @@
         <div class="settings-row">
           <span class="settings-label">Show thinking</span>
           <button class="settings-toggle on" id="toggle-show-thinking"></button>
+        </div>
+        <div class="settings-row" id="setting-fullscreen">
+          <span class="settings-label" id="fullscreen-label">Fullscreen</span>
+          <button class="settings-toggle" id="toggle-fullscreen"></button>
         </div>
       </div>
       <div class="settings-section" id="settings-auth-section" style="display:none">

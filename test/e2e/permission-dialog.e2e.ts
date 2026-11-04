@@ -1,15 +1,12 @@
+import { runtimeEnvironment, installFakeRuntime, closeFakeRuntime, launchBrowser, listenFakeServer, liveManager } from './fake-browser-runtime.ts';
+import { installBrowserRuntimePeers, installUpstreamQueueView } from './upstream-queue-runtime.ts';
 import { test, before, after } from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import path from 'node:path';
-import os from 'node:os';
-import { EventEmitter } from 'node:events';
-import { PassThrough } from 'node:stream';
-import { chromium } from 'playwright';
 import type { Browser, Page } from 'playwright';
 
-// The real browser and Tau server, with only Pi replaced at its stdio boundary.
+// The real browser and Tau server communicate through protocol-2 fake sockets.
+// The explicit upstream view fixture preserves browser-owned queue scenarios.
 // Snapshot overrides below exercise delayed/stale network deliveries without
 // reaching into the browser's state or dialog implementation.
 //
@@ -17,79 +14,27 @@ import type { Browser, Page } from 'playwright';
 // are Tau's own dialog-recovery tests: that a request arriving before a browser
 // connects is restored from the snapshot, that it reaches a second browser, and
 // that Abort cancels it. Every request below is emitted by hand from a fake Pi
-// child, and titles like 'Permission required' are only a representative label
+// runtime, and titles like 'Permission required' are only a representative label
 // for any extension dialog. The behaviour is generic across confirm, select,
 // input and editor, so these tests keep passing with no permission extension
 // installed at all. The real extension is exercised only in
 // test/permission-rpc.test.ts, which explains that split in its own header.
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-permission-e2e-'));
-process.env.TAU_HOST = '127.0.0.1';
-process.env.PI_CODING_AGENT_DIR = tmp;
-process.env.PI_CODING_AGENT_SESSION_DIR = path.join(tmp, 'sessions');
-process.env.TAU_PROJECTS_DIR = path.join(tmp, 'projects');
-const { server, computeUrls, liveManager, _setSpawnPiForTest, _setExecFileForTest } = (await import('../../bin/tau.js')) as any;
+const tmp = runtimeEnvironment.root;
+const peers = installBrowserRuntimePeers();
+let upstreamViews: ReturnType<typeof installUpstreamQueueView>;
 
 type Command = { type: string; id?: string; [key: string]: unknown };
 type PendingDialog = Command & { method: string; createdAt: number; expiresAt?: number };
 let base = '';
 let browser: Browser | null = null;
 let browserUnavailable = '';
-let spawnedChild: ReturnType<typeof makeFakeChild>;
-
-function makeFakeChild() {
-  const child: any = new EventEmitter();
-  child.stdin = new PassThrough();
-  child.stdout = new PassThrough();
-  child.stderr = new PassThrough();
-  child.pid = 12345;
-  child.kill = () => { queueMicrotask(() => child.emit('exit', 0)); };
-  const commands: Command[] = [];
-  const emit = (event: object) => child.stdout.write(`${JSON.stringify(event)}\n`);
-  let buffer = '';
-  child.stdin.on('data', (data: Buffer) => {
-    buffer += data.toString();
-    while (buffer.includes('\n')) {
-      const end = buffer.indexOf('\n');
-      const command = JSON.parse(buffer.slice(0, end)) as Command;
-      buffer = buffer.slice(end + 1);
-      commands.push(command);
-      child.emit('command', command);
-      if (command.type === 'get_state' || command.type === 'get_session_stats' || command.type === 'get_available_models') {
-        queueMicrotask(() => emit({
-          type: 'response', id: command.id, command: command.type, success: true,
-          data: command.type === 'get_state' ? { isStreaming: false, isCompacting: false, thinkingLevel: 'off' } : {},
-        }));
-      }
-    }
-  });
-  const nextCommand = (type: string): Promise<Command> => new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => { child.off('command', listener); reject(new Error(`No ${type} command reached Pi`)); }, 5000);
-    const listener = (command: Command) => {
-      if (command.type !== type) return;
-      clearTimeout(timeout);
-      child.off('command', listener);
-      resolve(command);
-    };
-    child.on('command', listener);
-  });
-  return { child, commands, emit, nextCommand };
-}
 
 before(async () => {
-  fs.mkdirSync(process.env.PI_CODING_AGENT_SESSION_DIR!, { recursive: true });
-  _setSpawnPiForTest(() => {
-    spawnedChild = makeFakeChild();
-    return spawnedChild.child;
-  });
-  _setExecFileForTest((_file: string, _args: string[], _opts: object, cb: (err: Error | null, stdout: string, stderr: string) => void) => cb(null, '', ''));
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => {
-    const port = server.address().port;
-    computeUrls(port);
-    base = `http://127.0.0.1:${port}`;
-    resolve();
-  }));
+  installFakeRuntime();
+  upstreamViews = installUpstreamQueueView();
+  base = await listenFakeServer();
   try {
-    browser = await chromium.launch();
+    browser = await launchBrowser();
   } catch (e) {
     browserUnavailable = `Playwright browser unavailable (${(e as Error).message.split('\n')[0]}). Run via: npm run test:e2e`;
   }
@@ -97,11 +42,8 @@ before(async () => {
 
 after(async () => {
   if (browser) await browser.close();
-  await liveManager.shutdown();
-  _setSpawnPiForTest(null);
-  _setExecFileForTest(null);
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-  fs.rmSync(tmp, { recursive: true, force: true });
+  upstreamViews.restore();
+  await closeFakeRuntime();
 });
 
 function skipUnlessBrowser(t: TestContext) {
@@ -110,16 +52,17 @@ function skipUnlessBrowser(t: TestContext) {
   return true;
 }
 
-async function createSession(t: TestContext) {
+async function createSession(t: TestContext, shared = false) {
   const response = await fetch(`${base}/api/live-sessions`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ cwd: tmp }),
   });
   assert.equal(response.status, 200);
   const { session } = await response.json() as { session: { id: string } };
-  const fake = spawnedChild;
+  if (!shared) upstreamViews.expose(session.id);
+  const fake = peers.at(-1)!;
   t.after(async () => { await fetch(`${base}/api/live-sessions/${session.id}`, { method: 'DELETE' }); });
-  return { sessionId: session.id, ...fake };
+  return { sessionId: session.id, commands: fake.commands, emit: fake.emit, nextCommand: fake.nextCommand };
 }
 
 async function openPage(t: TestContext, sessionId: string, snapshot?: object) {
@@ -133,12 +76,12 @@ async function openPage(t: TestContext, sessionId: string, snapshot?: object) {
   page.on('pageerror', (error: Error) => errors.push(error.message));
   t.after(() => assert.deepEqual(errors, [], 'browser must not throw'));
   if (snapshot) {
-    await page.route((url) => url.pathname === `/api/live-sessions/${sessionId}/snapshot`, async (route) => {
+    await page.route(`**/api/live-sessions/${sessionId}/snapshot`, async (route) => {
       const response = await route.fetch();
       await route.fulfill({ response, json: { ...await response.json(), ...snapshot } });
     });
   }
-  const snapshotResponse = page.waitForResponse((response) => new URL(response.url()).pathname === `/api/live-sessions/${sessionId}/snapshot`);
+  const snapshotResponse = page.waitForResponse((response) => response.url().endsWith(`/api/live-sessions/${sessionId}/snapshot`));
   await page.goto(base);
   await (await snapshotResponse).finished();
   await page.waitForSelector(`.live-tab.active[data-session-id="${sessionId}"]`);
@@ -153,6 +96,26 @@ function confirmRequest(id: string, extra: Partial<PendingDialog> = {}): Pending
 async function expectDialog(page: Page, title = 'Permission required') {
   await page.waitForFunction((text) => document.querySelector('#dialog-container:not(.hidden) .dialog-title')?.textContent === text, title, { timeout: 5000 });
 }
+
+test('shared socket views restore the mux dialog and observe its first authoritative closure', async t => {
+  if (skipUnlessBrowser(t)) return;
+  const { sessionId, emit, commands } = await createSession(t, true);
+  assert.ok(liveManager.get(sessionId)!.metadata().attached);
+  emit(confirmRequest('shared-mux-dialog'));
+  const first = await openPage(t, sessionId);
+  const second = await openPage(t, sessionId);
+  await Promise.all([expectDialog(first), expectDialog(second)]);
+  await first.reload();
+  await expectDialog(first);
+  await second.click('#dialog-yes');
+  await Promise.all([
+    first.waitForSelector('#dialog-container.hidden', { state: 'attached' }),
+    second.waitForSelector('#dialog-container.hidden', { state: 'attached' }),
+  ]);
+  assert.deepEqual(commands.filter(command => command.type === 'extension_ui_response'), [
+    { type: 'extension_ui_response', id: 'shared-mux-dialog', confirmed: true },
+  ]);
+});
 
 test('a snapshot restores a permission request that arrived before the browser connected', async (t) => {
   if (skipUnlessBrowser(t)) return;
@@ -208,9 +171,9 @@ test('switching tabs preserves the original approval deadline and never sends ca
   await page.click(`.live-tab[data-session-id="${other.sessionId}"]`);
   await page.waitForSelector('#dialog-container.hidden', { state: 'attached' });
   await page.clock.runFor(4000);
-  // The tab's kept conversation comes back without a new snapshot request.
+  const response = page.waitForResponse((res) => res.url().endsWith(`/api/live-sessions/${sessionId}/snapshot`));
   await page.click(`.live-tab[data-session-id="${sessionId}"]`);
-  await page.waitForSelector(`.live-tab.active[data-session-id="${sessionId}"]`);
+  await response;
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
   assert.equal(await page.locator('#dialog-container').isVisible(), false, 'an expired request must not get a fresh timeout on tab return');
   assert.deepEqual(commands.filter((command) => command.type === 'extension_ui_response'), []);
@@ -253,64 +216,6 @@ test('a delivery acknowledgement cannot resolve a dialog or let the browser subm
 
   liveManager.broadcast({ type: 'live_session_snapshot', sessionId, pendingDialogs: [], interactionRevision: 2 });
   await page.waitForSelector('#dialog-container.hidden', { state: 'attached' });
-});
-
-test('returning to a tab waits for the current reply before sending its queued instruction', async (t) => {
-  if (skipUnlessBrowser(t)) return;
-  const first = await createSession(t);
-  const second = await createSession(t);
-  const laptop = await openPage(t, first.sessionId);
-  const phone = await openPage(t, first.sessionId);
-  first.emit({ type: 'agent_start' });
-  await laptop.waitForSelector('#abort-btn:not(.hidden)');
-  await laptop.fill('#message-input', 'waiting instruction from laptop');
-  await laptop.press('#message-input', 'Enter');
-  await laptop.waitForSelector('.queued-msg');
-
-  const selectSecond = async () => {
-    const snapshot = laptop.waitForResponse(response => new URL(response.url()).pathname === `/api/live-sessions/${second.sessionId}/snapshot`);
-    await laptop.click(`.live-tab[data-session-id="${second.sessionId}"]`);
-    await (await snapshot).finished();
-    await laptop.waitForSelector('#messages .welcome');
-  };
-  await selectSecond();
-  first.emit({ type: 'agent_settled' });
-  await phone.waitForSelector('#send-btn:not(.hidden)');
-  await laptop.waitForSelector(`.live-tab[data-session-id="${first.sessionId}"] .live-tab-streaming-dot`, { state: 'detached' });
-
-  const phonePrompt = first.nextCommand('prompt');
-  await phone.fill('#message-input', 'new task from phone');
-  await phone.press('#message-input', 'Enter');
-  const sent = await phonePrompt;
-  first.emit({ type: 'response', command: 'prompt', id: sent.id, success: true });
-  first.emit({ type: 'agent_start' });
-  first.emit({ type: 'message_start', message: { role: 'user', content: 'new task from phone' } });
-  first.emit({ type: 'message_start', message: { role: 'assistant', content: [] } });
-  first.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'phone reply in progress' } });
-  await laptop.waitForSelector(`.live-tab[data-session-id="${first.sessionId}"] .live-tab-streaming-dot`);
-
-  await laptop.click(`.live-tab[data-session-id="${first.sessionId}"]`);
-  await laptop.waitForFunction(() => document.getElementById('messages')?.textContent?.includes('phone reply in progress'));
-  assert.equal(await laptop.locator('.queued-msg').count(), 1, 'the laptop instruction must wait for the phone task');
-  assert.equal(await laptop.locator('#typing-indicator').isVisible(), true);
-  assert.deepEqual(first.commands.filter(command => command.type === 'prompt').map(command => command.message), ['new task from phone']);
-
-  // A reply that finishes while another tab is shown releases the waiting
-  // instruction when this browser returns to its conversation.
-  await laptop.click(`.live-tab[data-session-id="${second.sessionId}"]`);
-  await laptop.waitForSelector('#messages .welcome');
-  first.emit({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'phone reply finished' }] } });
-  first.emit({ type: 'agent_settled' });
-  await laptop.waitForSelector(`.live-tab[data-session-id="${first.sessionId}"] .live-tab-streaming-dot`, { state: 'detached' });
-  const laptopPrompt = first.nextCommand('prompt');
-  await laptop.click(`.live-tab[data-session-id="${first.sessionId}"]`);
-  const waiting = await laptopPrompt;
-  assert.equal(waiting.message, 'waiting instruction from laptop');
-  first.emit({ type: 'response', command: 'prompt', id: waiting.id, success: true });
-  await laptop.waitForSelector('#queued-messages.hidden', { state: 'attached' });
-  assert.deepEqual(first.commands.filter(command => command.type === 'prompt').map(command => command.message), [
-    'new task from phone', 'waiting instruction from laptop',
-  ]);
 });
 
 test('queued instructions wait through turn_end and agent_end until agent_settled', async (t) => {
@@ -383,8 +288,9 @@ test('an Abort timeout remains honest and queued instructions stay with their se
   const prompt = first.nextCommand('prompt');
   // A native acknowledgement may arrive after Tau already reported timeout,
   // without another agent_settled. Its authoritative idle metadata is enough.
-  liveManager.broadcast({ type: 'live_session_updated', session: { id: first.sessionId, abortState: 'timed_out', isStreaming: true } });
-  liveManager.broadcast({ type: 'live_session_updated', session: { id: first.sessionId, abortState: 'idle', isStreaming: false } });
+  liveManager.broadcast({ type: 'live_session_updated', session: { ...liveManager.get(first.sessionId)!.metadata(), abortState: 'timed_out', isStreaming: true } });
+  first.emit({ type: 'response', command: 'get_state', success: true, data: { isStreaming: false } });
+  liveManager.broadcast({ type: 'live_session_updated', session: { ...liveManager.get(first.sessionId)!.metadata(), abortState: 'idle', isStreaming: false } });
   assert.equal((await prompt).message, 'keep this in the first session');
   assert.doesNotMatch(await page.locator('#status-text').innerText(), /timed out/);
 });
@@ -424,7 +330,7 @@ test('a delayed HTTP snapshot cannot roll back a newer running state or approval
   const captured = new Promise<void>(resolve => { snapshotCaptured = resolve; });
   let releaseSnapshot!: () => void;
   const released = new Promise<void>(resolve => { releaseSnapshot = resolve; });
-  await page.route((url) => url.pathname === `/api/live-sessions/${sessionId}/snapshot`, async route => {
+  await page.route(`**/api/live-sessions/${sessionId}/snapshot`, async route => {
     const response = await route.fetch();
     const snapshot = await response.json();
     snapshotCaptured();
@@ -437,7 +343,7 @@ test('a delayed HTTP snapshot cannot roll back a newer running state or approval
   emit(confirmRequest('after-snapshot'));
   await page.waitForSelector('#typing-indicator:not(.hidden)');
   await page.waitForFunction(() => document.getElementById('status-text')?.textContent === 'Waiting for approval');
-  const response = page.waitForResponse(response => new URL(response.url()).pathname === `/api/live-sessions/${sessionId}/snapshot`);
+  const response = page.waitForResponse(response => response.url().endsWith(`/api/live-sessions/${sessionId}/snapshot`));
   releaseSnapshot();
   await (await response).finished();
   await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
@@ -702,42 +608,6 @@ for (const failure of ['network', 'http', 'rpc'] as const) {
     assert.equal(probes, 3, 'Retries stop once the dispatch is released');
   });
 }
-
-test('switching tabs while disconnected reloads messages missed by the previous tab', async (t) => {
-  if (skipUnlessBrowser(t)) return;
-  const first = await createSession(t);
-  const second = await createSession(t);
-  const page = await openPage(t, first.sessionId);
-  first.emit({ type: 'agent_start' });
-  first.emit({ type: 'message_start', message: { role: 'assistant', content: [] } });
-  first.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'answer before disconnect' } });
-  await page.waitForFunction(() => document.getElementById('messages')?.textContent?.includes('answer before disconnect'));
-
-  await page.clock.pauseAt(await page.evaluate(() => Date.now()));
-  for (const client of liveManager.clients) client.close();
-  await page.getByText('Disconnected', { exact: true }).waitFor();
-  const secondSnapshot = page.waitForResponse(response => new URL(response.url()).pathname === `/api/live-sessions/${second.sessionId}/snapshot`);
-  await page.click(`.live-tab[data-session-id="${second.sessionId}"]`);
-  await (await secondSnapshot).finished();
-  await page.waitForSelector('#messages .welcome');
-
-  first.emit({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'answer completed during disconnect' }] } });
-  first.emit({ type: 'agent_settled' });
-  const reconnectedSnapshot = page.waitForResponse(response => new URL(response.url()).pathname === `/api/live-sessions/${second.sessionId}/snapshot`);
-  await page.clock.runFor(1100);
-  await (await reconnectedSnapshot).finished();
-  await page.clock.resume();
-  await page.getByText('Connected', { exact: true }).waitFor();
-
-  let refreshed = false;
-  page.on('request', request => {
-    if (new URL(request.url()).pathname === `/api/live-sessions/${first.sessionId}/snapshot`) refreshed = true;
-  });
-  await page.click(`.live-tab[data-session-id="${first.sessionId}"]`);
-  await page.waitForFunction(() => document.getElementById('messages')?.textContent?.includes('answer completed during disconnect'));
-  assert.equal(refreshed, true, 'the previous tab must ask the server for messages missed during the outage');
-  assert.equal(await page.locator('#messages .message-content.streaming').count(), 0);
-});
 
 test('reconnecting recovers an approval created while the browser was disconnected', async (t) => {
   if (skipUnlessBrowser(t)) return;

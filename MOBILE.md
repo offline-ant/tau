@@ -16,7 +16,7 @@ Everything customised for mobile (≤768px) compared to the desktop experience.
 - **iOS-native styling** — 17px regular-weight titles (not bold), 13px meta text, flat divider lines between items
 - **Titles wrap** — up to 2 lines instead of truncating
 - **Larger touch targets** — 16px vertical padding per row, 44px minimum on all interactive elements
-- **Larger search input** — 16px font (prevents iOS zoom), 10px padding, 12px border radius
+- **Always-visible project `+` button** — 18px glyph with wider padding, instead of appearing on hover
 - **Larger action buttons** — 36×36px icons
 
 ## Conversation Stream

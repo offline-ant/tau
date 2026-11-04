@@ -1,11 +1,9 @@
+import { runtimeEnvironment, launcher, installFakeRuntime, closeFakeRuntime, launchBrowser, listenFakeServer, liveManager } from './fake-browser-runtime.ts';
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { EventEmitter } from 'node:events';
-import { PassThrough } from 'node:stream';
-import { chromium } from 'playwright';
 import type { TestContext } from 'node:test';
 import type { Browser, Page } from 'playwright';
 
@@ -13,12 +11,7 @@ import type { Browser, Page } from 'playwright';
 // where the reply stopped, and an error Pi recovered from with a retry must
 // not be shown as a final failure.
 
-process.env.TAU_HOST = '127.0.0.1';
-process.env.PI_CODING_AGENT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-e2e-errors-'));
-process.env.PI_CODING_AGENT_SESSION_DIR = path.join(process.env.PI_CODING_AGENT_DIR, 'sessions');
-process.env.TAU_PROJECTS_DIR = path.join(process.env.PI_CODING_AGENT_DIR, 'projects');
-
-const { server, computeUrls, SESSIONS_DIR, liveManager, _setSpawnPiForTest, _setExecFileForTest } = (await import('../../bin/tau.js')) as any;
+const SESSIONS_DIR = runtimeEnvironment.sessions;
 
 let base = '';
 let browser: Browser | null = null;
@@ -28,16 +21,6 @@ const PROJ_DIR = path.join(SESSIONS_DIR, '--tmp--error-e2e');
 const FINAL_ERROR = '401: {"type":"authentication_error","code":"api_key_expired","message":"This API key has expired."}';
 const RECOVERED_ERROR = '503: temporary upstream failure';
 let sessionFile = '';
-
-function makeFakeChild() {
-  const child: any = new EventEmitter();
-  child.stdin = new PassThrough();
-  child.stdout = new PassThrough();
-  child.stderr = new PassThrough();
-  child.pid = 12345;
-  child.kill = () => {};
-  return child;
-}
 
 function writeSession(cwd: string) {
   fs.mkdirSync(PROJ_DIR, { recursive: true });
@@ -69,7 +52,7 @@ function writeSession(cwd: string) {
     { type: 'session_info', name: 'Error E2E Session' },
   ];
   sessionFile = path.join(PROJ_DIR, 'errors.jsonl');
-  fs.writeFileSync(sessionFile, entries.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
+  fs.writeFileSync(sessionFile, entries.map((entry, index) => JSON.stringify(index === 0 ? entry : { ...entry, id: `entry-${index}`, parentId: index === 1 ? null : `entry-${index - 1}` })).join('\n') + '\n');
 }
 
 async function openPage(t: TestContext) {
@@ -84,6 +67,7 @@ async function openPage(t: TestContext) {
     }
   });
   await page.goto(base);
+  await page.locator('.project-group .project-header').first().click();
   await page.waitForSelector('.session-item', { timeout: 15000 });
   return { page, errors };
 }
@@ -113,22 +97,12 @@ before(async () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-e2e-error-cwd-'));
   writeSession(cwd);
 
-  _setSpawnPiForTest(() => makeFakeChild());
-  _setExecFileForTest((_file: string, _args: string[], _opts: object, cb: (err: Error | null, stdout: string, stderr: string) => void) =>
-    cb(null, '', '')
-  );
+  installFakeRuntime();
 
-  await new Promise<void>((resolve) => {
-    server.listen(0, '127.0.0.1', () => {
-      const port = server.address().port;
-      computeUrls(port);
-      base = `http://127.0.0.1:${port}`;
-      resolve();
-    });
-  });
+  base = await listenFakeServer();
 
   try {
-    browser = await chromium.launch();
+    browser = await launchBrowser();
   } catch (e) {
     browserUnavailable = `Playwright browser unavailable (${(e as Error).message.split('\n')[0]}). Run via: npm run test:e2e`;
   }
@@ -136,10 +110,7 @@ before(async () => {
 
 after(async () => {
   if (browser) await browser.close().catch(() => {});
-  await liveManager.shutdown();
-  _setSpawnPiForTest(null);
-  _setExecFileForTest(null);
-  await new Promise<void>((resolve) => server.close(() => resolve()));
+  await closeFakeRuntime();
 });
 
 test('reopened history shows the final provider error and hides an error Pi recovered from', async (t: TestContext) => {
@@ -164,8 +135,9 @@ test('a failed reply shows a retry notice, then only the final failure stays inl
 
   const session = liveManager.findBySessionFile(sessionFile);
   assert.ok(session, 'the resumed session should be live');
-  const broadcast = (event: Record<string, unknown>) =>
-    liveManager.broadcast({ type: 'event', sessionId: session.id, event });
+  const mux = launcher.muxes.find(runtime => (runtime.entry.session as Record<string, unknown>).file === sessionFile);
+  assert.ok(mux);
+  const broadcast = (event: Record<string, unknown>) => mux.broadcast(event);
   const historyErrors = await page.locator('#messages .message-error').count();
 
   broadcast({ type: 'agent_start' });

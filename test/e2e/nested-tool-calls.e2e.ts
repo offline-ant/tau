@@ -26,14 +26,15 @@ test('nested tool events leave root cards unchanged and match reloaded history',
   if (skipUnlessBrowser(t)) return;
   const { page, errors } = await openPage(t);
   await page.click(sessionItemSelector(smallFile));
-  await page.waitForFunction((expected: number) =>
-    document.querySelectorAll('#messages > .message').length === expected, B_ROUNDS * 2);
+  await page.waitForFunction((rounds: number) =>
+    document.querySelectorAll('#messages > .message.user').length === rounds &&
+    document.querySelectorAll('#messages > .assistant-block').length === rounds, B_ROUNDS);
 
   const session = liveManager.findBySessionFile(smallFile);
   assert.ok(session, 'small fixture should have a resumed live session');
   const toolCallId = 'root-with-nested-calls';
   const card = page.locator(`.tool-card[data-tool-call-id="${toolCallId}"]`);
-  const broadcast = (event: JsonAgentSessionEvent | { type: 'compaction_start'; reason: 'manual'; parentToolCallId: string }) => liveManager.broadcast({ type: 'event', sessionId: session.id, event });
+  const broadcast = (event: JsonAgentSessionEvent & { parentToolCallId?: string }) => liveManager.broadcast({ type: 'event', sessionId: session.id, event });
   broadcast({ type: 'tool_execution_start', toolCallId, toolName: 'codemode', args: { code: 'tools.read()' } });
   await card.waitFor({ state: 'attached' });
   broadcast({ type: 'tool_execution_update', toolCallId, toolName: 'codemode', args: { code: 'tools.read()' }, partialResult: { content: [{ type: 'text', text: 'root partial output' }], details: {} } });
@@ -52,7 +53,7 @@ test('nested tool events leave root cards unchanged and match reloaded history',
   // and still handles other event types carrying the parent field.
   broadcast({ type: 'compaction_start', reason: 'manual', parentToolCallId });
   await page.waitForSelector('#messages .compaction-running');
-  assert.equal(await page.locator('#messages > .tool-card').count(), 1);
+  assert.equal(await page.locator('#messages > .assistant-block .tool-card').count(), 1);
   assert.equal(await card.locator('.tool-output').textContent(), 'root partial output');
   assert.equal(await card.locator('.nested-calls').count(), 1);
   assert.equal(await card.locator('.nested-call-row').count(), 1);
@@ -73,7 +74,7 @@ test('nested tool events leave root cards unchanged and match reloaded history',
     document.querySelector(`.tool-card[data-tool-call-id="${id}"] .nested-call-duration`)?.textContent === '17 ms', toolCallId);
   assert.equal(await card.locator('.nested-calls-toggle').getAttribute('aria-expanded'), 'false');
   assert.equal(await card.locator('.nested-calls-list').isVisible(), false);
-  const liveIds = await page.locator('#messages > .tool-card').evaluateAll(cards => cards.map(card => card.getAttribute('data-tool-call-id')));
+  const liveIds = await page.locator('#messages > .assistant-block .tool-card').evaluateAll(cards => cards.map(card => card.getAttribute('data-tool-call-id')));
 
   session.entries.push(
     { type: 'message', message: { role: 'assistant', content: [{ type: 'toolCall', id: toolCallId, name: 'codemode', arguments: { code: 'tools.read()' } }] } },
@@ -82,16 +83,14 @@ test('nested tool events leave root cards unchanged and match reloaded history',
   );
   await page.reload();
   await card.waitFor({ state: 'attached' });
-  assert.deepEqual(await page.locator('#messages > .tool-card').evaluateAll(cards => cards.map(card => card.getAttribute('data-tool-call-id'))), liveIds);
+  assert.deepEqual(await page.locator('#messages > .assistant-block .tool-card').evaluateAll(cards => cards.map(card => card.getAttribute('data-tool-call-id'))), liveIds);
+  assert.equal(await card.locator('.tool-output').textContent(), 'root final output');
   assert.equal(await card.locator('.nested-call-row').count(), 1);
   assert.equal(await card.locator('.nested-call-duration').textContent(), '17 ms');
   assert.equal(await card.locator('.nested-call-status').textContent(), 'succeeded');
   assert.equal(await card.locator('.nested-call-details pre').count(), 0, 'history details must be lazy');
-  assert.equal(await card.locator('.tool-output').count(), 0, 'a closed history card builds its output when it opens');
-  await card.locator('.tool-card-header').click();
-  assert.equal(await card.locator('.tool-output').textContent(), 'root final output');
-  // The output sits below the calls, as in the live card.
-  assert.equal(await card.locator('.tool-card-body > :last-child').getAttribute('class'), 'tool-output');
+  assert.equal(await card.locator('.tool-card-header').getAttribute('aria-expanded'), 'true', 'grouped history keeps tool contents readable');
+  assert.equal(await card.locator('.tool-output').isVisible(), true);
   await card.locator('.nested-calls-toggle').click();
   await card.locator('.nested-call-toggle').click();
   assert.match(await card.locator('.nested-call-details').textContent() || '', /\/tmp\/nested\.txt/);
@@ -160,7 +159,7 @@ test('live siblings keep start order and a handled failure remains visible after
   );
   await page.reload();
   await card.waitFor({ state: 'attached' });
-  assert.equal(await page.locator('#messages > .tool-card').count(), 1);
+  assert.equal(await page.locator('#messages > .assistant-block .tool-card').count(), 1);
   assert.equal(await card.locator('.nested-call-row').count(), 3);
   assert.deepEqual(await card.locator('.nested-call-status').allTextContents(), ['succeeded', 'succeeded', 'failed']);
   assert.deepEqual(await card.locator('.nested-call-duration').allTextContents(), ['10 ms', '7 ms', '31 ms']);
@@ -221,7 +220,7 @@ test('a final record uses the known assistant definition when the root start was
     { id: id + '/2/1', name: 'bash', arguments: { command: 'unobserved final call' }, status: 'unfinished' },
   ] });
   await card.locator('.nested-call-row').nth(1).waitFor({ state: 'attached' });
-  assert.equal(await page.locator('#messages > .tool-card').count(), 1);
+  assert.equal(await page.locator('#messages > .assistant-block .tool-card').count(), 1);
   assert.match(await card.textContent() || '', /known root arguments/);
   assert.deepEqual(await card.locator('.nested-call-status').allTextContents(), ['succeeded', 'unfinished']);
   assert.equal(await card.locator('.nested-call-row').count(), 2, 'missing intermediate calls are not invented');
@@ -243,7 +242,7 @@ test('tool-result messages do not finalize assistant text or fabricate unknown p
   const partial = { ...assistant, content: [{ type: 'text' as const, text: 'assistant text' }] };
   broadcast({ type: 'message_update', usage: assistant.usage,
     assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: 'assistant text' } });
-  await page.waitForFunction(() => document.querySelector('.message-content.streaming')?.textContent?.includes('assistant text'));
+  await page.waitForFunction(() => document.querySelector('.assistant-step-content.streaming:not(.thinking-block)')?.textContent?.includes('assistant text'));
   const result = { role: 'toolResult', toolCallId: id, toolName: 'codemode',
     content: [{ type: 'text', text: 'separate parent output' }], isError: false, timestamp: Date.now(),
     usage: { ...assistant.usage, input: 999, cost: { ...assistant.usage.cost, total: 99 } },
@@ -253,15 +252,16 @@ test('tool-result messages do not finalize assistant text or fabricate unknown p
   broadcast({ type: 'message_end', message: result });
   await page.waitForFunction((root: string) =>
     document.querySelector(`.tool-card[data-tool-call-id="${root}"] .tool-output`)?.textContent === 'separate parent output', id);
-  assert.equal(await page.locator('#messages > .tool-card').count(), 1);
-  assert.equal(await page.locator('.message-content.streaming').count(), 1);
-  assert.equal(await page.locator('#messages > .message').last().locator('.message-usage').count(), 0);
+  assert.equal(await page.locator('#messages > .assistant-block .tool-card').count(), 1);
+  assert.equal(await page.locator('.assistant-step-content.streaming:not(.thinking-block)').count(), 1);
+  assert.equal(await page.locator('#messages > .assistant-block').last().locator('.message-usage').count(), 0);
+  assert.equal(await page.locator('#context-pill').evaluate(element => element.classList.contains('visible')), false, 'tool-result usage does not become assistant context or cost');
   const continued = { ...partial, content: [{ type: 'text' as const, text: 'assistant text continues' }] };
   broadcast({ type: 'message_update', usage: assistant.usage,
     assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: ' continues' } });
-  await page.waitForFunction(() => document.querySelector('.message-content.streaming')?.textContent?.includes('assistant text continues'));
+  await page.waitForFunction(() => document.querySelector('.assistant-step-content.streaming:not(.thinking-block)')?.textContent?.includes('assistant text continues'));
   broadcast({ type: 'message_end', message: { ...continued, stopReason: 'stop' } });
-  await page.waitForFunction(() => document.querySelectorAll('.message-content.streaming').length === 0);
+  await page.waitForFunction(() => document.querySelectorAll('.assistant-step-content.streaming').length === 0);
   assert.equal(await card.locator('.tool-output').textContent(), 'separate parent output');
   await assertNoPageErrors(errors);
 });
@@ -285,7 +285,7 @@ test('unobserved final records and empty incomplete records have honest notices'
   await secondCard.locator('.nested-call-row').waitFor({ state: 'attached' });
   assert.equal(await secondCard.locator('.nested-call-status').textContent(), 'succeeded');
   assert.equal(await secondCard.locator('.nested-call-duration').textContent(), '19 ms');
-  assert.equal(await page.locator('#messages > .tool-card').count(), 2);
+  assert.equal(await page.locator('#messages > .assistant-block .tool-card').count(), 2);
   await assertNoPageErrors(errors);
 });
 
@@ -370,7 +370,7 @@ test('nested controls work with a keyboard on a narrow screen', async (t: TestCo
   await assertNoPageErrors(errors);
 });
 
-test('unfinished snapshot calls open for live children without reopening completed history', async (t: TestContext) => {
+test('unfinished snapshot calls reveal live children without overriding manual choices or changing completed history', async (t: TestContext) => {
   if (skipUnlessBrowser(t)) return;
   const { page, errors, id, card, session, start, end, finish, broadcast } = await openNestedPage(t);
   const manual = id + '-manual';
@@ -387,12 +387,20 @@ test('unfinished snapshot calls open for live children without reopening complet
   session.isStreaming = true;
   await page.reload();
   await card.waitFor({ state: 'attached' });
-  await page.waitForFunction(() => document.querySelectorAll('#messages > .tool-card').length === 4);
-  assert.equal(await card.locator('.tool-card-body.expanded').count(), 0);
-  // Opening and closing the snapshot card records an explicit manual choice.
+  await page.waitForFunction(() => document.querySelectorAll('#messages > .assistant-block .tool-card').length === 4);
+  const activity = page.locator('#messages > .assistant-block').filter({ has: card });
+  assert.equal(await activity.locator('.assistant-block-toggle').getAttribute('aria-expanded'), 'false');
+  assert.equal(await card.isVisible(), false, 'the collapsed activity shows only its last result');
+  await activity.locator('.assistant-block-toggle').click();
+  assert.equal(await card.isVisible(), true);
+  assert.equal(await card.locator('.tool-card-body.expanded').count(), 1, 'tool bodies inside the activity start readable');
+  // The separate tool-detail toggle records an explicit manual closed choice.
   const manualCard = page.locator(`.tool-card[data-tool-call-id="${manual}"]`);
   await manualCard.locator('.tool-card-header').click();
-  await manualCard.locator('.tool-card-header').click();
+  assert.equal(await manualCard.locator('.tool-card-body.expanded').count(), 0);
+  for (const root of completed) {
+    await page.locator(`.tool-card[data-tool-call-id="${root}"]`).evaluate(element => element.setAttribute('data-retained-completed', 'yes'));
+  }
   start('/1', id);
   broadcast({ type: 'tool_execution_start', toolCallId: manual + '/1', parentToolCallId: manual, toolName: 'read', args: {} });
   for (const root of completed) {
@@ -415,10 +423,12 @@ test('unfinished snapshot calls open for live children without reopening complet
   assert.match(await card.locator('.nested-calls-indicator').textContent() || '', /1 failed/);
   for (const [index, root] of completed.entries()) {
     const old = page.locator(`.tool-card[data-tool-call-id="${root}"]`);
-    assert.equal(await old.locator('.tool-card-body.expanded').count(), 0);
+    assert.equal(await old.getAttribute('data-retained-completed'), 'yes', 'late children cannot rebuild a completed card');
+    assert.equal(await old.locator('.tool-card-body.expanded').count(), 1, 'grouped history keeps completed tool contents readable');
     assert.equal(await old.locator('.nested-call-row').count(), index);
+    if (index) assert.equal(await old.locator('.nested-calls-toggle').getAttribute('aria-expanded'), 'false', 'late children do not expand a completed call list');
   }
-  assert.equal(await page.locator('#messages > .tool-card').count(), 4);
+  assert.equal(await page.locator('#messages > .assistant-block .tool-card').count(), 4);
   await assertNoPageErrors(errors);
 });
 
@@ -428,9 +438,7 @@ test('live children received before a deferred snapshot card still open that car
   session.entries.push({ type: 'message', message: { role: 'assistant', content: [
     { type: 'toolCall', id, name: 'codemode', arguments: { code: 'deferred root' } },
   ] } });
-  // Within the newest entries the snapshot sends first, but above the
-  // messages painted right away, so the card waits for an idle-time chunk.
-  for (let n = 0; n < 40; n++) session.entries.push({ type: 'message', message: { role: 'user', content: `deferred-padding-${n}` } });
+  for (let n = 0; n < 100; n++) session.entries.push({ type: 'message', message: { role: 'user', content: `deferred-padding-${n}` } });
   await page.addInitScript(() => {
     const callbacks: IdleRequestCallback[] = [];
     window.requestIdleCallback = callback => { callbacks.push(callback); return callbacks.length; };
@@ -439,7 +447,7 @@ test('live children received before a deferred snapshot card still open that car
     } });
   });
   await page.reload();
-  await page.waitForFunction(() => document.getElementById('messages')?.textContent?.includes('deferred-padding-39'));
+  await page.waitForFunction(() => document.getElementById('messages')?.textContent?.includes('deferred-padding-99'));
   assert.equal(await card.count(), 0);
   start('/1', id);
   broadcast({ type: 'tool_execution_start', toolCallId: id + '-fence', toolName: 'read', args: {} });

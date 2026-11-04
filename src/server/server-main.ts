@@ -2,38 +2,55 @@
 /*
  * Tau standalone server.
  *
- * Serves the Tau web UI and manages backend-owned `pi --mode rpc` child
- * sessions. Browser connections are views only; explicit live-session DELETE or
- * server shutdown terminates child Pi processes.
+ * Serves the Tau web UI and equal socket clients of detached Pi runtimes.
+ * Agent Close stops its exact runtime; internal view cleanup and server
+ * shutdown only disconnect. Browser loss never controls agent lifetime.
  */
 
 import http from 'node:http';
+import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import zlib from 'node:zlib';
-import { spawn, execFile, type ExecException } from 'node:child_process';
-import readline from 'node:readline';
+import { spawn, execFile } from 'node:child_process';
 import { WebSocketServer, WebSocket } from 'ws';
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Stats, Dirent } from 'node:fs';
-import type { Socket } from 'node:net';
+import type { AddressInfo, Socket } from 'node:net';
+import type { TLSSocket } from 'node:tls';
 import type { WebSocket as WsType } from 'ws';
 import type { JsonRecord, RpcCommand, RpcResponse, StatusError } from './types.js';
-import { ARGS, AUTH_CONFIGURED, HOST, MIME_TYPES, PI_AGENT_DIR, PI_COMMAND, PORT, SESSIONS_DIR, STATIC_DIR, TAU_SETTINGS, USER_HOME, expandHome, loadTauSettings, parseArgs, resolvePiCommand, saveTauSetting } from './config.js';
+import { ARGS, AUTH_CONFIGURED, HOST, HTTP_PORT, MIME_TYPES, PI_AGENT_DIR, PI_COMMAND, PORT, SESSIONS_DIR, STATIC_DIR, TAU_SETTINGS, TLS_DIR, USER_HOME, expandHome, loadTauSettings, parseArgs, requireTauCredentials, resolvePiCommand, saveTauSetting } from './config.js';
 import { SESSION_COOKIE_NAME, SESSION_REFRESH_THRESHOLD_SECONDS, buildSessionCookie, issueSessionToken, parseCookies, verifySessionToken } from './auth.js';
 import { completeDirectories } from './path-completion.js';
 import { getAvailableModels, modelLabel, normalizeModel, parseModelSpecToModel, parsePiListModels, _clearModelListCacheForTest, _setExecFileForTest } from './model-utils.js';
-import { LiveSessionManager, PiRpcSession, isGenericSessionName, liveManager, makeId, _setSpawnPiForTest } from './sessions.js';
-import { NAVIGATE_COMMAND, NAVIGATION_MARKER_TYPE, flattenTree, isTreeNavigationInProgress, leafDescendsFrom, navigateTree, pathFromRoot, selectNavigationTarget } from './tree.js';
+import { InputContextError, LiveSessionManager, PiRpcSession, SessionOpenError, assertNoSessionArgs, isGenericSessionName, liveManager, makeId } from './sessions.js';
+import { isReadOnlyCommand } from '@phimacs/pimux/protocol';
+import { readWorkerTask } from 'pi-orchestration/worker-task';
+import { observeWorkerExit } from './close-worker.js';
+import { workerExitReport } from './runtime-exit.js';
+import { pimuxCommand, pimuxEntryById, pimuxEntryForFile, pimuxFiles, pimuxSharing } from './pimux.js';
+import { AgentOverview } from './agents.js';
+import { canonicalSessionPath, lookupClaim } from '@phimacs/pimux/ownership';
+import { withStoppedSessionLease } from './session-files.js';
+import { exportSession } from './session-export.js';
+import { readSessionHeader } from './session-header.js';
+import { searchSessions } from './session-search.js';
+import { buildEndpoint, orchestrationEndpoint, publishEndpoint, unpublishEndpoint } from './orchestration.js';
+import { sessionOwner, sessionOwners } from './session-owners.js';
+import { ensureTlsCertificate } from './tls.js';
+import { MAX_FRAME_BYTES, VOICE_PATH, configuredTranscriber, handleVoiceSocket } from './voice.js';
+import { NAVIGATE_COMMAND, NAVIGATION_MARKER_TYPE, entriesById, isTreeNavigationInProgress, leafDescendsFrom, navigateTree, pathFromRoot, selectNavigationTarget } from './tree.js';
 
 type TauWs = WsType & { isAlive?: boolean };
 
-let authEnabled = AUTH_CONFIGURED && TAU_SETTINGS.authEnabled !== false;
+let authEnabled = TAU_SETTINGS.authEnabled !== false;
 
 function checkBasicAuth(req: IncomingMessage) {
   if (!authEnabled) return true;
+  if (!AUTH_CONFIGURED) return false;
   const header = req.headers.authorization;
   if (!header || !header.startsWith('Basic ')) return false;
   const decoded = Buffer.from(header.slice(6), 'base64').toString();
@@ -58,8 +75,24 @@ function checkAuth(req: IncomingMessage): AuthResult {
   return { ok: false, via: 'none' };
 }
 
-function isForwardedHttps(req: IncomingMessage): boolean {
-  return String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
+/**
+ * The one route open without credentials, compared after URL normalization:
+ * `/api/health/../agents` routes to `/api/agents`, so a raw prefix check
+ * would let it past authentication.
+ */
+function isPublicRequest(req: IncomingMessage): boolean {
+  const url = req.url || '';
+  if (!url.startsWith('/')) return false;
+  try {
+    return new URL(`http://localhost${url}`).pathname === '/api/health';
+  } catch {
+    return false;
+  }
+}
+
+function isHttpsRequest(req: IncomingMessage): boolean {
+  return (req.socket as TLSSocket).encrypted === true
+    || String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
 }
 
 // Mint when the request carries no valid session cookie (covers the page load
@@ -78,7 +111,7 @@ function maybeSetSessionCookie(req: IncomingMessage, res: ServerResponse, auth: 
     }
   }
   if (expiresAt !== undefined && expiresAt - Math.floor(Date.now() / 1000) >= SESSION_REFRESH_THRESHOLD_SECONDS) return;
-  res.setHeader('Set-Cookie', buildSessionCookie(issueSessionToken(), { secure: isForwardedHttps(req) }));
+  res.setHeader('Set-Cookie', buildSessionCookie(issueSessionToken(), { secure: isHttpsRequest(req) }));
 }
 
 function errorMessage(e: unknown): string {
@@ -98,7 +131,7 @@ function sendAuthRequired(res: ServerResponse, req?: IncomingMessage) {
   // Clear a presented-but-invalid session cookie so the browser stops
   // resending it and falls back to the Basic prompt.
   if (req && parseCookies(req.headers.cookie)[SESSION_COOKIE_NAME]) {
-    res.setHeader('Set-Cookie', buildSessionCookie('', { secure: isForwardedHttps(req), clear: true }));
+    res.setHeader('Set-Cookie', buildSessionCookie('', { secure: isHttpsRequest(req), clear: true }));
   }
   res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Tau"', 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Unauthorized' }));
@@ -141,6 +174,13 @@ function json(res: ServerResponse, status: number, data: unknown, extraHeaders: 
   res.end(JSON.stringify(data));
 }
 
+function sendLifecycleError(res: ServerResponse, error: unknown) {
+  if (error instanceof SessionOpenError) {
+    return json(res, error.status, { error: error.message, ...(error.muxId ? { muxId: error.muxId } : {}) });
+  }
+  return json(res, errorStatus(error), { error: errorMessage(error) });
+}
+
 function readBody(req: IncomingMessage): Promise<RpcCommand> {
   return new Promise((resolve, reject) => {
     let body = '';
@@ -160,19 +200,83 @@ let tailscaleUrl = '';
 
 function resolveSessionFile(filePath: string) {
   if (!filePath || typeof filePath !== 'string') throw new Error('filePath required');
-  const resolved = path.resolve(filePath);
-  const root = path.resolve(SESSIONS_DIR);
+  const resolved = canonicalSessionPath(filePath);
+  const root = canonicalSessionPath(SESSIONS_DIR);
   if (!resolved.startsWith(root + path.sep) || !resolved.endsWith('.jsonl')) {
     throw new Error('Invalid session file');
   }
-  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) throw new Error('Session not found');
+  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) throw Object.assign(new Error('Session not found'), { status: 404 });
   return resolved;
 }
 
-function appendSessionName(filePath: string, name: string) {
-  const resolved = resolveSessionFile(filePath);
-  fs.appendFileSync(resolved, JSON.stringify({ type: 'session_info', name, timestamp: new Date().toISOString() }) + '\n');
-  return resolved;
+/**
+ * Validates programmatic spawn fields for live-session create and resume.
+ *
+ * These let an orchestration client run a managed runtime with its own
+ * extensions, model flags, and environment. They do not widen the server's
+ * blast radius: the API already starts `pi` in a caller-chosen directory and
+ * prompts it, so it is an authenticated code-execution surface either way.
+ * The checks exist to turn malformed input into a 400 instead of a confusing
+ * spawn failure.
+ */
+function parseSpawnOverrides(body: RpcCommand): { args?: string[]; env?: Record<string, string>; sessionFile?: string } {
+  const overrides: { args?: string[]; env?: Record<string, string>; sessionFile?: string } = {};
+  if (body.args !== undefined) {
+    if (!Array.isArray(body.args) || body.args.some((arg) => typeof arg !== 'string')) throw new Error('args must be an array of strings');
+    assertNoSessionArgs(body.args as string[]);
+    overrides.args = body.args as string[];
+  }
+  if (body.env !== undefined) {
+    if (typeof body.env !== 'object' || body.env === null || Array.isArray(body.env)) throw new Error('env must be an object of string values');
+    const env: Record<string, string> = {};
+    for (const [key, value] of Object.entries(body.env as Record<string, unknown>)) {
+      if (typeof value !== 'string') throw new Error(`env.${key} must be a string`);
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) throw new Error(`Invalid environment variable name: ${key}`);
+      env[key] = value;
+    }
+    overrides.env = env;
+  }
+  // Reuse the session-directory containment check: a created session may adopt
+  // an existing file (an orchestration worker writes its header before start),
+  // but never a path outside Pi's session storage.
+  if (body.sessionFile !== undefined) overrides.sessionFile = resolveSessionFile(String(body.sessionFile));
+  return overrides;
+}
+
+/**
+ * Another Pi process (a terminal orchestration target) is appending to this
+ * file; opening it would make Tau a second writer. A pimux-shared file is not
+ * refused here: opening it attaches.
+ */
+function terminalOwnerRefusal(file: string, _force: boolean) {
+  const claim = lookupClaim(file);
+  if (claim && (claim.owner.kind !== 'rpc' || claim.owner.protocol !== 2)) {
+    return { error: 'Session has a live or uncertain nonattachable owner. Force cannot override a writer claim.' };
+  }
+  if (claim?.owner.kind === 'rpc') return null;
+  const owner = sessionOwner(file);
+  return owner ? { error: `Session is running as ${owner.name} on ${owner.host}. Follow it read-only or stop that agent first.`, owner } : null;
+}
+
+/** Why deleting this stored session would destroy a conversation some Pi is still writing, or null. */
+async function liveFileRefusal(file: string) {
+  if (lookupClaim(file)) return 'Session is owned by a live or uncertain managed runtime; stop it before deleting.';
+  if (liveManager.findBySessionFile(file) || liveManager.hasStartingSession(file) || liveManager.hasPendingResume(file) || liveManager.hasTerminatingResume(file)) {
+    return 'This session is open in a Tau tab; close the tab before deleting it.';
+  }
+  // A leftover entry of an agent that is gone owns nothing.
+  if (await pimuxSharing(file)) return 'This session is running in another frontend; stop it there before deleting it.';
+  const owner = sessionOwner(file);
+  if (owner) return `Session is running as ${owner.name} on ${owner.host}; stop it before deleting it.`;
+  return null;
+}
+
+async function appendSessionName(filePath: string, name: string) {
+  return withStoppedSessionLease(filePath, () => {
+    const resolved = resolveSessionFile(filePath);
+    fs.appendFileSync(resolved, JSON.stringify({ type: 'session_info', name, timestamp: new Date().toISOString() }) + '\n');
+    return resolved;
+  });
 }
 
 function updateLiveSessionName(session: PiRpcSession | null | undefined, name: string) {
@@ -214,31 +318,18 @@ function openUrl(url: string): Promise<void> {
   }
   const opener = process.platform === 'darwin' ? 'open' : 'xdg-open';
   return new Promise<void>((resolve, reject) => {
-    execFile(opener, [url], (err: ExecException | null) => err ? reject(err) : resolve());
+    execFile(opener, [url], (err) => err ? reject(err) : resolve());
   });
-}
-
-// Fire-and-forget: refresh session.model/thinkingLevel from pi's get_state.
-// Used after prompt/steer/follow_up acks so extension-driven model/thinking
-// changes (e.g. pi-session-model's /session-model) propagate to tau and all
-// clients. Silently skips on failure — the next user input or snapshot resyncs.
-async function refreshSessionModel(session: PiRpcSession | null | undefined) {
-  if (!session || session.terminating) return;
-  const resp = await session.send({ type: 'get_state' }, { timeoutMs: 5000 });
-  const data = (resp && (resp.data || resp.result || resp)) as RpcCommand;
-  if (!data) return;
-  if (data.model !== undefined) session.model = normalizeModel(data.model);
-  if (data.thinkingLevel) session.thinkingLevel = String(data.thinkingLevel);
-  liveManager.broadcastUpdated(session.id);
 }
 
 async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
   const id = command.id;
   const cmd = command.type;
   const success = (data?: unknown): RpcResponse => ({ type: 'response', command: cmd, success: true, id, ...(data !== undefined ? { data } : {}) });
-  const error = (message: string): RpcResponse => ({ type: 'response', command: cmd, success: false, error: message, id, ...(cmd === 'prompt' ? { delivery: 'rejected' } : {}) });
+  const isInstruction = cmd === 'prompt' || cmd === 'steer' || cmd === 'follow_up';
+  const error = (message: string): RpcResponse => ({ type: 'response', command: cmd, success: false, error: message, id, ...(isInstruction ? { delivery: 'rejected' } : {}) });
 
-  // Backend-local commands do not require a live Pi child.
+  // Backend-local commands do not require a live runtime connection.
   if (cmd === 'get_auth') return success({ configured: AUTH_CONFIGURED, enabled: authEnabled });
   if (cmd === 'set_auth') {
     if (!AUTH_CONFIGURED) return error('No credentials configured. Set tau.user and tau.pass in settings.json');
@@ -248,7 +339,7 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
     liveManager.broadcast({ type: 'event', event: { type: 'auth_changed', enabled: authEnabled } });
     if (!wasEnabled && authEnabled) {
       const timer = setTimeout(() => {
-        for (const client of Array.from(liveManager.clients)) {
+        for (const client of [...liveManager.clients, ...voiceWss.clients]) {
           try { client.close(4001, 'Authentication enabled'); } catch {}
         }
       }, 25);
@@ -257,34 +348,66 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
     return success({ enabled: authEnabled });
   }
   if (cmd === 'get_available_models') return success({ models: await getAvailableModels() });
+  const session = command.sessionId ? liveManager.get(command.sessionId) : null;
+  let requestContext: ReturnType<PiRpcSession['browserInputContext']> | undefined;
+  if (session && !isReadOnlyCommand(String(cmd)) && cmd !== 'live_session_snapshot_request') {
+    try { requestContext = session.browserInputContext(command); }
+    catch (cause) { return error(errorMessage(cause)); }
+    command = { ...command, pimuxContext: requestContext.runtimeContext };
+  }
   if (cmd === 'set_session_name') {
     const name = (command.name || '').trim();
     if (!name) return error('Name cannot be empty');
-    const session = command.sessionId ? liveManager.get(command.sessionId) : null;
+    if (command.sessionId && !session) return error('Live session not found');
     let resolvedFile = null;
-    const targetFile = command.filePath || session?.sessionFile;
-    if (targetFile) {
-      try { resolvedFile = appendSessionName(targetFile, name); } catch (e) { return error(errorMessage(e)); }
+    if (command.filePath) {
+      try { resolvedFile = resolveSessionFile(command.filePath); } catch (e) { return error(errorMessage(e)); }
     }
-    const matchingLive = resolvedFile
-      ? Array.from(liveManager.sessions.values()).find((s) => s.sessionFile && path.resolve(s.sessionFile) === resolvedFile)
-      : null;
-    if (session) updateLiveSessionName(session, name);
-    else if (matchingLive) updateLiveSessionName(matchingLive, name);
-    else if (!resolvedFile) return error('sessionId or filePath required');
+    const live = session || (resolvedFile ? liveManager.findBySessionFile(resolvedFile) : null);
+    if (live) {
+      // A live Pi writes its own file: rename through it, so its state and
+      // every frontend sharing it agree, and the file has one writer.
+      let renameContext = live.attachment?.inputContext;
+      try {
+        const expected = requestContext ?? (command.inputContext !== undefined ? live.browserInputContext(command) : undefined);
+        renameContext = expected?.runtimeContext ?? renameContext;
+        if (resolvedFile && !live.referencesSessionFile(resolvedFile)) return error('Runtime serves another conversation; the rename was not sent');
+        const resp = await live.send({ type: 'set_session_name', name,
+          ...(renameContext ? { pimuxContext: renameContext } : {}) }, { timeoutMs: 10000 });
+        if (resp.success === false) return error(String(resp.error || 'Pi refused the rename'));
+      } catch (e) { return error(errorMessage(e)); }
+      if (renameContext && live.attachment?.inputContext?.contextId === renameContext.contextId
+        && live.sessionFile === renameContext.sessionFile) updateLiveSessionName(live, name);
+      return success({ name });
+    }
+    if (!resolvedFile) return error('sessionId or filePath required');
+    let shared: Awaited<ReturnType<typeof pimuxSharing>>;
+    try { shared = await pimuxSharing(resolvedFile); }
+    catch (cause) { return error(errorMessage(cause)); }
+    if (shared?.reachability === 'unreachable') return error('This session is shared by another frontend that does not accept connections right now; rename it there.');
+    if (shared) {
+      try {
+        const resp = await pimuxCommand(shared.entry, { type: 'set_session_name', name }, 10000);
+        return resp.success === true ? success({ name }) : error(String(resp.error || 'Pi refused the rename'));
+      } catch (e) { return error(errorMessage(e)); }
+    }
+    const owner = sessionOwner(resolvedFile);
+    if (owner) return error(`Session is running as ${owner.name} on ${owner.host}; rename it there.`);
+    if (liveManager.hasStartingSession(resolvedFile) || liveManager.hasPendingResume(resolvedFile)) return error('Session is opening; wait a moment and send again');
+    try { await appendSessionName(resolvedFile, name); } catch (e) { return error(errorMessage(e)); }
     return success({ name });
   }
 
-  const session = command.sessionId ? liveManager.get(command.sessionId) : null;
   // Backend-local: move the session-tree leaf to an earlier entry (pi's
   // native RPC protocol has no leaf-move command, so tau drives the bundled
   // /tau-tree-navigate extension command in-process — see src/server/tree.ts).
   if (cmd === 'navigate_tree') {
     if (!session) return error('Live session not found');
+    if (!session.capabilities.navigateTree) return error('This runtime does not advertise the tree navigation command.');
     const entryId = typeof command.entryId === 'string' ? command.entryId.trim() : '';
     if (!entryId) return error('entryId required');
     try {
-      const result = await navigateTree(session, entryId);
+      const result = await navigateTree(session, entryId, requestContext?.runtimeContext);
       return success({ editorText: result.editorText });
     } catch (e) { return error(errorMessage(e)); }
   }
@@ -293,16 +416,8 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
       if (command.sessionId && !session) throw new Error('Live session not found');
       const sf = command.filePath ? resolveSessionFile(command.filePath) : session?.sessionFile;
       if (!sf) throw new Error('No session file to export yet');
-      const args = ['--export', sf];
-      if (command.outputPath) args.push(resolveExportOutputPath(command.outputPath, sf));
-      const output = await new Promise<string>((resolve, reject) => {
-        execFile(PI_COMMAND, args, { cwd: session?.cwd || path.dirname(sf), timeout: 30000, encoding: 'utf8' }, (err: ExecException | null, stdout: string, stderr: string) => {
-          if (err) reject(new Error(stderr || err.message)); else resolve(stdout);
-        });
-      });
-      let result = output.trim().split('\n').pop() || sf.replace(/\.jsonl$/, '.html');
-      result = path.resolve(expandHome(result));
-      if (!fs.existsSync(result)) result = sf.replace(/\.jsonl$/, '.html');
+      const output = resolveExportOutputPath(command.outputPath || sf.replace(/\.jsonl$/, '.html'), sf);
+      const result = await exportSession(sf, output, session, requestContext?.runtimeContext);
       return success({ path: result });
     } catch (e) { return error(errorMessage(e)); }
   }
@@ -330,15 +445,17 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
     });
   }
   if (cmd === 'get_messages') return success({ entries: session.entries });
-  if (cmd === 'live_session_snapshot_request') return { type: 'live_session_snapshot', sessionId: session.id, ...session.snapshot() };
+  if (cmd === 'live_session_snapshot_request') return { type: 'live_session_snapshot', sessionId: session.id, ...await session.snapshot() };
   if (cmd === 'set_auto_compaction' && typeof command.enabled !== 'boolean') return error('enabled must be true or false');
   // Pi's compact aborts a running reply before it compacts. Never throw a
   // reply away from a click; the user can stop the reply first.
   if (cmd === 'compact' && session.compaction) return { ...error('Compaction is already running.'), compactionStarted: false };
   if (cmd === 'compact' && session.isStreaming) return { ...error('Wait for the reply to finish, or stop it first.'), compactionStarted: false };
 
-  const native = new Set(['prompt', 'steer', 'follow_up', 'abort', 'compact', 'set_auto_compaction', 'set_model', 'cycle_model', 'set_thinking_level', 'cycle_thinking_level', 'get_session_stats', 'get_tree', 'get_entries', 'extension_ui_response']);
-  if (!native.has(cmd ?? '')) return error(`Unknown command: ${cmd}`);
+  // Session replacement moves every frontend of the same runtime.
+  const native = new Set(['new_session', 'prompt', 'steer', 'follow_up', 'abort', 'compact', 'set_auto_compaction', 'set_model', 'cycle_model', 'set_thinking_level', 'cycle_thinking_level', 'get_session_stats', 'get_tree', 'get_entries', 'clear_queue', 'extension_ui_response']);
+  if (!native.has(cmd ?? '') && !isReadOnlyCommand(String(cmd))) return error(`Unknown command: ${cmd}`);
+  if (cmd === 'clear_queue' && command.confirmGlobal !== true) return error('Clearing the queue removes input from every frontend; explicit confirmation is required.');
 
   // While navigate_tree is moving the child's leaf (pi's stdin loop does not
   // serialize a new prompt behind a running extension command), a prompt
@@ -354,6 +471,8 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
   // session.thinkingLevel — yet touch(true)->broadcastUpdated would echo the
   // stale level to all clients (reverting a client's just-set optimistic
   // level). Record the level optimistically here and restore on pi failure.
+  const requestIsCurrent = () => !!requestContext && requestContext.file === session.sessionFile
+    && requestContext.runtimeContext.contextId === session.attachment?.inputContext?.contextId;
   const isSetThinkingLevel = cmd === 'set_thinking_level';
   let prevThinkingLevel: string | null = null;
   if (isSetThinkingLevel) {
@@ -375,34 +494,26 @@ async function handleRpcCommand(command: RpcCommand): Promise<RpcResponse> {
       : cmd === 'abort'
         ? await session.abort(command)
         : await session.send(command, { timeoutMs });
-    if (isSetThinkingLevel && resp.success === false && prevThinkingLevel !== null) {
+    if (isSetThinkingLevel && resp.success === false && prevThinkingLevel !== null && requestIsCurrent()) {
       session.thinkingLevel = prevThinkingLevel;
     }
+    if (cmd === 'clear_queue' && resp.success !== false && requestIsCurrent()) liveManager.broadcast({ type: 'event', sessionId: session.id, event: { type: 'shared_queue_cleared' } });
     if (cmd === 'set_auto_compaction' && resp.success !== false) {
       session.autoCompactionEnabled = command.enabled === true;
       return success({ enabled: session.autoCompactionEnabled });
     }
-    // Extension-driven model/thinking changes (e.g. the pi-session-model
-    // `/session-model` slash command) call pi.setModel/pi.setThinkingLevel
-    // inside a prompt/steer/follow_up. Those acks carry no model data and emit
-    // no runtime stream event, so tau would stay stale. Fire-and-forget a
-    // get_state refresh so tau and all clients learn the new model/level. Do
-    // NOT block this HTTP response — return the original ack first.
-    if (resp.success !== false && (cmd === 'prompt' || cmd === 'steer' || cmd === 'follow_up')) {
-      refreshSessionModel(session).catch(() => {});
-    }
-    return { ...resp, success: resp.success !== false, ...(cmd === 'prompt' && resp.success === false ? { delivery: 'rejected' } : {}), ...compactionStarted() };
+    return { ...resp, success: resp.success !== false, ...(cmd === 'clear_queue' ? { recoveryContext: requestContext } : {}), ...(isInstruction && resp.success === false ? { delivery: resp.delivery === 'uncertain' ? 'uncertain' : 'rejected' } : {}), ...compactionStarted() };
   } catch (e) {
-    if (isSetThinkingLevel && prevThinkingLevel !== null) session.thinkingLevel = prevThinkingLevel;
+    if (isSetThinkingLevel && prevThinkingLevel !== null && requestIsCurrent()) session.thinkingLevel = prevThinkingLevel;
     // A timeout or broken transport does not establish whether Pi ran a prompt.
-    return { ...error(errorMessage(e)), ...(cmd === 'prompt' ? { delivery: 'uncertain' } : {}), ...compactionStarted() };
+    return { ...error(errorMessage(e)), ...(isInstruction ? { delivery: e instanceof InputContextError ? 'rejected' : 'uncertain' } : {}), ...compactionStarted() };
   }
 }
 
 function serveStaticFile(req: IncomingMessage, res: ServerResponse) {
   let urlPath = req.url || '/';
   const auth = checkAuth(req);
-  if (authEnabled && !urlPath.startsWith('/api/health') && !auth.ok) return sendAuthRequired(res, req);
+  if (authEnabled && !auth.ok && !isPublicRequest(req)) return sendAuthRequired(res, req);
   maybeSetSessionCookie(req, res, auth);
   if (urlPath.startsWith('/api/')) return handleApiRoute(req, res, urlPath);
   urlPath = urlPath.split('?')[0];
@@ -464,33 +575,87 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
   if (cleanPath === '/api/live-sessions' && req.method === 'POST') {
     readBody(req).then(async (body) => {
       if (!body.cwd) return json(res, 400, { error: 'cwd required' });
+      let overrides: { args?: string[]; env?: Record<string, string>; sessionFile?: string };
       try {
-        const session = await liveManager.create({ cwd: body.cwd, model: body.model || '' });
-        json(res, 200, { session: session.metadata() });
-      } catch (e) { json(res, 400, { error: errorMessage(e) }); }
+        overrides = parseSpawnOverrides(body);
+      } catch (e) { return json(res, 400, { error: errorMessage(e) }); }
+      const refusal = overrides.sessionFile ? terminalOwnerRefusal(overrides.sessionFile, body.force === true) : null;
+      if (refusal) return json(res, 409, refusal);
+      try {
+        const session = await liveManager.create({ cwd: body.cwd, model: body.model || '', ...overrides });
+        json(res, 200, { session: session.metadata(), ...(session.attachment ? { attached: true } : {}) });
+      } catch (e) { sendLifecycleError(res, e); }
     }).catch((e) => json(res, 400, { error: errorMessage(e) }));
     return;
   }
   if (cleanPath === '/api/live-sessions/resume' && req.method === 'POST') {
     readBody(req).then(async (body) => {
       if (!body.filePath || typeof body.filePath !== 'string') return json(res, 400, { error: 'filePath required' });
+      const rejectBeforeSpawn = (message: string) => json(res, 400, { error: message });
       let resolvedFile: string;
-      try { resolvedFile = resolveSessionFile(body.filePath); } catch (e) { return json(res, 400, { error: errorMessage(e) }); }
+      let overrides: { args?: string[]; env?: Record<string, string> };
+      try {
+        resolvedFile = resolveSessionFile(body.filePath);
+        overrides = parseSpawnOverrides({ args: body.args, env: body.env });
+        if (body.model !== undefined && typeof body.model !== 'string') throw new Error('model must be a string');
+        if (body.refresh !== undefined && typeof body.refresh !== 'boolean') throw new Error('refresh must be a boolean');
+      } catch (e) { return rejectBeforeSpawn(errorMessage(e)); }
       const existing = liveManager.findBySessionFile(resolvedFile);
-      if (existing) return json(res, 200, { session: existing.metadata(), reused: true });
+      if (existing && !existing.exited && body.refresh !== true && !existing.terminating && !liveManager.hasTerminatingResume(resolvedFile) && !liveManager.hasPendingResume(resolvedFile)) {
+        return json(res, 200, { session: existing.metadata(), reused: true, started: false, ...(existing.attachment ? { attached: true } : {}) });
+      }
+      const refusal = terminalOwnerRefusal(resolvedFile, body.force === true);
+      if (refusal) return json(res, 409, refusal);
       let cwd: string | null = normalizeSessionCwd(body.cwd);
       if (!cwd) cwd = readSessionHeaderCwd(resolvedFile);
-      if (!cwd || !fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
-        return json(res, 400, { error: 'Cannot resume session because its project directory no longer exists' });
-      }
+      try {
+        if (!cwd || !fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
+          return rejectBeforeSpawn('Cannot resume session because its project directory no longer exists');
+        }
+      } catch (e) { return rejectBeforeSpawn(errorMessage(e)); }
       const entries = readSessionEntries(resolvedFile) as JsonRecord[];
       const sessionName = deriveSessionNameFromEntries(entries);
-      const reusedPending = liveManager.hasPendingResume(resolvedFile);
       try {
-        const session = await liveManager.resume({ sessionFile: resolvedFile, cwd, model: body.model || '', entries, sessionName });
-        json(res, 200, { session: session.metadata(), ...(reusedPending ? { reused: true } : {}) });
-      } catch (e) { json(res, 400, { error: errorMessage(e) }); }
+        const { session, started, refreshed } = await liveManager.resume({ sessionFile: resolvedFile, cwd, model: body.model || '', entries, sessionName, refresh: body.refresh === true, ...overrides });
+        json(res, 200, { session: session.metadata(), started, ...(!started ? { reused: true } : {}), ...(refreshed ? { refreshed: true } : {}), ...(session.attachment ? { attached: true } : {}) });
+      } catch (e) { sendLifecycleError(res, e); }
     }).catch((e) => json(res, 400, { error: errorMessage(e) }));
+    return;
+  }
+  // Attach to a pimux-shared Pi by its id (the agent overview, /switch tau).
+  if (cleanPath === '/api/live-sessions/attach' && req.method === 'POST') {
+    readBody(req).then(async (body) => {
+      if (typeof body.muxId !== 'string' || !body.muxId) return json(res, 400, { error: 'muxId required' });
+      try {
+        const { session, started } = await liveManager.attachById(body.muxId);
+        json(res, 200, { session: session.metadata(), attached: true, started, ...(!started ? { reused: true } : {}) });
+      } catch (e) { sendLifecycleError(res, e); }
+    }).catch((e) => json(res, 400, { error: errorMessage(e) }));
+    return;
+  }
+  if (cleanPath === '/api/agents' && req.method === 'GET') return json(res, 200, { agents: agentOverview.list() });
+  const stopAgent = cleanPath.match(/^\/api\/agents\/([^/]+)\/stop$/);
+  if (stopAgent && req.method === 'POST') {
+    readBody(req).then(async body => {
+      if (body.operationId !== undefined && typeof body.operationId !== 'string') return json(res, 400, { error: 'operationId must be a string' });
+      try {
+        const muxId = decodeURIComponent(stopAgent[1]);
+        const known = [...liveManager.sessions.values()].find(view => view.attachment?.muxId === muxId);
+        const env = known?.attachment ? { ...process.env, PIMUX_DIR: path.dirname(known.attachment.socket) } : process.env;
+        const task = readWorkerTask(muxId, env);
+        if (task?.state === 'failed') throw new SessionOpenError(`Worker task cleanup failed: ${task.error}`, 503, muxId);
+        const session = known ?? (pimuxEntryById(muxId, env.PIMUX_DIR)?.placement === 'worker'
+          ? (await liveManager.attachById(muxId)).session : undefined);
+        if (!session && task?.state === 'pending') throw new SessionOpenError('Worker task cleanup is still pending; no cancellation connection is available', 503, muxId);
+        const receipt = session ? await session.stop(body.operationId as string | undefined)
+          : await liveManager.runtime.stop(muxId, { operationId: body.operationId as string | undefined, env });
+        for (const view of liveManager.sessions.values()) {
+          if (view.attachment?.muxId === muxId) await liveManager.delete(view.id, 'closed_by_user', receipt);
+        }
+        const report = session?.attachedOwner?.placement === 'worker' || task ? workerExitReport(session?.attachment?.exit ?? receipt) : undefined;
+        return json(res, 200, { receipt, ...report });
+      } catch (error) { return sendLifecycleError(res, error); }
+    }).catch(error => json(res, 400, { error: errorMessage(error) }));
     return;
   }
   const imageMatch = cleanPath.match(/^\/api\/live-sessions\/([^/]+)\/images\/(\d+)\/(\d+)\/(\d+)$/);
@@ -516,7 +681,7 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
     res.end(bytes);
     return;
   }
-  const liveMatch = cleanPath.match(/^\/api\/live-sessions\/([^/]+)(?:\/(snapshot|entries))?$/);
+  const liveMatch = cleanPath.match(/^\/api\/live-sessions\/([^/]+)(?:\/(snapshot|stop))?$/);
   if (liveMatch) {
     let id;
     try {
@@ -527,20 +692,35 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
     const session = liveManager.get(id);
     if (!session) return json(res, 404, { error: 'Live session not found' });
     const subRoute = liveMatch[2];
+    if (subRoute === 'stop' && req.method === 'POST') {
+      readBody(req).then(async body => {
+        if (body.operationId !== undefined && typeof body.operationId !== 'string') return json(res, 400, { error: 'operationId must be a string' });
+        try {
+          const receipt = await session.stop(body.operationId as string | undefined);
+          await liveManager.delete(id, 'closed_by_user', receipt);
+          const report = session.attachedOwner?.placement === 'worker' ? workerExitReport(session.attachment?.exit ?? receipt) : undefined;
+          return json(res, 200, { receipt, ...report });
+        }
+        catch (error) { return sendLifecycleError(res, error); }
+      }).catch(error => json(res, 400, { error: errorMessage(error) }));
+      return;
+    }
     if (subRoute === 'snapshot' && req.method === 'GET') {
-      const tail = parsed.searchParams.get('tail');
-      return compressedJson(req, res, 200, session.snapshot(tail ? { tail: Math.max(1, Number(tail) || 1) } : {}));
+      // Selecting an attached tab is opening that agent: it is no longer done.
+      if (session.attachment) agentOverview.markSeen(session.attachment.muxId);
+      session.snapshot().then(
+        (snapshot) => compressedJson(req, res, 200, snapshot),
+        (error: unknown) => json(res, 503, { error: errorMessage(error) }),
+      );
+      return;
     }
-    if (subRoute === 'entries' && req.method === 'GET') {
-      const end = Number(parsed.searchParams.get('end'));
-      const limit = Number(parsed.searchParams.get('limit'));
-      const epoch = Number(parsed.searchParams.get('epoch'));
-      if (![end, limit, epoch].every(Number.isInteger) || end < 0 || limit < 1) return json(res, 400, { error: 'end, limit and epoch must be whole numbers' });
-      const page = session.historyPage(end, limit, epoch);
-      if (!page) return json(res, 409, { error: 'The session history changed. Load the session again.' });
-      return compressedJson(req, res, 200, page);
+    if (!subRoute && req.method === 'DELETE') {
+      const disconnected = session.attachedOwner?.placement === 'worker'
+        ? (session.transport?.close() ?? Promise.resolve()).then(() => observeWorkerExit(session))
+        : liveManager.delete(id, 'closed_by_user');
+      disconnected.then(() => json(res, 200, { success: true }), error => sendLifecycleError(res, error));
+      return;
     }
-    if (!subRoute && req.method === 'DELETE') { liveManager.delete(id, 'closed_by_user').then(() => json(res, 200, { success: true })); return; }
   }
 
   if (cleanPath === '/api/complete/directories' && req.method === 'GET') {
@@ -548,8 +728,8 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
     return json(res, 200, { items });
   }
   if (cleanPath === '/api/projects' && req.method === 'GET') return serveProjectsList(res);
-  if (cleanPath === '/api/sessions' && req.method === 'GET') return serveSessionsList(res);
-  if (cleanPath.startsWith('/api/search') && req.method === 'GET') return serveSearch(res, parsed.searchParams.get('q') || '');
+  if (cleanPath === '/api/sessions' && req.method === 'GET') return serveProjectSummaries(res);
+  if (cleanPath === '/api/search' && req.method === 'GET') return serveSearch(res, parsed.searchParams.get('q') || '');
   if ((cleanPath === '/api/files') && req.method === 'GET') {
     const explicitPath = parsed.searchParams.get('path');
     const sessionId = parsed.searchParams.get('sessionId');
@@ -589,18 +769,48 @@ function handleApiRoute(req: IncomingMessage, res: ServerResponse, urlPath: stri
     return;
   }
   if (cleanPath === '/api/sessions/delete' && req.method === 'POST') {
-    readBody(req).then((body) => {
+    readBody(req).then(async (body) => {
       if (!body.filePath || typeof body.filePath !== 'string') return json(res, 400, { error: 'filePath required' });
       const sessionFile = resolveSessionFile(body.filePath);
-      fs.unlinkSync(sessionFile);
+      const refusal = await liveFileRefusal(sessionFile);
+      if (refusal) return json(res, 409, { error: refusal });
+      await withStoppedSessionLease(sessionFile, () => fs.unlinkSync(resolveSessionFile(sessionFile)));
       json(res, 200, { success: true });
     }).catch((e) => json(res, 400, { error: errorMessage(e) }));
     return;
   }
+  const projectMatch = cleanPath.match(/^\/api\/sessions\/([^/]+)$/);
+  if (projectMatch && req.method === 'GET') return serveProjectSessions(res, projectMatch[1]);
   const sessionMatch = cleanPath.match(/^\/api\/sessions\/([^/]+)\/([^/]+)$/);
-  if (sessionMatch && req.method === 'GET') return serveSessionFile(res, sessionMatch[1], sessionMatch[2]);
+  if (sessionMatch && req.method === 'GET') return serveSessionFile(res, sessionMatch[1], sessionMatch[2], parsed.searchParams.get('since'));
 
   json(res, 404, { error: 'Not found' });
+}
+
+async function serveSearch(res: ServerResponse, query: string) {
+  try {
+    const matches = await searchSessions(SESSIONS_DIR, query);
+    if (!matches.length) return json(res, 200, { results: [] });
+    const owners = sessionOwners();
+    const sharedFiles = pimuxFiles();
+    const liveFiles = liveFilesSet();
+    const results = matches.map(result => {
+      const shared = sharedFiles.get(canonicalFile(result.filePath)) ?? null;
+      return {
+        ...result, project: normalizeSessionCwd(result.project) || '',
+        live: liveFiles.has(result.filePath), owner: shared ? null : owners.get(result.filePath) ?? null, shared,
+      };
+    });
+    json(res, 200, { results });
+  } catch (error) { json(res, 500, { error: errorMessage(error) }); }
+}
+
+function canonicalFile(file: string) {
+  try { return fs.realpathSync(file); } catch { return path.resolve(file); }
+}
+
+function liveFilesSet() {
+  return new Set(liveManager.list().map((s) => s.sessionFile).filter(Boolean));
 }
 
 function normalizeSessionCwd(cwd: unknown) {
@@ -654,25 +864,8 @@ function titleFromMessageContent(content: unknown) {
 }
 
 function readSessionHeaderCwd(filePath: string) {
-  let fd: number | null = null;
-  try {
-    fd = fs.openSync(filePath, 'r');
-    const buffer = Buffer.alloc(64 * 1024);
-    const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, 0);
-    const text = buffer.toString('utf8', 0, bytesRead);
-    for (const line of text.split(/\r?\n/)) {
-      if (!line.trim()) continue;
-      const entry = JSON.parse(line);
-      if (entry?.type === 'session') return normalizeSessionCwd(entry.cwd);
-    }
-  } catch {
-    return null;
-  } finally {
-    if (fd !== null) {
-      try { fs.closeSync(fd); } catch {}
-    }
-  }
-  return null;
+  try { return readSessionHeader(filePath).cwd; }
+  catch { return null; }
 }
 
 function serveProjectsList(res: ServerResponse) {
@@ -681,24 +874,9 @@ function serveProjectsList(res: ServerResponse) {
   try {
     const projectsRoot = path.resolve(projectsDir);
     const sessionInfo = new Map<string, { count: number; lastActive: number }>();
-    if (fs.existsSync(SESSIONS_DIR)) {
-      for (const dir of fs.readdirSync(SESSIONS_DIR, { withFileTypes: true })) {
-        if (!dir.isDirectory()) continue;
-        const files = fs.readdirSync(path.join(SESSIONS_DIR, dir.name)).filter((f: string) => f.endsWith('.jsonl'));
-        let sessionCwd: string | null = null;
-        let lastActive = 0;
-        for (const f of files) {
-          const filePath = path.join(SESSIONS_DIR, dir.name, f);
-          try {
-            lastActive = Math.max(lastActive, fs.statSync(filePath).mtimeMs);
-            if (!sessionCwd) sessionCwd = readSessionHeaderCwd(filePath);
-          } catch {}
-        }
-        const projectPath = sessionCwd;
-        if (!projectPath) continue;
-        if (!isWithinPath(projectsRoot, projectPath)) continue;
-        sessionInfo.set(projectPath, { count: files.length, lastActive });
-      }
+    for (const project of projectSummaries()) {
+      if (!project.path || !isWithinPath(projectsRoot, project.path)) continue;
+      sessionInfo.set(project.path, { count: project.count, lastActive: project.lastActive });
     }
     const liveCwds = new Set(liveManager.list().map((s) => s.cwd));
     const projects = fs.readdirSync(projectsRoot, { withFileTypes: true })
@@ -712,73 +890,151 @@ function serveProjectsList(res: ServerResponse) {
   } catch (e) { json(res, 500, { error: errorMessage(e) }); }
 }
 
-async function serveSessionsList(res: ServerResponse) {
-  try {
-    if (!fs.existsSync(SESSIONS_DIR)) return json(res, 200, { projects: [] });
-    const projectsByPath = new Map<string, { path: string; dirName: string; sessions: Array<Record<string, unknown>> }>();
-    for (const dir of fs.readdirSync(SESSIONS_DIR, { withFileTypes: true })) {
-      if (!dir.isDirectory()) continue;
-      const projectDir = path.join(SESSIONS_DIR, dir.name);
-      for (const file of fs.readdirSync(projectDir).filter((f: string) => f.endsWith('.jsonl'))) {
-        try {
-          const filePath = path.join(projectDir, file);
-          const parsed = await parseSessionFile(filePath);
-          if (parsed) {
-            const projectPath = parsed.cwd || ''; // Intentionally leave missing header cwd empty; backward compatibility for legacy/incomplete sessions without cwd is not required.
-            let project = projectsByPath.get(projectPath);
-            if (!project) {
-              project = { path: projectPath, dirName: dir.name, sessions: [] };
-              projectsByPath.set(projectPath, project);
-            }
-            project.sessions.push({ ...parsed, file, filePath, mtime: fs.statSync(filePath).mtimeMs });
-          }
-        } catch {}
-      }
+/**
+ * One project per session directory: pi derives that directory name from the
+ * session cwd, so a directory is a project and its newest file carries the
+ * current cwd. Listing costs a readdir and a stat per file, no transcript
+ * parsing — the sidebar loads a project's sessions only when it is expanded.
+ */
+function projectSummaries() {
+  if (!fs.existsSync(SESSIONS_DIR)) return [];
+  const projects: Array<{ path: string; dirName: string; count: number; lastActive: number }> = [];
+  for (const dir of fs.readdirSync(SESSIONS_DIR, { withFileTypes: true })) {
+    if (!dir.isDirectory()) continue;
+    const projectDir = path.join(SESSIONS_DIR, dir.name);
+    let count = 0, lastActive = 0, newest = '';
+    for (const file of fs.readdirSync(projectDir)) {
+      if (!file.endsWith('.jsonl')) continue;
+      count++;
+      const mtime = fs.statSync(path.join(projectDir, file)).mtimeMs;
+      if (mtime >= lastActive) { lastActive = mtime; newest = file; }
     }
-    const projects = Array.from(projectsByPath.values());
-    for (const project of projects) project.sessions.sort((a, b) => Number(b.mtime || 0) - Number(a.mtime || 0));
-    projects.sort((a, b) => Number(b.sessions[0]?.mtime || 0) - Number(a.sessions[0]?.mtime || 0));
-    json(res, 200, { projects });
+    if (!count) continue;
+    projects.push({ path: readSessionHeaderCwd(path.join(projectDir, newest)) || '', dirName: dir.name, count, lastActive });
+  }
+  projects.sort((a, b) => b.lastActive - a.lastActive);
+  return projects;
+}
+
+function serveProjectSummaries(res: ServerResponse) {
+  try {
+    json(res, 200, { projects: projectSummaries() });
   } catch (e) { json(res, 500, { error: errorMessage(e) }); }
 }
 
-async function parseSessionFile(filePath: string) {
-  const stream = fs.createReadStream(filePath, { encoding: 'utf8' });
-  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-  let header = null, firstMessage = null, sessionName = null, userMessageCount = 0, lineCount = 0;
-  for await (const line of rl) {
-    if (!line.trim()) continue;
-    lineCount++;
-    try {
-      const entry = JSON.parse(line);
-      if (entry.type === 'session') header = entry;
-      else if (entry.type === 'session_info' && entry.name) sessionName = entry.name;
-      else if (entry.type === 'message' && entry.message?.role === 'user') {
-        userMessageCount++;
-        if (!firstMessage) {
-          const c = entry.message.content;
-          firstMessage = typeof c === 'string' ? c.slice(0, 120) : (Array.isArray(c) ? (c.find((b) => b.type === 'text')?.text || '').slice(0, 120) : null);
-        }
-      }
-    } catch {}
-  }
-  rl.close(); stream.destroy();
-  if (!header?.id || (userMessageCount <= 1 && lineCount <= 8)) return null;
-  return { id: header.id, timestamp: header.timestamp || '', name: sessionName, firstMessage, cwd: normalizeSessionCwd(header.cwd) };
+function serveProjectSessions(res: ServerResponse, dirName: string) {
+  try {
+    const projectDir = canonicalSessionPath(path.join(SESSIONS_DIR, decodeURIComponent(dirName)));
+    if (!isWithinPath(canonicalSessionPath(SESSIONS_DIR), projectDir)) return json(res, 403, { error: 'Project is outside session storage' });
+    if (!fs.existsSync(projectDir) || !fs.statSync(projectDir).isDirectory()) return json(res, 404, { error: 'Project not found' });
+    const liveFiles = liveFilesSet();
+    const owners = sessionOwners();
+    const sharedFiles = pimuxFiles();
+    const sessions = fs.readdirSync(projectDir)
+      .filter((file: string) => file.endsWith('.jsonl'))
+      .map((file: string) => {
+        const filePath = path.join(projectDir, file);
+        // A pimux-shared session opens by attaching, never as a read-only follow.
+        const shared = sharedFiles.get(canonicalFile(filePath)) ?? null;
+        return {
+          ...readSessionSummary(filePath), file, dir: dirName, filePath,
+          live: liveFiles.has(filePath), owner: shared ? null : owners.get(filePath) ?? null, shared,
+        };
+      })
+      .sort((a, b) => b.mtime - a.mtime);
+    json(res, 200, { sessions });
+  } catch (e) { json(res, 500, { error: errorMessage(e) }); }
 }
 
-function serveSessionFile(res: ServerResponse, dirName: string, file: string) {
-  const filePath = path.join(SESSIONS_DIR, dirName, file);
+/** Bytes read per step from the start of a transcript, and once from its end. */
+const SUMMARY_WINDOW = 64 * 1024;
+
+/**
+ * Summarises one stored session without reading it whole: the start is read
+ * forward only as far as the first user message (system records of any size
+ * may precede it), and a rename is appended at the end, so one window there
+ * completes everything the sidebar shows.
+ * Transcripts here reach tens of megabytes, and a project holds thousands.
+ */
+function readSessionSummary(filePath: string) {
+  const { size, mtimeMs } = fs.statSync(filePath);
+  let id = '', timestamp = '', name: string | null = null, firstMessage: string | null = null;
+  const readLine = (line: string) => {
+    if (!line.trim()) return;
+    let entry;
+    try { entry = JSON.parse(line); } catch { return; }
+    if (entry.type === 'session') { id = entry.id || ''; timestamp = entry.timestamp || ''; }
+    else if (entry.type === 'session_info' && entry.name) name = entry.name;
+    else if (firstMessage === null && entry.type === 'message' && entry.message?.role === 'user') {
+      firstMessage = titleFromMessageContent(entry.message.content);
+    }
+  };
+
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const window = Buffer.alloc(SUMMARY_WINDOW);
+    let position = 0;
+    let partial: Buffer = Buffer.alloc(0);
+    while (firstMessage === null && position < size) {
+      const bytesRead = fs.readSync(fd, window, 0, SUMMARY_WINDOW, position);
+      if (!bytesRead) break;
+      position += bytesRead;
+      partial = Buffer.concat([partial, window.subarray(0, bytesRead)]);
+      let newline;
+      while ((newline = partial.indexOf(10)) !== -1) {
+        readLine(partial.toString('utf8', 0, newline));
+        partial = partial.subarray(newline + 1);
+      }
+    }
+    // The rest is sampled from the end. A window that starts past the first
+    // unread line starts mid-record, so its leading partial line is dropped.
+    const unread = position - partial.length;
+    const tailStart = Math.max(unread, size - SUMMARY_WINDOW);
+    readWindow(fd, tailStart, SUMMARY_WINDOW).split('\n').slice(tailStart > unread ? 1 : 0).forEach(readLine);
+  } finally {
+    fs.closeSync(fd);
+  }
+  return { id, timestamp, name, firstMessage, mtime: mtimeMs };
+}
+
+function readWindow(fd: number, position: number, length: number) {
+  const buffer = Buffer.alloc(length);
+  const bytesRead = fs.readSync(fd, buffer, 0, length, position);
+  return buffer.toString('utf8', 0, bytesRead);
+}
+
+/**
+ * Reads a stored session. `since` is a byte offset from a previous read, so a
+ * follower polls only the entries appended since then; a file that shrank or
+ * was rewritten answers from the start with `reset`, because its earlier bytes
+ * no longer describe the same conversation.
+ */
+function serveSessionFile(res: ServerResponse, dirName: string, file: string, since: string | null) {
+  let filePath: string;
+  try { filePath = resolveSessionFile(path.join(SESSIONS_DIR, decodeURIComponent(dirName), decodeURIComponent(file))); }
+  catch (error) { return json(res, errorStatus(error), { error: errorMessage(error) }); }
   if (!fs.existsSync(filePath)) return json(res, 404, { error: 'Session not found' });
+  const size = fs.statSync(filePath).size;
+  const requested = since === null ? 0 : Number(since);
+  if (!Number.isInteger(requested) || requested < 0) return json(res, 400, { error: 'since must be a byte offset' });
+  const reset = requested > size;
+  const start = reset ? 0 : requested;
   const entries: unknown[] = [];
-  const stream = fs.createReadStream(filePath, { encoding: 'utf8' });
+  if (start >= size) return json(res, 200, { entries, offset: size, reset });
+  const stream = fs.createReadStream(filePath, { encoding: 'utf8', start });
   let buffer = '';
-  stream.on('data', (chunk: string) => {
-    buffer += chunk;
+  // Whole lines only: the last partial line stays unread until its newline
+  // arrives, so the next poll starts at a record boundary.
+  let consumed = start;
+  stream.on('data', (chunk) => {
+    buffer += chunk.toString();
     const lines = buffer.split('\n'); buffer = lines.pop() || '';
-    for (const line of lines) if (line.trim()) { try { entries.push(JSON.parse(line)); } catch {} }
+    for (const line of lines) {
+      consumed += Buffer.byteLength(line) + 1;
+      if (line.trim()) { try { entries.push(JSON.parse(line)); } catch {} }
+    }
   });
-  stream.on('end', () => { if (buffer.trim()) { try { entries.push(JSON.parse(buffer)); } catch {} } json(res, 200, { entries }); });
+  stream.on('end', () => json(res, 200, { entries, offset: consumed, reset }));
   stream.on('error', (e: Error) => json(res, 500, { error: e.message }));
 }
 
@@ -884,48 +1140,6 @@ async function openNative(fp: string) {
   }
 }
 
-async function serveSearch(res: ServerResponse, query: string) {
-  try {
-    if (!query || query.length < 2 || !fs.existsSync(SESSIONS_DIR)) return json(res, 200, { results: [] });
-    const q = query.toLowerCase();
-    const results = [];
-    for (const dir of fs.readdirSync(SESSIONS_DIR, { withFileTypes: true })) {
-      if (!dir.isDirectory() || results.length >= 30) continue;
-      const projectDir = path.join(SESSIONS_DIR, dir.name);
-      for (const file of fs.readdirSync(projectDir).filter((f: string) => f.endsWith('.jsonl'))) {
-        if (results.length >= 30) break;
-        const filePath = path.join(projectDir, file);
-        const stream = fs.createReadStream(filePath, { encoding: 'utf8' });
-        const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-        let sessionId = '', sessionName = '', sessionTimestamp = '', firstMessage = '';
-        let sessionCwd: string | null = null;
-        const matches = [];
-        for await (const line of rl) {
-          if (!line.trim()) continue;
-          try {
-            const entry = JSON.parse(line);
-            if (entry.type === 'session') { sessionId = entry.id; sessionTimestamp = entry.timestamp || ''; sessionCwd = normalizeSessionCwd(entry.cwd); }
-            if (entry.type === 'session_info' && entry.name) sessionName = entry.name;
-            if (entry.type === 'message') {
-              const c = entry.message?.content;
-              const text = typeof c === 'string' ? c : (Array.isArray(c) ? c.filter((b) => b.type === 'text').map((b) => b.text).join(' ') : '');
-              if (!firstMessage && entry.message?.role === 'user' && text) firstMessage = text.slice(0, 120);
-              const idx = text.toLowerCase().indexOf(q);
-              if (idx >= 0) {
-                matches.push({ role: entry.message?.role || 'unknown', snippet: `${idx > 0 ? '…' : ''}${text.slice(Math.max(0, idx - 60), Math.min(text.length, idx + q.length + 60)).replace(/\n/g, ' ')}${idx + q.length + 60 < text.length ? '…' : ''}` });
-                if (matches.length >= 3) break;
-              }
-            }
-          } catch {}
-        }
-        rl.close(); stream.destroy();
-        if (matches.length) results.push({ filePath, project: sessionCwd || '', sessionId, sessionName, sessionTimestamp, firstMessage, matches });
-      }
-    }
-    json(res, 200, { results });
-  } catch (e) { json(res, 500, { error: errorMessage(e) }); }
-}
-
 function computeUrls(port: number) {
   const isLoopback = HOST === '127.0.0.1' || HOST === '::1' || HOST === 'localhost';
   let localIp = 'localhost';
@@ -944,14 +1158,23 @@ function computeUrls(port: number) {
     }
     for (const name of Object.keys(nets)) for (const net of nets[name] || []) if (net.family === 'IPv4' && !net.internal && net.address.startsWith('100.')) tailscaleIp = net.address;
   }
-  lanUrl = `http://${localIp}:${port}`;
-  tailscaleUrl = tailscaleIp ? `http://${tailscaleIp}:${port}` : '';
+  lanUrl = `https://${localIp}:${port}`;
+  tailscaleUrl = tailscaleIp ? `https://${tailscaleIp}:${port}` : '';
 }
 
+// Plain HTTP serves only loopback (local Pi orchestration); the network listener
+// is HTTPS, created at startup once its certificate exists. Both share handlers.
 const server = http.createServer(serveStaticFile);
+let httpsServer: https.Server | null = null;
 const wss = new WebSocketServer({ noServer: true });
+const agentOverview = new AgentOverview({
+  tabFor: (muxId) => liveManager.findByMuxId(muxId)?.id ?? null,
+  onChange: (agents) => liveManager.broadcast({ type: 'pimux_agents', agents }),
+});
+liveManager.onAttachmentsChanged = () => agentOverview.refresh();
+const voiceWss = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_BYTES });
 
-server.on('upgrade', (request: IncomingMessage, socket: Socket, head: Buffer) => {
+function handleUpgrade(request: IncomingMessage, socket: Socket, head: Buffer) {
   if (!isAllowedApiOrigin(request)) {
     socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
     socket.destroy();
@@ -963,21 +1186,23 @@ server.on('upgrade', (request: IncomingMessage, socket: Socket, head: Buffer) =>
     return;
   }
   if (request.url === '/ws') wss.handleUpgrade(request, socket, head, (ws: TauWs) => wss.emit('connection', ws, request));
+  else if (request.url === VOICE_PATH) voiceWss.handleUpgrade(request, socket, head, (ws) => handleVoiceSocket(ws, configuredTranscriber(PI_AGENT_DIR)));
   else socket.destroy();
-});
+}
+server.on('upgrade', handleUpgrade);
 
 wss.on('connection', (ws: TauWs) => {
   liveManager.addClient(ws);
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
-  ws.send(JSON.stringify({ type: 'state', liveSessions: liveManager.list() }));
+  ws.send(JSON.stringify({ type: 'state', liveSessions: liveManager.list(), agents: agentOverview.list() }));
   ws.on('message', async (data: Buffer) => {
     try {
       const command = JSON.parse(data.toString());
       const resp = await handleRpcCommand(command);
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(resp));
+      liveManager.sendTo(ws, JSON.stringify(resp));
     } catch (e) {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'error', message: errorMessage(e) }));
+      liveManager.sendTo(ws, JSON.stringify({ type: 'error', message: errorMessage(e) }));
     }
   });
   ws.on('close', () => liveManager.removeClient(ws));
@@ -993,47 +1218,74 @@ setInterval(() => {
   }
 }, 20000).unref();
 
-function listen(port: number, attemptsLeft = 10) {
-  server.once('error', (err: NodeJS.ErrnoException) => {
-    if (err.code === 'EADDRINUSE' && attemptsLeft > 0) {
-      console.log(`[Tau] Port ${port} in use, trying ${port + 1}...`);
-      server.removeAllListeners('error');
-      listen(port + 1, attemptsLeft - 1);
-    } else {
-      console.error(`[Tau] Failed to start: ${err.message}`);
-      process.exit(1);
-    }
+function listenOn(target: http.Server, port: number, host: string, attemptsLeft = 10): Promise<AddressInfo> {
+  return new Promise((resolve, reject) => {
+    const onError = (err: NodeJS.ErrnoException) => {
+      if (err.code === 'EADDRINUSE' && port !== 0 && attemptsLeft > 0) {
+        console.log(`[Tau] Port ${port} in use, trying ${port + 1}...`);
+        resolve(listenOn(target, port + 1, host, attemptsLeft - 1));
+      } else reject(err);
+    };
+    target.once('error', onError);
+    target.listen(port, host, () => {
+      target.off('error', onError);
+      resolve(target.address() as AddressInfo);
+    });
   });
-  server.listen(port, HOST, () => {
-    computeUrls(port);
-    console.log(`[Tau] Server running on ${lanUrl}${tailscaleUrl ? `  •  Tailscale: ${tailscaleUrl}` : ''}`);
-    console.log(`[Tau] Static assets: ${STATIC_DIR}`);
-    console.log(`[Tau] Pi command: ${PI_COMMAND}`);
-    if (ARGS.open) openUrl(lanUrl).catch(() => {});
-  });
+}
+
+async function listen() {
+  if (authEnabled) requireTauCredentials(TAU_SETTINGS);
+  const tls = ensureTlsCertificate(TLS_DIR, TAU_SETTINGS.hostnames);
+  httpsServer = https.createServer({ key: tls.key, cert: tls.cert }, serveStaticFile);
+  httpsServer.on('upgrade', handleUpgrade);
+  const local = await listenOn(server, HTTP_PORT, '127.0.0.1');
+  const secure = await listenOn(httpsServer, PORT, HOST);
+  computeUrls(secure.port);
+  publishEndpoint(local.port, secure.port, secure.address);
+  agentOverview.start();
+  console.log(`[Tau] Server running on ${lanUrl}${tailscaleUrl ? `  •  Tailscale: ${tailscaleUrl}` : ''}`);
+  console.log(`[Tau] Local orchestration (loopback HTTP): http://127.0.0.1:${local.port}`);
+  console.log(`[Tau] TLS certificate authority (trust it once on other devices): ${tls.caFile}`);
+  console.log(`[Tau] Static assets: ${STATIC_DIR}`);
+  console.log(`[Tau] Pi command: ${PI_COMMAND}`);
+  if (ARGS.open) openUrl(lanUrl).catch(() => {});
 }
 
 let shuttingDown = false;
 async function shutdown(signal: string) {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log(`\n[Tau] Shutting down (${signal}); terminating ${liveManager.sessions.size} Pi session(s)...`);
+  console.log(`\n[Tau] Shutting down (${signal}); disconnecting ${liveManager.sessions.size} agent view(s)...`);
   try { wss.close(); } catch {}
-  await liveManager.shutdown();
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 2500).unref();
+  agentOverview.stop();
+  try { voiceWss.close(); } catch {}
+  unpublishEndpoint();
+  let exitCode = 0;
+  try { await liveManager.shutdown(); }
+  catch (error) {
+    exitCode = 1;
+    console.error(`[Tau] View disconnect failed: ${errorMessage(error)}`);
+  }
+  httpsServer?.close();
+  server.close(() => process.exit(exitCode));
+  setTimeout(() => process.exit(exitCode), 2500).unref();
 }
 function startCli() {
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('exit', () => {
+    unpublishEndpoint();
     for (const session of liveManager.sessions.values()) {
-      try { session.child?.kill('SIGTERM'); } catch {}
+      session.transport?.abandon();
     }
   });
   process.on('uncaughtException', (err) => { console.error(err); shutdown('uncaughtException'); });
   process.on('unhandledRejection', (err) => { console.error(err); });
-  listen(PORT);
+  listen().catch((err: unknown) => {
+    console.error(`[Tau] Failed to start: ${errorMessage(err)}`);
+    process.exit(1);
+  });
 }
 
 // Test-only helper to reset module-level auth state between cases.
@@ -1043,9 +1295,6 @@ function _setAuthForTest(enabled: boolean) { authEnabled = !!enabled; }
 // (tokens embed a credential fingerprint) and mint tokens at chosen expiries.
 function _setCredentialsForTest(user: string, pass: string) { TAU_SETTINGS.user = user; TAU_SETTINGS.pass = pass; }
 function _issueSessionTokenForTest(expiresAtSeconds?: number) { return issueSessionToken(expiresAtSeconds); }
-
-// Test-only hook to substitute the Pi spawn so LiveSessionManager.create()
-// can be exercised without launching a real Pi process.
 
 export {
   parseArgs,
@@ -1074,12 +1323,17 @@ export {
   handleRpcCommand,
   NAVIGATE_COMMAND,
   NAVIGATION_MARKER_TYPE,
-  flattenTree,
+  entriesById,
   isTreeNavigationInProgress,
   leafDescendsFrom,
   navigateTree,
   pathFromRoot,
   selectNavigationTarget,
+  buildEndpoint,
+  orchestrationEndpoint,
+  parseSpawnOverrides,
+  sessionOwner,
+  sessionOwners,
   isAllowedApiOrigin,
   setCorsForAllowedOrigin,
   handleApiRoute,
@@ -1097,7 +1351,7 @@ export {
   _setAuthForTest,
   _setCredentialsForTest,
   _issueSessionTokenForTest,
-  _setSpawnPiForTest,
+  agentOverview,
   _setExecFileForTest,
   _clearModelListCacheForTest,
 };

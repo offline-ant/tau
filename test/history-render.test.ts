@@ -1,185 +1,170 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-// The compiled frontend module is a plain JS artifact without declarations;
-// the old require() call typed these as any, so keep that contract here.
-const { buildHistoryItems } = (await import('../public/history-render.js')) as any;
+import { buildHistoryItems, messageImages, type SessionHistoryEntry } from '../src/public/history-render.ts';
+import type { AppMessage } from '../src/public/app-types.ts';
 
-type Entry = { type?: string; message?: Record<string, unknown>; summary?: string; tokensBefore?: number; estimatedTokensAfter?: number; firstKeptEntryId?: string };
-
-function msg(message: Record<string, unknown>): Entry {
+function msg(message: AppMessage): SessionHistoryEntry {
   return { type: 'message', message };
 }
 
-test('string user content becomes a user item', () => {
-  const { items } = buildHistoryItems([msg({ role: 'user', content: 'hello' })]);
-  assert.deepEqual(items, [{ kind: 'user', content: 'hello', images: undefined }]);
+test('user text and images preserve their order and supported image shapes', () => {
+  const { items } = buildHistoryItems([msg({ role: 'user', content: [
+    { type: 'text', text: 'line one' }, { type: 'text', text: 'line two' },
+    { type: 'image', source: { data: 'abc123', media_type: 'image/jpeg' } },
+  ] })]);
+  assert.deepEqual(items, [{ kind: 'user', content: 'line one\nline two', images: [{ data: 'abc123', mimeType: 'image/jpeg' }] }]);
 });
 
-test('block user content joins text blocks and extracts images', () => {
+test('shared live images and saved images use the same MIME-aware extraction', () => {
+  for (const image of [
+    { type: 'image', data: 'jpeg-data', mimeType: 'image/jpeg' },
+    { type: 'image', data: 'jpeg-data', media_type: 'image/jpeg' },
+    { type: 'image', source: { data: 'jpeg-data', media_type: 'image/jpeg' } },
+  ]) {
+    const message = { role: 'user', content: [image] };
+    const images = [{ data: 'jpeg-data', mimeType: 'image/jpeg' }];
+    assert.deepEqual(messageImages(message), images);
+    assert.deepEqual(buildHistoryItems([msg(message)]).items, [{ kind: 'user', content: '', images }]);
+  }
+  assert.deepEqual(messageImages({ role: 'user', content: 'plain text' }), []);
+});
+
+test('empty user messages are omitted but image-only messages remain', () => {
   const { items } = buildHistoryItems([
-    msg({
-      role: 'user',
-      content: [
-        { type: 'text', text: 'line one' },
-        { type: 'text', text: 'line two' },
-        { type: 'image', source: { data: 'abc123', media_type: 'image/jpeg' } },
-      ],
-    }),
-  ]);
-  assert.equal(items.length, 1);
-  assert.equal(items[0].content, 'line one\nline two');
-  assert.deepEqual(items[0].images, [{ data: 'abc123', mimeType: 'image/jpeg' }]);
-});
-
-test('empty user message produces no item', () => {
-  const { items } = buildHistoryItems([msg({ role: 'user', content: '' }), msg({ role: 'user', content: [] })]);
-  assert.equal(items.length, 0);
-});
-
-test('image-only user message still produces an item', () => {
-  const { items } = buildHistoryItems([
+    msg({ role: 'user', content: '' }), msg({ role: 'user', content: [] }),
     msg({ role: 'user', content: [{ type: 'image', data: 'xyz', media_type: 'image/png' }] }),
   ]);
-  assert.equal(items.length, 1);
-  assert.equal(items[0].content, '');
-  assert.deepEqual(items[0].images, [{ data: 'xyz', mimeType: 'image/png' }]);
+  assert.deepEqual(items, [{ kind: 'user', content: '', images: [{ data: 'xyz', mimeType: 'image/png' }] }]);
 });
 
-test('assistant text and thinking blocks become one assistant item with block content', () => {
-  const blocks = [
-    { type: 'thinking', thinking: 'hmm' },
-    { type: 'text', text: 'answer' },
-  ];
-  const { items } = buildHistoryItems([msg({ role: 'assistant', content: blocks })]);
-  assert.equal(items.length, 1);
-  assert.equal(items[0].kind, 'assistant');
-  assert.deepEqual(items[0].content, blocks);
-});
-
-test('thinking-only assistant message still produces an item', () => {
-  const { items } = buildHistoryItems([
-    msg({ role: 'assistant', content: [{ type: 'thinking', thinking: 'pondering' }] }),
+test('text and thinking are distinct typed activity steps in original order', () => {
+  const { items } = buildHistoryItems([msg({ role: 'assistant', content: [
+    { type: 'thinking', thinking: 'hmm' }, { type: 'text', text: 'answer' },
+    { type: 'thinking', thinking: 'another thought' },
+  ] })]);
+  assert.deepEqual(items, [
+    { kind: 'assistant', step: { type: 'thinking', text: 'hmm' } },
+    { kind: 'assistant', step: { type: 'text', text: 'answer' } },
+    { kind: 'assistant', step: { type: 'thinking', text: 'another thought' } },
   ]);
-  assert.equal(items.length, 1);
-  assert.equal(items[0].kind, 'assistant');
 });
 
-test('assistant error with no content becomes an item with the provider message', () => {
-  const { items } = buildHistoryItems([
-    msg({ role: 'assistant', content: [], stopReason: 'error', errorMessage: '401: API key expired' }),
-  ]);
-  assert.equal(items.length, 1);
-  assert.equal(items[0].kind, 'assistant');
-  assert.deepEqual(items[0].content, '');
-  assert.equal(items[0].error, '401: API key expired');
+test('string assistant content is a text step and never a thinking fallback', () => {
+  assert.deepEqual(buildHistoryItems([msg({ role: 'assistant', content: 'answer' })]).items,
+    [{ kind: 'assistant', step: { type: 'text', text: 'answer' } }]);
 });
 
-test('assistant error with partial content keeps both the text and the error', () => {
-  const { items } = buildHistoryItems([
-    msg({ role: 'assistant', content: [{ type: 'text', text: 'partial answer' }], stopReason: 'error', errorMessage: '500: upstream failed' }),
-  ]);
-  assert.equal(items.length, 1);
-  assert.deepEqual(items[0].content, [{ type: 'text', text: 'partial answer' }]);
-  assert.equal(items[0].error, '500: upstream failed');
+test('a final empty assistant error remains a visible error step', () => {
+  assert.deepEqual(buildHistoryItems([msg({ role: 'assistant', content: [], stopReason: 'error', errorMessage: '401: API key expired' })]).items,
+    [{ kind: 'assistantError', error: '401: API key expired' }]);
 });
 
-test('error that a later assistant reply recovered from is not shown', () => {
+test('partial content stays before its final error, including thinking-only replies', () => {
+  for (const content of [
+    [{ type: 'text', text: 'partial answer' }],
+    [{ type: 'thinking', thinking: 'private reasoning' }],
+  ]) {
+    const { items } = buildHistoryItems([msg({ role: 'assistant', content, stopReason: 'error', errorMessage: '500: upstream failed' })]);
+    assert.equal(items.length, 2);
+    assert.deepEqual(items[1], { kind: 'assistantError', error: '500: upstream failed' });
+    assert.ok(!JSON.stringify(items[1]).includes('private reasoning'));
+  }
+});
+
+test('a provider error without detail uses the final failure fallback', () => {
+  assert.deepEqual(buildHistoryItems([msg({ role: 'assistant', stopReason: 'error' })]).items,
+    [{ kind: 'assistantError', error: 'Request failed' }]);
+});
+
+test('a later assistant reply suppresses the recovered error, not partial content', () => {
   const { items } = buildHistoryItems([
     msg({ role: 'user', content: 'question' }),
-    msg({ role: 'assistant', content: [], stopReason: 'error', errorMessage: '503: try again' }),
+    msg({ role: 'assistant', content: [{ type: 'text', text: 'partial' }], stopReason: 'error', errorMessage: '503: try again' }),
     msg({ role: 'assistant', content: [{ type: 'text', text: 'recovered answer' }], stopReason: 'stop' }),
   ]);
-  assert.deepEqual(items.map((item: { kind: string }) => item.kind), ['user', 'assistant']);
-  assert.equal(items[1].error, undefined);
-  assert.deepEqual(items[1].content, [{ type: 'text', text: 'recovered answer' }]);
+  assert.deepEqual(items.map(item => item.kind), ['user', 'assistant', 'assistant']);
+  assert.ok(!JSON.stringify(items).includes('503: try again'));
 });
 
-test('only the last error in a turn is kept when several retries fail', () => {
+test('an empty failed attempt leaves no empty bubble after successful retry', () => {
+  const { items } = buildHistoryItems([
+    msg({ role: 'assistant', content: [], stopReason: 'error', errorMessage: 'retry me' }),
+    msg({ role: 'assistant', content: [{ type: 'text', text: 'recovered' }] }),
+  ]);
+  assert.deepEqual(items, [{ kind: 'assistant', step: { type: 'text', text: 'recovered' } }]);
+});
+
+test('only the last failed retry is final within a user turn', () => {
   const { items } = buildHistoryItems([
     msg({ role: 'user', content: 'question' }),
     msg({ role: 'assistant', content: [], stopReason: 'error', errorMessage: 'first failure' }),
     msg({ role: 'assistant', content: [], stopReason: 'error', errorMessage: 'final failure' }),
   ]);
-  assert.deepEqual(items.map((item: { kind: string }) => item.kind), ['user', 'assistant']);
-  assert.equal(items[1].error, 'final failure');
+  assert.deepEqual(items.map(item => item.kind), ['user', 'assistantError']);
+  assert.deepEqual(items[1], { kind: 'assistantError', error: 'final failure' });
 });
 
-test('a new user turn keeps the previous turn\'s final error', () => {
+test('a new user turn cannot recover the previous turn\'s final error', () => {
   const { items } = buildHistoryItems([
     msg({ role: 'user', content: 'first question' }),
-    msg({ role: 'assistant', content: [], stopReason: 'error', errorMessage: '401: API key expired' }),
+    msg({ role: 'assistant', content: [], stopReason: 'error', errorMessage: 'expired' }),
     msg({ role: 'user', content: 'second question' }),
-    msg({ role: 'assistant', content: [{ type: 'text', text: 'second answer' }], stopReason: 'stop' }),
+    msg({ role: 'assistant', content: [{ type: 'text', text: 'second answer' }] }),
   ]);
-  assert.deepEqual(items.map((item: { kind: string }) => item.kind), ['user', 'assistant', 'user', 'assistant']);
-  assert.equal(items[1].error, '401: API key expired');
-  assert.equal(items[3].error, undefined);
+  assert.deepEqual(items.map(item => item.kind), ['user', 'assistantError', 'user', 'assistant']);
+  assert.deepEqual(items[1], { kind: 'assistantError', error: 'expired' });
 });
 
-test('tool-call-only assistant message produces toolCall items but no assistant item', () => {
-  const { items } = buildHistoryItems([
-    msg({
-      role: 'assistant',
-      content: [
-        { type: 'toolCall', id: 'tc-1', name: 'bash', arguments: { command: 'ls' } },
-        { type: 'toolCall', id: 'tc-2', name: 'read', arguments: { path: '/x' } },
-      ],
-    }),
+test('tool-only assistant messages emit calls without empty text steps', () => {
+  const { items } = buildHistoryItems([msg({ role: 'assistant', content: [
+    { type: 'toolCall', id: 'tc-1', name: 'bash', arguments: { command: 'ls' } },
+    { type: 'toolCall', id: 'tc-2', name: 'read', arguments: { path: '/x' } },
+  ] })]);
+  assert.deepEqual(items, [
+    { kind: 'toolCall', toolCallId: 'tc-1', toolName: 'bash', args: { command: 'ls' } },
+    { kind: 'toolCall', toolCallId: 'tc-2', toolName: 'read', args: { path: '/x' } },
   ]);
-  assert.deepEqual(
-    items.map((i: { kind: string }) => i.kind),
-    ['toolCall', 'toolCall']
-  );
-  assert.equal(items[0].toolCallId, 'tc-1');
-  assert.equal(items[0].toolName, 'bash');
-  assert.deepEqual(items[0].args, { command: 'ls' });
 });
 
-test('toolResult attaches to its toolCall item and emits no item of its own', () => {
+test('interleaved steps keep chronology and out-of-order tool results across compaction', () => {
   const { items } = buildHistoryItems([
-    msg({
-      role: 'assistant',
-      content: [
-        { type: 'text', text: 'running' },
-        { type: 'toolCall', id: 'tc-1', name: 'bash', arguments: {} },
-      ],
-    }),
-    msg({ role: 'toolResult', toolCallId: 'tc-1', content: [{ type: 'text', text: 'output here' }] }),
-  ]);
-  assert.equal(items.length, 2);
-  const tc = items[1];
-  assert.equal(tc.kind, 'toolCall');
-  assert.deepEqual(tc.result, { content: [{ type: 'text', text: 'output here' }] });
-  assert.equal(tc.isError, false);
-});
-
-test('multiple toolCalls in one assistant message each get their own result', () => {
-  const { items } = buildHistoryItems([
-    msg({
-      role: 'assistant',
-      content: [
-        { type: 'toolCall', id: 'a', name: 'bash', arguments: {} },
-        { type: 'toolCall', id: 'b', name: 'read', arguments: {} },
-      ],
-    }),
+    msg({ role: 'user', content: [
+      { type: 'text', text: 'Check' }, { type: 'text', text: 'these files' },
+      { type: 'image', data: 'abc', media_type: 'image/png' },
+    ] }),
+    msg({ role: 'assistant', content: [
+      { type: 'thinking', thinking: 'Plan' },
+      { type: 'toolCall', id: 'a', name: 'read', arguments: { path: '/a' } },
+      { type: 'text', text: 'Also check b' },
+      { type: 'toolCall', id: 'b', name: 'read', arguments: { path: '/b' } },
+    ] }),
     msg({ role: 'toolResult', toolCallId: 'b', content: [{ type: 'text', text: 'result-b' }] }),
-    msg({ role: 'toolResult', toolCallId: 'a', content: [{ type: 'text', text: 'result-a' }], isError: true }),
+    msg({ role: 'toolResult', toolCallId: 'a', content: [{ type: 'text', text: 'failed-a' }], isError: true }),
+    msg({ role: 'assistant', content: [{ type: 'toolCall', id: 'c', name: 'self_compact', arguments: {} }] }),
+    msg({ role: 'toolResult', toolCallId: 'c', content: [{ type: 'text', text: 'Handoff' }] }),
+    { type: 'compaction', summary: 'Summary' },
+    msg({ role: 'assistant', content: [{ type: 'text', text: 'Continued' }] }),
+    msg({ role: 'user', content: [{ type: 'image', data: 'next', media_type: 'image/jpeg' }] }),
+    msg({ role: 'assistant', content: [{ type: 'toolCall', id: 'd', name: 'read', arguments: { path: '/d' } }] }),
+    msg({ role: 'toolResult', toolCallId: 'unknown', content: [{ type: 'text', text: 'orphan' }] }),
   ]);
-  const byId = new Map<string, Record<string, unknown>>(
-    items.map((i: { toolCallId: string }) => [i.toolCallId, i])
-  );
-  assert.deepEqual(byId.get('a')!.result, { content: [{ type: 'text', text: 'result-a' }] });
-  assert.equal(byId.get('a')!.isError, true);
-  assert.deepEqual(byId.get('b')!.result, { content: [{ type: 'text', text: 'result-b' }] });
-  assert.equal(byId.get('b')!.isError, false);
+  assert.deepEqual(items, [
+    { kind: 'user', content: 'Check\nthese files', images: [{ data: 'abc', mimeType: 'image/png' }] },
+    { kind: 'assistant', step: { type: 'thinking', text: 'Plan' } },
+    { kind: 'toolCall', toolCallId: 'a', toolName: 'read', args: { path: '/a' }, result: { content: [{ type: 'text', text: 'failed-a' }] }, isError: true },
+    { kind: 'assistant', step: { type: 'text', text: 'Also check b' } },
+    { kind: 'toolCall', toolCallId: 'b', toolName: 'read', args: { path: '/b' }, result: { content: [{ type: 'text', text: 'result-b' }] }, isError: false },
+    { kind: 'toolCall', toolCallId: 'c', toolName: 'self_compact', args: {}, result: { content: [{ type: 'text', text: 'Handoff' }] }, isError: false },
+    { kind: 'compaction', summary: 'Summary' },
+    { kind: 'assistant', step: { type: 'text', text: 'Continued' } },
+    { kind: 'user', content: '', images: [{ data: 'next', mimeType: 'image/jpeg' }] },
+    { kind: 'toolCall', toolCallId: 'd', toolName: 'read', args: { path: '/d' } },
+  ]);
 });
 
-test('nested records stay paired with their own parent without adding history items', () => {
-  const first = {
-    complete: true,
-    calls: [{ id: 'a/1', name: 'read', arguments: { path: '/a' }, status: 'ok', durationMs: 12 }],
-  };
+test('nested records stay with their own parent without adding history items', () => {
+  const first: NonNullable<AppMessage['nestedCalls']> = { complete: true, calls: [{ id: 'a/1', name: 'read', arguments: { path: '/a' }, status: 'ok', durationMs: 12 }] };
   const second = { complete: false, calls: [] };
   const { items } = buildHistoryItems([
     msg({ role: 'assistant', content: [
@@ -190,9 +175,12 @@ test('nested records stay paired with their own parent without adding history it
     msg({ role: 'toolResult', toolCallId: 'a', content: [{ type: 'text', text: 'parent output' }], nestedCalls: first }),
   ]);
   assert.equal(items.length, 2);
-  assert.deepEqual(items.map((item: { kind: string }) => item.kind), ['toolCall', 'toolCall']);
-  assert.deepEqual(items[0].result, { content: [{ type: 'text', text: 'parent output' }], nestedCalls: first });
-  assert.deepEqual(items[1].result, { content: [], nestedCalls: second });
+  assert.deepEqual(items[0], { kind: 'toolCall', toolCallId: 'a', toolName: 'codemode', args: { code: 'a()' }, result: { content: [{ type: 'text', text: 'parent output' }], nestedCalls: first }, isError: false });
+  assert.deepEqual(items[1], { kind: 'toolCall', toolCallId: 'b', toolName: 'codemode', args: { code: 'b()' }, result: { content: [], nestedCalls: second }, isError: false });
+});
+
+test('unmatched tool results are ignored', () => {
+  assert.deepEqual(buildHistoryItems([msg({ role: 'toolResult', toolCallId: 'ghost', content: [] })]).items, []);
 });
 
 test('tool-result usage is separate from assistant usage', () => {
@@ -205,68 +193,43 @@ test('tool-result usage is separate from assistant usage', () => {
   assert.equal(lastUsage, null);
 });
 
-test('unmatched toolResult is dropped without throwing', () => {
-  const { items } = buildHistoryItems([
-    msg({ role: 'toolResult', toolCallId: 'ghost', content: [{ type: 'text', text: 'orphan' }] }),
-  ]);
-  assert.equal(items.length, 0);
-});
-
-test('totalCost sums usage.cost.total across assistant messages', () => {
-  const { totalCost } = buildHistoryItems([
+test('assistant costs sum across messages', () => {
+  assert.equal(buildHistoryItems([
     msg({ role: 'assistant', content: [{ type: 'text', text: 'a' }], usage: { cost: { total: 0.5 } } }),
     msg({ role: 'assistant', content: [{ type: 'text', text: 'b' }], usage: { cost: { total: 0.25 } } }),
-  ]);
-  assert.equal(totalCost, 0.75);
+  ]).totalCost, 0.75);
 });
 
-test('lastInputTokens/lastUsage come from the last assistant message with usage', () => {
-  const first = { input: 100, cacheRead: 10, cost: { total: 0.1 } };
+test('splitting steps counts usage once, including tool-only messages, not cache warming as context', () => {
   const last = { input: 200, cacheRead: 50, cost: { total: 0.2 } };
-  const { lastInputTokens, lastUsage } = buildHistoryItems([
-    msg({ role: 'assistant', content: [{ type: 'text', text: 'a' }], usage: first }),
-    msg({ role: 'user', content: 'more' }),
-    msg({ role: 'assistant', content: [{ type: 'text', text: 'b' }], usage: last }),
+  const { items, totalCost, lastInputTokens, lastUsage } = buildHistoryItems([
+    msg({ role: 'assistant', usage: { input: 100, cost: { total: 0.5 } }, content: [
+      { type: 'thinking', thinking: 'Plan' }, { type: 'text', text: 'Checking' },
+      { type: 'toolCall', id: 'a', name: 'read', arguments: {} },
+    ] }),
+    msg({ role: 'assistant', usage: last, content: [{ type: 'toolCall', id: 'b', name: 'read', arguments: {} }] }),
+    { type: 'usage', usage: { input: 0, cacheRead: 50000, cost: { total: 0.015 } } },
+    msg({ role: 'assistant', content: [{ type: 'text', text: 'Done' }] }),
   ]);
+  assert.equal(items.length, 5, 'cache warming is not displayed');
+  assert.equal(totalCost, 0.715);
   assert.equal(lastInputTokens, 250);
   assert.deepEqual(lastUsage, last);
 });
 
-test('non-message entries and empty messages are skipped', () => {
-  const { items } = buildHistoryItems([
-    { type: 'session' },
-    { type: 'message' },
-    { type: 'event', message: { role: 'user', content: 'wrong entry type' } },
-    msg({ role: 'user', content: 'real' }),
-  ]);
-  assert.equal(items.length, 1);
-  assert.equal(items[0].content, 'real');
-});
-
-test('items preserve conversation order', () => {
-  const { items } = buildHistoryItems([
-    msg({ role: 'user', content: 'q1' }),
-    msg({
-      role: 'assistant',
-      content: [
-        { type: 'text', text: 'a1' },
-        { type: 'toolCall', id: 't1', name: 'bash', arguments: {} },
-      ],
-    }),
-    msg({ role: 'toolResult', toolCallId: 't1', content: [] }),
-    msg({ role: 'user', content: 'q2' }),
-    msg({ role: 'assistant', content: [{ type: 'text', text: 'a2' }] }),
-  ]);
-  assert.deepEqual(
-    items.map((i: { kind: string }) => i.kind),
-    ['user', 'assistant', 'toolCall', 'user', 'assistant']
-  );
+test('context edits change model context only: the target stays displayed', () => {
+  const entries = [
+    { type: 'message', id: 'u1', message: { role: 'user', content: 'kept in UI' } },
+    { type: 'context_edit', targetId: 'u1', replacement: null },
+    { type: 'context_edit', targetId: 'u1', replacement: 'replaced for the model' },
+  ];
+  assert.deepEqual(buildHistoryItems(entries).items, [{ kind: 'user', content: 'kept in UI', images: undefined }]);
 });
 
 test('a compaction entry becomes a divider with its summary at the point where it happened', () => {
   const { items } = buildHistoryItems([
     msg({ role: 'user', content: 'before' }),
-    { type: 'compaction', summary: 'What happened so far.', tokensBefore: 150000, firstKeptEntryId: 'k1' } as Entry,
+    { type: 'compaction', summary: 'What happened so far.', tokensBefore: 150000, firstKeptEntryId: 'k1' } as SessionHistoryEntry,
     msg({ role: 'user', content: 'after' }),
   ]);
   assert.deepEqual(items.map((item: { kind: string }) => item.kind), ['user', 'compaction', 'user']);
@@ -277,7 +240,7 @@ test('the context count after a compaction is the estimate until a reply reports
   const usage = { input: 120000, cost: { total: 0 } };
   let result = buildHistoryItems([
     msg({ role: 'assistant', content: [{ type: 'text', text: 'a' }], usage }),
-    { type: 'compaction', summary: 'S', tokensBefore: 120000, estimatedTokensAfter: 30000 } as Entry,
+    { type: 'compaction', summary: 'S', tokensBefore: 120000, estimatedTokensAfter: 30000 } as SessionHistoryEntry,
   ]);
   assert.equal(result.lastInputTokens, 30000);
   assert.equal(result.contextTokensEstimated, true);
@@ -285,13 +248,13 @@ test('the context count after a compaction is the estimate until a reply reports
   // A compaction loaded from a session file has no estimate.
   result = buildHistoryItems([
     msg({ role: 'assistant', content: [{ type: 'text', text: 'a' }], usage }),
-    { type: 'compaction', summary: 'S', tokensBefore: 120000 } as Entry,
+    { type: 'compaction', summary: 'S', tokensBefore: 120000 } as SessionHistoryEntry,
   ]);
   assert.equal(result.lastInputTokens, 0);
   assert.equal(result.contextTokensEstimated, false);
 
   result = buildHistoryItems([
-    { type: 'compaction', summary: 'S', tokensBefore: 120000, estimatedTokensAfter: 30000 } as Entry,
+    { type: 'compaction', summary: 'S', tokensBefore: 120000, estimatedTokensAfter: 30000 } as SessionHistoryEntry,
     msg({ role: 'assistant', content: [{ type: 'text', text: 'b' }], usage: { input: 31000 } }),
   ]);
   assert.equal(result.lastInputTokens, 31000);

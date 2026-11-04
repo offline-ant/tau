@@ -2,27 +2,34 @@
 
 **Browser workspace for [Pi](https://github.com/earendil-works/pi) — a standalone web server that manages multiple live Pi RPC sessions in parallel.**
 
+> **This checkout is a fork** of [milanglacier/pi-tau-web-server](https://github.com/milanglacier/pi-tau-web-server)
+> (remote `upstream`, branch `pi-orchestration`). It adds orchestration support for
+> pi-ant: tau acts as a *web host* for Pi workers, and never becomes a second writer
+> on a session file a terminal worker owns. See [Orchestration host](#orchestration-host).
+> Authentication requires explicitly configured HTTP Basic credentials. Tau refuses
+> startup without them unless `tau.authEnabled` is explicitly `false`.
+
 Pi Tau Web Server is a fork of [deflating/tau](https://github.com/deflating/tau), forked at
 [`5e2bce39`](https://github.com/deflating/tau/tree/5e2bce39) and rewritten from
 a Pi extension that ran inside the Pi TUI into a standalone Node.js web server.
 The original Tau project was retired on 2026-09-30 and is no longer maintained.
-This fork is under active maintenance and development. Instead of living inside
-a TUI session, Tau runs one backend process and spawns headless `pi --mode rpc`
-child processes — one per in-page Tau tab — so you can work with multiple Pi
-sessions side by side in your browser.
+This private integration candidate keeps upstream maintenance and the fork's
+browser/orchestration features. One detached pimux owns each Pi RPC agent; Tau
+and Pilish are equal Unix-socket clients. The tab × and **Close agent** end the
+agent in every frontend without confirmation. Closing the browser or restarting
+Tau only disconnects its views.
 
 ## Key differences from `5e2bce39`
 
 | Area                  | Upstream (`5e2bce39`)                                                                         | This fork                                                                                                      |
 | --------------------- | --------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| **Architecture**      | Pi extension loaded inside the Pi TUI process; browser displayed a single running TUI session | Standalone Node.js server that spawns independent `pi --mode rpc` child processes                              |
-| **Multiple sessions** | Not supported                                                                                 | In-page tabs each backed by their own Pi RPC subprocess; run N sessions in parallel                            |
-| **Session lifecycle** | Tied to the Pi TUI session — close the TUI and the browser view died                          | Sessions are server-owned; closing/reloading the browser does not kill Pi children                             |
-| **Pi communication**  | In-process Pi extension API                                                                   | Out-of-process JSON line-delimited RPC over stdin/stdout                                                       |
-| **UI dialogs**        | `ctx.ui.confirm/input/select` shown in TUI only; not forwarded to the browser                 | All forwarded to the browser — extensions that use these built-in UI interfaces work seamlessly in the browser |
-| **Test coverage**     | Javascript and No tests                                                                       | Typescript + Full test suite                                                                                   |
-| **Auto-start**           | Extension auto-started inside Pi unless `TAU_DISABLED=1`                                      | Always explicit — the user runs `pi-tau-web-server` when they want it                                          |
-| **Various enhancements** | N/A                                                                                           | Session tree and branching, mirroring Pi TUI's `/tree` command                                                  |
+| **Architecture** | Pi extension inside a terminal | Standalone HTTP/WebSocket server and equal clients of detached agents |
+| **Multiple sessions** | One terminal conversation | Independent agents, with several frontend views of each |
+| **Session lifecycle** | Bound to the terminal | Bound to the detached runtime, not its creating frontend |
+| **Pi communication** | In-process extension API | JSONL RPC over protected Unix sockets |
+| **UI dialogs** | Terminal only | Shared dialogs with first-answer-wins closure |
+| **Auto-start** | Inside Pi | Explicit server and agent launch |
+| **Session tree** | Terminal navigation | Capability-checked navigation, branching and complete exports |
 
 ![Tau light mode](docs/images/main-page.jpg)
 
@@ -42,34 +49,62 @@ sessions side by side in your browser.
 
 ## What it does
 
-- **Standalone server** — run `pi-tau-web-server`; it serves the web UI and manages Pi RPC child processes as subprocesses via `pi --mode rpc`
-- **Multiple live sessions** — in-page Tau tabs (not browser tabs) each represent a live Pi RPC session. Create, switch, and close them from one browser page. Tau runs all of them in parallel.
-- **Session persistence while the server runs** — closing or reloading the browser does not kill Pi child sessions; only closing an in-page Tau tab or shutting down the Tau server does
-- **Works on any device** — open the same Tau server from your phone, tablet, or another monitor
-- **Session history browser** — view saved Pi JSONL session files, search across all sessions by message content
-- **WebSocket-based client-server architecture** — the browser connects to Tau over HTTP and WebSocket; Tau communicates with Pi processes over JSON line-delimited RPC over stdin/stdout
+- Runs several Pi agents and shows the same live agent from several browsers or Emacs.
+- Keeps accepted work running with zero connected clients; never restarts crashed
+  agents or resends uncertain input automatically.
+- Browses saved sessions by project, with lazy loading, search and read-only
+  following of terminal-owned conversations.
+- Provides shared dialogs, model/thinking controls, rich tool output, queue
+  recovery, images, an optional file browser and optional public voice dictation.
 
 ## Install
 
-Requires Node.js 22.19 or newer and [Pi](https://github.com/earendil-works/pi)
-installed as the `pi` command on your `PATH`.
+This is an unpublished Phimacs candidate, not the upstream npm package. It needs
+Linux, Node 24 and its exact Pi 1.5.0 host. The release installs the complete tested
+runtime; it does not use or modify an unrelated global Pi.
 
-```bash
-npm install --global pi-tau-web-server
-```
+For candidate development, reviewed compiled pimux, orchestration and generic sound
+archives are included in `vendor/` and locked with integrity hashes. Run
+`npm ci --ignore-scripts`, then the explicit compilation commands below. Installing
+never builds or downloads assets through a lifecycle script. Orchestration supplies
+`pi-orchestration/worker-task` and the `phimacs-task-status` executable. See the
+[candidate input record](docs/phimacs-candidate.md) for retained source provenance
+and committed source archives. Public redistribution remains gated on the complete
+release matrix and the upstream license clarification.
 
 ## Usage
 
-```bash
-pi-tau-web-server
-```
-
-Open the printed URL (default `http://localhost:3001`). Click `+` in the tab bar or sidebar to create an in-page Tau tab, choose or type a project directory, optionally enter a Pi `/model`-style model string, then chat.
+Configure authentication first (see [Authentication](#authentication)), or supply
+credentials when starting:
 
 ```bash
-pi-tau-web-server --host 127.0.0.1 --port 3001 --open
-TAU_PORT=3001 TAU_HOST=0.0.0.0 TAU_PROJECTS_DIR="$HOME/projects" pi-tau-web-server
+TAU_USER=pi TAU_PASS='choose-a-password' pi-tau-web-server
 ```
+
+Open the printed URL (default `https://localhost:3443`). Click `+` in the tab bar or sidebar to create an in-page Tau tab, choose or type a project directory, optionally enter a Pi `/model`-style model string, then chat.
+
+```bash
+pi-tau-web-server --host 127.0.0.1 --port 3443 --open
+TAU_PORT=3443 TAU_HOST=0.0.0.0 TAU_PROJECTS_DIR="$HOME/projects" pi-tau-web-server
+```
+
+### HTTPS
+
+The network listener (`--host`/`--port`, default `127.0.0.1:3443`) always speaks
+HTTPS; browsers need a secure context for the microphone. Plain HTTP exists only
+on loopback (`127.0.0.1`, `--http-port`, default `3001`) for local Pi
+orchestration and is never reachable from the network. Both listeners share the
+same routes, WebSockets and authentication.
+
+On first start Tau creates a small local certificate authority under
+`<PI_CODING_AGENT_DIR>/tau/tls/` (directory `0700`, keys `0600`) and prints the
+path of its `ca.crt`. Install that file once as a trusted CA on each phone or
+browser to avoid certificate warnings. The server certificate (825 days, signed
+by that CA) covers `localhost`, the machine's host name, names listed in
+`hostnames`/`TAU_HOSTNAMES`, `127.0.0.1`, `::1` and every non-link-local
+interface address. It is reissued by the same CA at startup when those names or
+addresses change or expiry is within 30 days, so installed trust survives.
+Certificates are signed with the `openssl` CLI, which must be on `PATH`.
 
 ## Containers
 
@@ -86,7 +121,7 @@ Start an instance with credentials in the environment:
 
 ```bash
 TAU_USER=alice TAU_PASS='choose-a-password' \
-  container/tau-container run personal-workspace --port 3001
+  container/tau-container run personal-workspace --port 3443
 ```
 
 Missing credentials are prompted for, with the password input hidden. Start
@@ -94,7 +129,7 @@ additional isolated instances by giving each one a different name and host
 port:
 
 ```bash
-container/tau-container run work-workspace --port 3002
+container/tau-container run work-workspace --port 3444
 container/tau-container status
 container/tau-container logs work-workspace
 container/tau-container stop work-workspace
@@ -122,29 +157,59 @@ ${XDG_DATA_HOME:-$HOME/.local/share}/pi-tau-web-server/instances/<instance>/
 The host-side projects directory is `<instance>/projects/` beneath that path.
 Override the state root with `TAU_CONTAINER_STATE_DIR`.
 
-Ports bind to all host interfaces by default. HTTP Basic Auth does not encrypt
-credentials or traffic, so use a TLS reverse proxy for access from another
-machine. Pass `--bind 127.0.0.1` to restrict an instance to local access.
+Ports bind to all host interfaces by default and serve HTTPS with the
+instance's own certificate authority, stored in its state under
+`agent/tau/tls/ca.crt`. Pass `--bind 127.0.0.1` to restrict an instance to local
+access.
 
 ## Features
 
 ### Chat
 
 - Full markdown rendering with syntax-highlighted code blocks
-- Streaming responses with typing indicator
+- Assistant activity shares one bubble: while working, a growing list of step types (`thinking · bash · bash · text`); when finished, only the last item is shown. Click the list to reveal all steps in order. Long lists keep the latest eight labels with an earlier-step count.
+- Expanded blocks stream their full content; collapsed blocks show only activity labels until completion. User messages and context compaction stay separate; compaction starts a new block.
+- Expand/Collapse All Steps commands; thinking visibility also controls thinking labels.
 - Image attachments (paste, drag & drop, or button)
 - Copy any message with one click
 - Inline diff viewer for edit tool calls
 - Message queuing while the agent is working
+- **Voice dictation** — tap the microphone to record, tap again to stop. The
+  browser streams 16 kHz PCM to the authenticated `/ws/voice` socket; the final
+  transcript is inserted once at the cursor and never sent. Switching or closing
+  the tab cancels. Browsers require HTTPS (or localhost) for the microphone,
+  which Tau's network listener provides (see [HTTPS](#https)).
+  Voice is disabled until an approved backend is explicitly configured in
+  `<PI_CODING_AGENT_DIR>/voice.json`, for example:
+
+  ```json
+  {"backend":"local","options":{"url":"http://127.0.0.1:8090"},"mode":"type"}
+  ```
+
+  The public `pi-sound` library supplies the asynchronous transcriber contract.
+  Browser audio needs no capture driver. Tau never reads native subscription
+  credentials, chooses a device socket or silently falls back to another backend.
+  English only; 5-minute recording, 64-KiB frames and 15-second silence limits apply.
 
 ### Live Session Management
 
-- Backend-owned live Pi RPC sessions, each backed by a `pi --mode rpc` subprocess
+- Detached Pi RPC runtimes shared by equal Tau/Pilish views
 - JupyterLab-style in-page Tau tab strip — each tab is an independent Pi session
 - Browser reload or reconnect restores live Tau tabs from the backend
 - Multiple browser clients see the same live session list
 - Historical sessions remain read-only
+- **Agents** — the header button (its count shows blocked agents) lists every Pi shared through pimux, such as Emacs Pilish sessions: grouped by directory, workers under their parent, blocked first, then working, done, idle. Tapping one attaches a tab; see [Shared agents](#shared-agents-pimux).
+- **Take from Herdr…** — use the arrow beside the Tau tabs or the command palette to select an idle Herdr conversation and load it into the current Tau tab. Requires pi-ant's `/take` command and an idle tab with no queued messages or pending dialogs. The existing RPC picker handles selection; drafts, attachments, and other tabs' queues stay untouched.
 - **Session tree and branching** — inspect the active session's full tree and jump to any earlier entry, mirroring Pi TUI's `/tree` behavior; choose a user message to restore it to the composer and create a new branch
+- **Live-tab links** — `/#session=<URL-encoded live-tab id>` selects an existing
+  live tab after connection, or when the URL fragment changes. Links contain no
+  credentials or session-file paths. They never resume historical files or submit
+  prompts; queued input stays paused until you select a tab normally or submit
+  input yourself. Missing/malformed links report an error without selecting a
+  fallback tab or waiting to select a future matching tab. Once handled, the
+  session fragment is removed, including invalid/missing targets; path, query and
+  unrelated fragments stay unchanged. Reconnect does not reapply an old link,
+  and reload restores your last selected tab normally.
 
 ### Model & Thinking
 
@@ -162,9 +227,11 @@ machine. Pass `--bind 127.0.0.1` to restrict an instance to local access.
 
 ### Session Browser
 
-- Sidebar with all saved Pi JSONL session files, grouped by project
-- Full-text search across all historical sessions with highlighted snippets
+- Sidebar listing every project that has saved Pi JSONL sessions, collapsed by default
+- Expanding a project loads its sessions; `+` on a project header starts a new session there
 - Rename sessions, export to HTML
+- Search filters titles across all projects, including collapsed projects and older sessions. With two or more characters, it also searches saved message text and shows up to 30 matching sessions, each with the first snippet and a match count capped at three. Matches are literal and case-insensitive. Clearing the search restores the usual ten-row/show-all view; ordinary browsing still loads session lists only on demand (or for favourites).
+- Opening a search match uses the normal session controls: shared agents attach, terminal-owned sessions open read-only, and other sessions resume through the server's ownership checks.
 
 ### Mobile Support
 
@@ -172,11 +239,15 @@ machine. Pass `--bind 127.0.0.1` to restrict an instance to local access.
 - Slimmed header, model picker stays accessible
 - Larger touch targets and font sizes optimized for mobile
 - Auto-reconnect WebSocket on return from background
-- PWA: installable as a standalone app on iOS, Android, and macOS
+- Fullscreen by default on touch devices: entered on the first tap (browsers require a gesture); turning it off in Settings is remembered. iPhone Safari has no page fullscreen, so Settings suggests adding Tau to the Home Screen instead
+- The layout follows the visible viewport, so the composer and latest message stay above the on-screen keyboard, including in fullscreen where browsers do not resize the page
+- PWA: installable as a fullscreen app (standalone where fullscreen is unsupported, e.g. iOS)
 
 ### Themes
 
-Six built-in themes: Dusk (clean neutral dark, default), Dawn (warm blue dark), Midnight (OLED black), Clean (Apple-style light with cyan-blue accents), Terracotta (warm light), Sage (warm olive-green). All with frosted glass header and input area.
+Chat uses messenger-style bubbles: your messages on the right and grouped agent activity on the left, each with a tail. Tool details live inside their assistant block.
+
+Seven built-in themes: Telegram (default: blue header, white agent bubbles, light blue user bubbles on a faint doodle wallpaper), Dusk (clean neutral dark), Dawn (warm blue dark), Midnight (OLED black), Clean (Apple-style light with cyan-blue accents), Terracotta (warm light), Sage (warm olive-green). Only an explicit choice in Settings is remembered; otherwise Telegram applies.
 
 ## Configuration
 
@@ -185,41 +256,50 @@ Six built-in themes: Dusk (clean neutral dark, default), Dawn (warm blue dark), 
 | Flag                                  |                                                  Description |
 | ------------------------------------- | -----------------------------------------------------------: |
 | `--open`                              |                 Open the URL in the default browser on start |
-| `--port` / `TAU_PORT`                 |                                Server port (default: `3001`) |
-| `--host` / `TAU_HOST`                 |                            Bind address (default: `0.0.0.0`) |
+| `--port` / `TAU_PORT`                 |                                 HTTPS port (default: `3443`) |
+| `--host` / `TAU_HOST`                 |                      HTTPS bind address (default: `127.0.0.1`) |
+| `--http-port` / `TAU_HTTP_PORT`       |               Loopback-only plain HTTP port (default: `3001`) |
 | `--projects-dir` / `TAU_PROJECTS_DIR` | Directory scanned for project chips in the new-session modal; also the base for relative paths typed in the project field |
-| `--pi-command` / `TAU_PI_COMMAND`     |                     Pi executable that Tau runs (default: `pi`) |
+| `--pi-command` / `TAU_PI_COMMAND`     |                     Absolute supported release Pi (default: installed SDK) |
 
 ### Environment variables
 
 | Variable           |     Default |                                              Description |
 | ------------------ | ----------: | -------------------------------------------------------: |
-| `TAU_PORT`         |      `3001` |                                              Server port |
-| `TAU_HOST`         |   `0.0.0.0` |                                             Bind address |
+| `TAU_PORT`         |      `3443` |                                               HTTPS port |
+| `TAU_HOST`         | `127.0.0.1` |                                       HTTPS bind address |
+| `TAU_HTTP_PORT`    |      `3001` |                            Loopback-only plain HTTP port |
+| `TAU_HOSTNAMES`    |    _(none)_ |      Comma-separated extra certificate/browser host names |
 | `TAU_PROJECTS_DIR` |    _(none)_ | Directory scanned for project chips in the new-tab modal |
-| `TAU_PI_COMMAND`   |        `pi` |                              Pi executable that Tau runs |
+| `TAU_PI_COMMAND`   | _(installed SDK)_ |                              Pi executable that Tau runs |
 | `TAU_STATIC_DIR`   | _(bundled)_ |                               Override static files path |
-| `TAU_USER`         |    _(none)_ |                                 HTTP Basic Auth username |
-| `TAU_PASS`         |    _(none)_ |                                 HTTP Basic Auth password |
+| `TAU_USER`         |    _(none)_ |                  Required nonempty Basic Auth username |
+| `TAU_PASS`         |    _(none)_ |                  Required nonempty Basic Auth password |
 | `TAU_COOKIE_SECRET`| _(generated)_ |            Secret that signs session cookies (optional) |
 | `TAU_INTERACTION_DIAGNOSTICS` | _(off)_ | Set to `1` to log dialog/Abort lifecycle IDs, reasons, and timestamps to stderr |
 
-Tau also reads matching values from `~/.pi/agent/settings.json` under the `tau` key (`host`, `port`, `projectsDir`, `user`, `pass`, `authEnabled`, `cookieSecret`).
+Tau also reads matching values from `~/.pi/agent/settings.json` under the `tau` key (`host`, `port`, `httpPort`, `hostnames` (array), `projectsDir`, `user`, `pass`, `authEnabled`, `cookieSecret`).
 
-### Using a different Pi command
+### Selecting the release Pi
 
-To run a Pi fork or wrapper instead of `pi`, pass `--pi-command` or set
-`TAU_PI_COMMAND` (the flag wins). The value is a single executable with no
-arguments. If it keeps its config outside `~/.pi/agent`, also set
-`PI_CODING_AGENT_DIR`.
+`--pi-command` overrides `TAU_PI_COMMAND`. The value must be one absolute
+executable belonging to the supported Pi package, not a shell command, PATH name
+or arbitrary wrapper. The default resolves this installation's Pi SDK entry.
+`PHIMACS_PI_VERSION` and `PHIMACS_PI_SHA256` enforce release metadata. Every launch,
+model listing and export rechecks the selected host; mismatch refuses before I/O.
+Set `PI_CODING_AGENT_DIR` to choose a separate state directory.
 
-```bash
-pi-tau-web-server --pi-command pi-bolt
+```sh
+pi-tau-web-server --pi-command /absolute/release/node_modules/.bin/pi
 ```
 
 ### Authentication
 
-Tau Web Server supports optional HTTP Basic Auth. Set credentials in `~/.pi/agent/settings.json` or via environment variables, then toggle "Require login" in Tau Settings.
+Tau Web Server uses HTTP Basic Auth by default and has **no default credentials**.
+Set a nonempty username and password in `~/.pi/agent/settings.json` or with
+`TAU_USER` and `TAU_PASS`. Environment values override settings, including empty
+strings: an empty or missing credential causes startup to fail before either
+listener opens, rather than silently disabling authentication.
 
 ```json
 {
@@ -230,35 +310,148 @@ Tau Web Server supports optional HTTP Basic Auth. Set credentials in `~/.pi/agen
 }
 ```
 
-Both HTTP and WebSocket connections are gated when enabled. `/api/health` remains open for monitoring.
+To deliberately run without authentication, set `"authEnabled": false` under
+`tau` in settings.json. This is the only startup opt-out; empty credential values
+are not an opt-out. This exposes the UI and session-spawning API to everyone who
+can reach either listener, so choose the bind address/network access accordingly.
+With credentials configured, Tau Settings can still toggle "Require login" and
+persists that choice. Without credentials, enabling it is rejected: configure
+credentials and restart first. Credential changes take effect on the next restart.
+
+Both HTTP and WebSocket connections are gated when enabled. Only the exact path `/api/health` remains open for monitoring.
 
 After the first successful Basic login, the server sets a signed `HttpOnly` session cookie and accepts it in place of the Authorization header. This keeps mobile browsers (notably iOS Safari and the installed PWA, which evict cached Basic credentials whenever you switch apps) from re-prompting for the password every time you return to the app. The cookie is scoped to the browser session — killing the browser ends it and the Basic prompt appears again — and the token inside it expires after 12 hours of inactivity, renewing itself while the app is in use. Changing the password invalidates every outstanding cookie on all devices, and deleting the auto-generated `cookieSecret` from `~/.pi/agent/settings.json` force-logs-out all devices at once.
 
+## Orchestration host
+
+Phimacs orchestration can start workers through this web host. Create/resume
+accept validated `sessionFile`, `args` and `env` overrides; session-opening flags
+inside `args` are rejected in favor of the exact file field. A worker additionally
+requires `PHIMACS_PARENT_TASK` with its parent's exact process/start/boot identity
+and task ID. Workers remain parent-task-owned; closing a frontend does not promote
+them into independent roots. Tau has no host-native shell panels.
+
+The private `<agentDir>/tau/server.json` advertises the loopback orchestration
+endpoint and credential-free HTTPS browser URLs. It is not a writer lock.
+Terminal registry owners are shown read-only. A common atomic claim protects all
+cooperating managed opens; `force:true` cannot bypass a live or uncertain native,
+unsupported or RPC owner. Raw Pi/internal storage paths outside the managed API
+remain an explicit upstream safety limitation.
+
+## Shared agents (pimux)
+
+All Tau roots use compiled `@phimacs/pimux` protocol 2. Create/resume have one
+attach-or-start path: an existing tab, a compatible existing runtime, or an
+atomically claimed new runtime. They wait for committed companion readiness and
+an authoritative snapshot/replay/live boundary, not a listening socket or timer.
+Failed/uncertain startup retains operation evidence; it never triggers a second
+writer. A failed frontend attach after commitment leaves the agent discoverable.
+
+- **Discovery:** `GET /api/agents` and WebSocket `pimux_agents` list shared agents,
+  grouping workers under parents and sorting blocked agents first. Unsupported
+  or unreachable live owners are refusals, not permission to spawn.
+- **Attach:** `POST /api/live-sessions/attach {"muxId":"…"}` opens an equal view.
+  Every selection/reconnect requests a complete snapshot. Only its own
+  `pimux_live` publishes a generation; superseded partial sequences are discarded.
+  File-based reconnect refuses a replacement snapshot serving another conversation.
+  Peer reconnects preserve the selected runtime unless the user selects another view.
+- **Close:** the tab × and palette **Close agent** use
+  `POST /api/live-sessions/:id/stop`; `POST /api/agents/:muxId/stop` addresses a
+  known runtime directly. Both accept `{operationId?}` without a confirmation flag,
+  including while idle or busy. An identity-bound `receipt.state:"stopped"` means
+  the owned Pi actually exited. Retained receipts reconcile lost acknowledgements
+  against that runtime, not a new owner. Root exit removes every browser view;
+  failures retain the tab and report an error. No client signals a raw Pi PID.
+  Worker Close verifies its exact pending parent-task binding and advertised
+  `/worker-cancel` extension before requesting cancellation. It requires matching
+  `complete` evidence from `pi-orchestration/worker-task` plus the runtime receipt.
+  Dispatch, runtime exit and pending or failed task cleanup do not remove the view.
+  Reads use the captured socket namespace, including on reconnect. A disconnected
+  worker without terminal evidence refuses Close immediately and asks for reconnect.
+  Pending Close blocks ordinary prompts and local queue dispatch without discarding
+  input; cancellation remains available. Named Close errors survive navigation.
+  Successful task cleanup preserves abnormal worker exit diagnostics in both the
+  stop response and retirement broadcast.
+- **Frontend loss:** browser closure and Tau shutdown only disconnect. Internal
+  `DELETE /api/live-sessions/:id` disconnects without stopping its runtime;
+  worker cleanup retains an unavailable view until final task cleanup is acknowledged.
+  It is not an alternative user-facing Close action. Zero-client runtimes continue
+  accepted work and may incur usage. A lost runtime socket retains an unavailable
+  tab with an error, never claims Pi exited, and never infers a restart or replay.
+- **Input:** busy sends steer; all clients see authoritative Pi-held queues and
+  first-answer dialog closure. New session replaces the conversation everywhere.
+  Drafts/images/local pending input are quarantined under agent/file/leaf identity
+  when context changes. Explicit Reuse is required; uncertain input is never resent.
+- **Input context:** each complete runtime snapshot supplies an opaque
+  `inputContext:{sessionFile,leafId,contextId}`. Tau publishes that object unchanged
+  as `session.runtimeContext`, with `session.inputReady`. A browser action captures
+  `{agentId,file,leafId,runtimeContext}` when it starts and supplies it as the RPC
+  `inputContext`. HTTP and WebSocket handlers reject missing, unknown or replaced
+  contexts; they never substitute a newer expectation. The owning router checks
+  the captured object again as `pimuxContext` before forwarding a mutation to Pi.
+  Ordinary streaming appends and same-branch refreshes retain the anchor, so valid
+  steering does not depend on a snapshot generation or the latest appended leaf.
+  A failed/pending snapshot disables mutation; reads and explicit Stop stay
+  available. Rejected or uncertain instructions remain requester-local for review,
+  never automatic replay.
+- **Queue recovery:** clearing/aborting affects the global Pi queue, including
+  input from other clients. Only the requester receives acknowledged recovered
+  text, bound to its original context. Other views never claim per-client recovery.
+- **Capabilities:** tree navigation is offered only when the runtime advertises its
+  owning command. Root operations are not privileged by which frontend created it.
+  Workers retain their session-replacement restrictions.
+- **Files:** rename uses the live owning Pi; live deletion refuses. Stopped-file
+  reads/mutations/exports use short common ownership leases. Live HTML export uses
+  Pi's owning in-memory exporter so the exact selected leaf and full tree survive.
+- **Refresh:** an attached view refreshes its authoritative runtime boundary; it
+  never reopens a live session file. The selected branch is the runtime's branch.
+
+`started:true` identifies a newly launched runtime, not a newly created view.
+Failure `childStopped` is only request-local evidence: `false` after a committed
+attachment failure, and never proof that every possible owner is gone. Timeouts,
+sent signals, removed tabs and ordinary HTTP errors do not authorize rollback.
+
 ## How it works
 
-```
-┌─────────────┐     ┌──────────────────────────┐     ┌───────────────────────────┐
-│  Browser    │◄───►│  Tau Web Server          │◄───►│  pi --mode rpc            │
-│  (Tau UI)   │     │  HTTP + WebSocket +      │     │  child session 1          │
-│             │     │  LiveSessionManager      │     ├───────────────────────────┤
-│             │     │  (Node.js)               │     │  pi --mode rpc            │
-│             │     │                          │     │  child session 2          │
-│             │     │                          │     ├───────────────────────────┤
-│             │     │                          │     │  pi --mode rpc            │
-│             │     │                          │     │  child session (N)        │
-└─────────────┘     └──────────────────────────┘     └───────────────────────────┘
+```text
+Browser -> Tau --------socket--+-> detached pimux -> exact release Pi (RPC)
+Emacs -> Pilish -------socket--+
 ```
 
-The browser connects to Tau Web Server over WebSocket (and HTTP for history and API calls). Tau manages a pool of `PiRpcSession` instances, each of which spawns a `pi --mode rpc` subprocess. Communication with Pi is over JSON line-delimited RPC via stdin/stdout. Closing an in-page Tau tab sends a DELETE request that terminates the corresponding Pi child. Shutting down Tau terminates all managed children.
+Tau holds view state and bounded browser queues; pimux owns process lifetime,
+claims, snapshots and stop. There is no central agent scheduler or creator role.
 
 For diagnosis, `TAU_INTERACTION_DIAGNOSTICS=1` logs dialog creation/resolution and Abort sent/acknowledged/timed-out events. These opt-in records exclude command arguments, dialog text, credentials, and conversation content. Live request IDs are never stored in the conversation history or restored after a Pi process restart.
 
 ## Development
 
-### Prerequisites
+### Prerequisites and explicit checks
 
-- [Pi](https://github.com/earendil-works/pi) must be installed (`pi` on `PATH`)
-- Node.js and npm
+Use Node 24 and the locked local input archives, not sibling source checkouts or
+developer globals. Keep browser assets and the optional tree extension in packs.
+
+```sh
+npm ci --ignore-scripts
+npm run typecheck
+node_modules/.bin/tsc -p tsconfig.server.json
+node_modules/.bin/tsc -p tsconfig.public.json
+node scripts/copy-katex.ts
+node scripts/copy-highlight.ts
+chmod u+x bin/tau.js
+node --test test/vendor-inputs.test.ts test/close-worker.test.ts test/runtime-recovery.test.ts test/detached-runtime.test.ts test/pimux-attach.test.ts test/http-routes.test.ts
+node --test test/e2e/close-agent.e2e.ts test/e2e/shared-input-safety.e2e.ts test/e2e/contextual-input.e2e.ts
+node --test test/voice.test.ts test/voice-route.test.ts
+# Explicit native lanes use isolated real Pi runtimes with faux inference:
+node --test test/detached-runtime-native.test.ts test/e2e/worker-close-native.e2e.ts
+node --test test/e2e/pimux-share.e2e.ts
+```
+
+Focused backend/browser tests use synthetic sessions, fake peers or faux providers,
+private HOME/agent/discovery/claim roots and disposable loopback servers. Never
+point them at a personal daemon, account, device socket or live session. The
+cross-frontend release matrix also uses a separately provisioned reference Emacs;
+a personal Emacs cache is not clean-install evidence. See
+[the candidate input record](docs/phimacs-candidate.md).
 
 ## License
 

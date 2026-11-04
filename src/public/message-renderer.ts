@@ -1,62 +1,27 @@
-/**
- * Message Renderer - Renders chat messages with markdown support
- */
-
+/** Markdown message and assistant-step rendering. Grouping lives in AssistantBlocks. */
 import { renderMarkdown, renderUserMarkdown } from './markdown.js';
 import { imageSource } from './image-source.js';
 
-type RenderedImage = {
-  data: string;
-  mimeType?: string;
-  url?: string;
-};
-
-type MessageContentBlock = {
-  type?: string;
-  text?: string;
-  thinking?: string;
-};
-
-type RenderMessage = {
-  id?: string;
-  content?: string | MessageContentBlock[];
-  images?: RenderedImage[];
-  usage?: {
-    cost?: { total?: number };
-    [key: string]: unknown;
-  };
-  error?: string;
-};
+import type { AssistantStep } from './app-types.js';
+type RenderedImage = { data: string; mimeType?: string; url?: string };
+type UserMessage = { content?: string; images?: RenderedImage[] };
 
 export class MessageRenderer {
   container: HTMLElement;
-  isNearBottom: boolean;
-  /** Text of history thinking blocks that have not been opened yet. */
-  private unopenedThinking = new WeakMap<Element, string>();
+  isNearBottom = true;
+  /** Streamed text not drawn yet: a delta only grows this, and the DOM follows once per frame. */
+  private pendingSteps = new Map<HTMLElement, string>();
+  private stepFrame = 0;
 
   constructor(container: HTMLElement) {
     this.container = container;
-    this.isNearBottom = true;
-
-    // One handler opens and closes every thinking block in the conversation.
-    this.container.addEventListener('click', (event) => {
-      const toggle = (event.target as Element | null)?.closest('.thinking-toggle');
-      if (!toggle || !this.container.contains(toggle)) return;
-      const content = toggle.nextElementSibling;
-      if (content) this.fillThinking(content);
-      content?.classList.toggle('expanded');
-      toggle.classList.toggle('expanded');
-    });
-
-    // Track scroll position for smart auto-scroll
     this.container.addEventListener('scroll', () => {
-      const threshold = 100;
-      this.isNearBottom =
-        this.container.scrollHeight - this.container.scrollTop - this.container.clientHeight < threshold;
+      this.isNearBottom = this.container.scrollHeight - this.container.scrollTop - this.container.clientHeight < 100;
     });
   }
 
   clear() {
+    this.pendingSteps.clear();
     this.container.innerHTML = '';
   }
 
@@ -65,7 +30,7 @@ export class MessageRenderer {
       <div class="welcome">
         <div class="welcome-icon"><img src="icons/tau-192.png" alt="τ" class="tau-icon-welcome"></div>
         <p>Welcome to Tau</p>
-        <p class="hint">Type a message below to start chatting with Pi, or select a session from the sidebar.</p>
+        <p class="hint">Open an agent or a session from the sidebar, or create a Tau tab with +.</p>
         <div class="shortcuts-hint">
           <span>/ Focus input</span>
           <span>Esc Abort</span>
@@ -84,200 +49,69 @@ export class MessageRenderer {
     if (first?.classList.contains('welcome')) first.remove();
   }
 
-  renderUserMessage(message: RenderMessage, isHistory = false, target: ParentNode = this.container) {
+  renderUserMessage(message: UserMessage, isHistory = false, target: ParentNode = this.container) {
     this.removeWelcome();
-
     const div = document.createElement('div');
     div.className = `message user${isHistory ? ' history' : ''}`;
-
-    let imagesHtml = '';
-    if (message.images && message.images.length > 0) {
-      imagesHtml = '<div class="message-images">' +
-        message.images.map(img => {
-          const src = imageSource(img);
-          // Images below the visible part load only when scrolled to.
-          return src ? `<img class="message-image" src="${this.escapeAttribute(src)}" alt="Attached image" loading="lazy" decoding="async" />` : '';
-        }).join('') +
-        '</div>';
-    }
-
-    div.innerHTML = `
-      <div class="message-content">${imagesHtml}${renderUserMarkdown(message.content as string)}</div>
-      <button class="message-copy-btn" aria-label="Copy message"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
-    `;
-    this._setupCopyBtn(div);
+    const imagesHtml = message.images?.length ? '<div class="message-images">' + message.images.map(img => {
+      const src = imageSource(img);
+      // Images below the visible part load only when scrolled to.
+      return src ? `<img class="message-image" src="${src.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')}" alt="Attached image" loading="lazy" decoding="async" />` : '';
+    }).join('') + '</div>' : '';
+    div.innerHTML = `<div class="message-content">${imagesHtml}${renderUserMarkdown(message.content || '')}</div>`;
+    this.setupCopyButton(div);
     target.appendChild(div);
     if (!isHistory) this.scrollToBottom();
   }
 
-  renderAssistantMessage(message: RenderMessage, isStreaming = false, isHistory = false, target: ParentNode = this.container) {
-    this.removeWelcome();
-
-    const div = document.createElement('div');
-    div.className = `message assistant${isHistory ? ' history' : ''}`;
-    div.dataset.messageId = message.id || 'streaming';
-
-    let contentHtml = '';
-    let usageHtml = '';
-    // History thinking blocks start closed and get their text when opened,
-    // because most are never opened.
-    const thinkingTexts: string[] = [];
-
-    if (typeof message.content === 'string') {
-      contentHtml = isStreaming ? this.escapeHtml(message.content) : renderMarkdown(message.content);
-    } else if (Array.isArray(message.content)) {
-      for (const block of message.content) {
-        if (block.type === 'text') {
-          contentHtml += isStreaming ? this.escapeHtml(block.text) : renderMarkdown(block.text || '');
-        } else if (block.type === 'thinking') {
-          contentHtml += this.renderThinkingBlock(block.thinking, isHistory);
-          thinkingTexts.push(block.thinking || '');
-        }
-      }
+  renderAssistantStep(step: AssistantStep, streaming = false) {
+    const element = document.createElement('div');
+    element.className = 'assistant-step';
+    const content = document.createElement('div');
+    content.className = 'assistant-step-content';
+    if (step.type === 'thinking') {
+      content.classList.add('thinking-block');
+      const label = document.createElement('div');
+      label.className = 'thinking-label';
+      label.textContent = 'Thinking';
+      const thinking = document.createElement('div');
+      thinking.className = 'thinking-content';
+      content.append(label, thinking);
     }
-
-    // Usage/cost info
-    if (message.usage && message.usage.cost) {
-      const cost = message.usage.cost.total;
-      if (cost && cost > 0) {
-        usageHtml = `<span class="message-usage">$${cost.toFixed(4)}</span>`;
-      }
-    }
-
-    const streamingClass = isStreaming ? ' streaming' : '';
-    const errorHtml = message.error ? this.messageErrorHtml(message.error) : '';
-
-    div.innerHTML = `
-      <div class="message-content${streamingClass}">${contentHtml}${errorHtml}</div>
-      ${usageHtml}
-      ${!isStreaming ? '<button class="message-copy-btn" aria-label="Copy message"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>' : ''}
-    `;
-
-    if (isHistory && thinkingTexts.length > 0) {
-      div.querySelectorAll(':scope > .message-content > .thinking-block > .thinking-content')
-        .forEach((element, index) => this.unopenedThinking.set(element, thinkingTexts[index]));
-    }
-    if (!isStreaming) this._setupCopyBtn(div);
-    target.appendChild(div);
-    if (!isHistory) this.scrollToBottom();
-
-    return div;
+    element.append(content);
+    this.updateAssistantStep(element, step.text, streaming);
+    return element;
   }
 
-  private fillThinking(content: Element) {
-    const text = this.unopenedThinking.get(content);
-    if (text === undefined) return;
-    this.unopenedThinking.delete(content);
-    content.textContent = text;
-  }
-
-  /** A closed thinking block. With `textOnOpen`, its text is filled in when it first opens. */
-  renderThinkingBlock(thinking?: string, textOnOpen = false) {
-    return `<div class="thinking-block">
-<div class="thinking-toggle">
-<span class="chevron"><svg width="8" height="8" viewBox="0 0 8 8" fill="currentColor"><path d="M2 1l4 3-4 3z"/></svg></span>
-<span class="thinking-label"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M12 5v13"/><path d="M6.5 9h11"/><path d="M7 13h10"/></svg> Thinking</span>
-</div>
-<div class="thinking-content">${textOnOpen ? '' : this.escapeHtml(thinking)}</div>
-</div>`;
-  }
-
-  updateStreamingThinking(messageElement: HTMLElement, thinking: string) {
-    let thinkingDiv = messageElement.querySelector('.streaming-thinking');
-    if (!thinkingDiv) {
-      const contentDiv = messageElement.querySelector('.message-content');
-      if (!contentDiv) return;
-      thinkingDiv = document.createElement('div');
-      thinkingDiv.className = 'thinking-block streaming-thinking';
-      thinkingDiv.innerHTML = `
-        <div class="thinking-toggle expanded">
-          <span class="chevron"><svg width="8" height="8" viewBox="0 0 8 8" fill="currentColor"><path d="M2 1l4 3-4 3z"/></svg></span>
-          <span class="thinking-label"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M12 5v13"/><path d="M6.5 9h11"/><path d="M7 13h10"/></svg> Thinking</span>
-        </div>
-        <div class="thinking-content expanded"></div>`;
-      contentDiv.prepend(thinkingDiv);
-    }
-    const contentEl = thinkingDiv.querySelector('.thinking-content');
-    if (contentEl) {
-      contentEl.textContent = thinking;
-      this.scrollToBottom();
-    }
-  }
-
-  updateStreamingMessage(messageElement: HTMLElement, content: string) {
-    const contentDiv = messageElement.querySelector('.message-content');
-    if (!contentDiv) return;
-
-    // Render markdown incrementally so headings, lists, inline formatting,
-    // and other block elements appear live — not just after streaming ends.
-    const rendered = renderMarkdown(content);
-    const thinkingBlock = contentDiv.querySelector('.streaming-thinking');
-
-    if (thinkingBlock) {
-      // Keep the thinking block; update only the text portion
-      let textNode = contentDiv.querySelector('.streaming-text');
-      if (!textNode) {
-        // First time text arrives after thinking started:
-        // remove any stale text nodes that were placed directly in contentDiv
-        // before the thinking block existed.
-        let node = thinkingBlock.nextSibling;
-        while (node) {
-          const next = node.nextSibling;
-          node.remove();
-          node = next;
-        }
-        textNode = document.createElement('div');
-        textNode.className = 'streaming-text';
-        contentDiv.appendChild(textNode);
-      }
-      textNode.innerHTML = rendered;
-    } else {
-      contentDiv.innerHTML = rendered;
-    }
-    this.scrollToBottom();
+  /** Latest text of a step, drawn or not. */
+  assistantStepText(element: HTMLElement) {
+    return this.pendingSteps.get(element) ?? element.querySelector<HTMLElement>('.assistant-step-content')?.dataset.rawText ?? '';
   }
 
   /**
-   * Replace the streaming DOM with the final render of `thinking` and the
-   * markdown `text`. The caller passes both, so a message without text ends
-   * with only its thinking block.
+   * Records a streamed update and draws it on the next frame. Drawing renders
+   * the whole step, so doing it per delta makes a long reply quadratic and a
+   * phone fall ever further behind the stream.
    */
-  finalizeStreamingMessage(messageElement: HTMLElement, usage: RenderMessage['usage'] | null = null, thinking = '', text = '') {
-    const contentDiv = messageElement.querySelector('.message-content');
-    if (contentDiv) {
-      contentDiv.classList.remove('streaming');
+  queueAssistantStep(element: HTMLElement, text: string) {
+    this.pendingSteps.set(element, text);
+    if (this.stepFrame) return;
+    this.stepFrame = requestAnimationFrame(() => {
+      this.stepFrame = 0;
+      for (const [step, pending] of this.pendingSteps) this.updateAssistantStep(step, pending, true);
+      this.scrollToBottom();
+    });
+  }
 
-      // Final render — catches edge cases like code blocks whose closing
-      // fence arrived on the very last delta.
-      let html = '';
-      if (thinking) {
-        html += this.renderThinkingBlock(thinking);
-      }
-      html += renderMarkdown(text);
-      contentDiv.innerHTML = html;
-    }
-
-    // Add copy button after streaming finishes
-    if (!messageElement.querySelector('.message-copy-btn')) {
-      const btn = document.createElement('button');
-      btn.className = 'message-copy-btn';
-      btn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
-      messageElement.appendChild(btn);
-      this._setupCopyBtn(messageElement);
-    }
-
-    // Add usage info if available
-    if (usage && usage.cost) {
-      const total = usage.cost.total;
-      if (total && total > 0) {
-        if (!messageElement.querySelector('.message-usage')) {
-          const span = document.createElement('span');
-          span.className = 'message-usage';
-          span.textContent = `$${total.toFixed(4)}`;
-          messageElement.appendChild(span);
-        }
-      }
-    }
+  updateAssistantStep(element: HTMLElement, text: string, streaming = false) {
+    this.pendingSteps.delete(element);
+    const content = element.querySelector<HTMLElement>('.assistant-step-content')!;
+    content.dataset.rawText = text;
+    content.classList.toggle('streaming', streaming);
+    const thinking = content.querySelector('.thinking-content');
+    if (thinking) thinking.textContent = text;
+    else content.innerHTML = renderMarkdown(text);
+    if (!streaming) this.setupCopyButton(element);
   }
 
   renderSystemMessage(text: string) {
@@ -288,16 +122,20 @@ export class MessageRenderer {
     this.scrollToBottom();
   }
 
-  /** Add a provider error inside a finished assistant message. */
-  appendMessageError(messageElement: HTMLElement, errorMessage: string) {
-    const contentDiv = messageElement.querySelector('.message-content');
-    if (!contentDiv || contentDiv.querySelector('.message-error')) return;
-    contentDiv.insertAdjacentHTML('beforeend', this.messageErrorHtml(errorMessage));
-    this.scrollToBottom();
-  }
-
-  messageErrorHtml(errorMessage: string) {
-    return `<div class="message-error"><div class="message-error-title">Request failed</div><div class="message-error-detail">${this.escapeHtml(errorMessage)}</div></div>`;
+  /** A final provider failure is a visible activity step, never thinking text. */
+  renderAssistantError(errorMessage: string) {
+    const element = this.renderAssistantStep({ type: 'text', text: '' });
+    const error = document.createElement('div');
+    error.className = 'message-error';
+    const title = document.createElement('div');
+    title.className = 'message-error-title';
+    title.textContent = 'Request failed';
+    const detail = document.createElement('div');
+    detail.className = 'message-error-detail';
+    detail.textContent = errorMessage;
+    error.append(title, detail);
+    element.querySelector('.assistant-step-content')!.append(error);
+    return element;
   }
 
   renderError(errorMessage: string) {
@@ -308,19 +146,28 @@ export class MessageRenderer {
     this.scrollToBottom();
   }
 
-  _setupCopyBtn(messageEl: HTMLElement) {
-    const btn = messageEl.querySelector('.message-copy-btn');
-    if (!btn) return;
+  /** News about the session, not a failure. */
+  renderNotice(message: string) {
+    const div = document.createElement('div');
+    div.className = 'system-message';
+    div.textContent = message;
+    this.container.appendChild(div);
+    this.scrollToBottom();
+  }
+
+  private setupCopyButton(messageEl: HTMLElement) {
+    if (messageEl.querySelector('.message-copy-btn')) return;
+    const btn = document.createElement('button');
+    btn.className = 'message-copy-btn';
+    btn.setAttribute('aria-label', 'Copy message');
+    btn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
     btn.addEventListener('click', () => {
-      const content = messageEl.querySelector('.message-content');
-      if (!content) return;
-      content.querySelectorAll('.thinking-content').forEach(element => this.fillThinking(element));
-      const text = content.textContent;
-      // Fallback for non-HTTPS (LAN access)
-      const copyText = (t: string) => {
-        if (navigator.clipboard) return navigator.clipboard.writeText(t);
+      const content = messageEl.querySelector('.message-content, .assistant-step-content')!;
+      const text = content.textContent || '';
+      const copyText = (value: string) => {
+        if (navigator.clipboard) return navigator.clipboard.writeText(value);
         const ta = document.createElement('textarea');
-        ta.value = t;
+        ta.value = value;
         ta.style.cssText = 'position:fixed;left:-9999px';
         document.body.appendChild(ta);
         ta.select();
@@ -330,28 +177,15 @@ export class MessageRenderer {
       };
       copyText(text).then(() => {
         btn.classList.add('copied');
-        setTimeout(() => {
-          btn.classList.remove('copied');
-        }, 1500);
+        setTimeout(() => btn.classList.remove('copied'), 1500);
       });
     });
-  }
-
-  escapeAttribute(text: string) {
-    return this.escapeHtml(text).replace(/"/g, '&quot;');
-  }
-
-  escapeHtml(text: unknown) {
-    const div = document.createElement('div');
-    div.textContent = String(text ?? '');
-    return div.innerHTML;
+    messageEl.append(btn);
   }
 
   scrollToBottom() {
     if (this.isNearBottom) {
-      requestAnimationFrame(() => {
-        this.container.scrollTop = this.container.scrollHeight;
-      });
+      requestAnimationFrame(() => { this.container.scrollTop = this.container.scrollHeight; });
     }
   }
 }

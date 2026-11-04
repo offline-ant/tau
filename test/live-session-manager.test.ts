@@ -1,16 +1,24 @@
-import { test } from 'node:test';
+import { runtimeEnvironment, cwd } from './runtime-environment.ts';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { EventEmitter } from 'node:events';
-import { PassThrough } from 'node:stream';
+import { flushIo } from './fake-pi.ts';
+import fs from 'node:fs';
+import { FakeRuntimeLauncher } from './runtime-launcher.ts';
+import { until } from './fake-pimux.ts';
+import { RuntimeOperationError } from '@phimacs/pimux/runtime';
+import { acquireClaim, releaseClaim } from '@phimacs/pimux/ownership';
+import { readProcessIdentity } from '@phimacs/pimux/process-identity';
+import type { JsonRecord } from '../src/server/types.ts';
 import { WebSocket } from 'ws';
 
 // The built server module is a plain JS artifact without declarations; the
 // old require() call typed these as any, so keep that contract here.
-const { LiveSessionManager, PiRpcSession, _setSpawnPiForTest } = (await import('../bin/tau.js')) as any;
+import * as tau from '../bin/tau.js';
+const { LiveSessionManager, PiRpcSession } = tau as any;
 import type { TestContext } from 'node:test';
+after(() => fs.rmSync(runtimeEnvironment.root, { recursive: true, force: true }));
 
 interface StubClient {
   readyState: number;
@@ -146,156 +154,141 @@ test('shutdown terminates all managed sessions and clears the map', async () => 
   assert.equal(s1.calls.terminatedArgs[0], 'server_shutdown');
 });
 
-// A realistic fake `pi` child: real streams so start()'s setEncoding/on('data')
-// wiring works, and an EventEmitter so on('error')/on('exit') resolve startup.
-function makeFakeChild() {
-  const child: any = new EventEmitter();
-  child.stdin = new PassThrough();
-  child.stdout = new PassThrough();
-  child.stderr = new PassThrough();
-  child.pid = 12345;
-  child.kill = (sig: string) => { child.killedSignal = sig; };
-  return child;
+test('shutdown waits for every cleanup and reports failures without dropping uncertain children', async () => {
+  const mgr = new LiveSessionManager();
+  const failed = fakeSession('failed');
+  failed.terminate = async () => { throw new Error('exit not confirmed'); };
+  const delayed = fakeSession('delayed');
+  let finish: () => void = () => { throw new Error('cleanup not started'); };
+  delayed.terminate = () => new Promise<void>((resolve) => { finish = resolve; });
+  mgr.sessions.set(failed.id, failed);
+  mgr.sessions.set(delayed.id, delayed);
+  let settled = false;
+  const shuttingDown = assert.rejects(mgr.shutdown(), /1 view disconnect\(s\) unconfirmed/).then(() => { settled = true; });
+  await flushIo();
+  assert.equal(settled, false);
+  finish();
+  await shuttingDown;
+  assert.equal(mgr.get(failed.id), failed);
+  assert.equal(mgr.get(delayed.id), undefined);
+});
+
+function fixture(t: TestContext) {
+  const launcher = new FakeRuntimeLauncher();
+  const manager = new LiveSessionManager({ start: launcher.start });
+  t.after(async () => { await manager.shutdown().catch(() => {}); await launcher.close(); });
+  return { launcher, manager };
 }
 
-test('create() resolves cwd, stores the session, and broadcasts live_session_created', async (t: TestContext) => {
-  // Mock the startup setTimeouts in start() so the test does not wait on
-  // wall-clock time for the 100ms startup grace.
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  const child = makeFakeChild();
-  _setSpawnPiForTest(() => child);
-  t.after(() => _setSpawnPiForTest(null));
-
-  const mgr = new LiveSessionManager();
+test('create() publishes a session only after managed commitment and the authoritative socket boundary', async t => {
+  const { launcher, manager } = fixture(t);
+  let ready!: () => void;
+  launcher.gate = new Promise(resolve => { ready = resolve; });
+  launcher.configure = mux => { mux.extraSnapshot = { model: { provider: 'fx', id: 'deep' }, thinkingLevel: 'high' }; };
   const client = openClient();
-  mgr.addClient(client);
-
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-create-'));
-  const createP = mgr.create({ cwd, model: 'openai/gpt-5.5' });
-  // advance past start()'s 100ms startup wait so it resolves
-  t.mock.timers.tick(100);
-  const session = await createP;
-
-  assert.equal(mgr.get(session.id), session);
-  assert.equal(session.cwd, path.resolve(cwd));
-  assert.equal(session.modelSpec, 'openai/gpt-5.5');
-  assert.equal(session.pid, 12345);
-  // the live_session_created broadcast is delivered to the connected client
-  assert.equal(client.sent.length, 1);
-  const msg = JSON.parse(client.sent[0]);
-  assert.equal(msg.type, 'live_session_created');
-  assert.equal(msg.session.id, session.id);
-  // The server canonicalizes the spec into a full {provider,id} object.
-  assert.deepEqual(msg.session.model, { provider: 'openai', id: 'gpt-5.5' });
-  assert.equal(msg.session.modelLabel, 'openai/gpt-5.5');
+  manager.addClient(client);
+  const creating = manager.create({ cwd });
+  await until(() => launcher.calls.length === 1, 'launch entered');
+  assert.equal(manager.sessions.size, 0);
+  assert.equal(client.sent.length, 0);
+  ready();
+  const session = await creating;
+  const created = client.sent.map(message => JSON.parse(message)).filter(message => message.type === 'live_session_created');
+  assert.equal(created.length, 1);
+  assert.equal(created[0].session.model.id, 'deep');
+  assert.equal(created[0].session.thinkingLevel, 'high');
+  assert.equal(created[0].session.runtime.protocol, 2);
+  assert.equal(session.transport.kind, 'pimux');
 });
 
-test('resume() passes --session, seeds entries/name, stores, and broadcasts', async (t: TestContext) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  const child = makeFakeChild();
-  _setSpawnPiForTest(() => child);
-  t.after(() => _setSpawnPiForTest(null));
-
-  const mgr = new LiveSessionManager();
-  const client = openClient();
-  mgr.addClient(client);
-
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-resume-'));
-  const sessionFile = path.join(cwd, 'test.jsonl');
-  const entries = [{ type: 'message', message: { role: 'user', content: 'hi' } }];
-
-  const resumeP = mgr.resume({ sessionFile, cwd, model: 'openai/gpt-4o', entries, sessionName: 'My Session' });
-  t.mock.timers.tick(100);
-  const session = await resumeP;
-
-  assert.equal(mgr.get(session.id), session);
-  assert.equal(session.sessionFile, path.resolve(sessionFile));
-  assert.equal(session.sessionName, 'My Session');
-  assert.equal(session.entries.length, 1);
-  assert.deepEqual(session.entries[0], entries[0]);
-  assert.equal(session.cwd, path.resolve(cwd));
-
-  // Broadcast includes sessionFile and sessionName in metadata.
-  const msg = JSON.parse(client.sent[0]);
-  assert.equal(msg.type, 'live_session_created');
-  assert.equal(msg.session.sessionFile, path.resolve(sessionFile));
-  assert.equal(msg.session.sessionName, 'My Session');
+test('resume() forwards overrides and takes its active branch and name from the mux, not the disk cache', async t => {
+  const { launcher, manager } = fixture(t);
+  const file = path.join(runtimeEnvironment.sessions, 'branch.jsonl');
+  const root = { id: 'root', parentId: null, type: 'message' };
+  const kept = { id: 'kept', parentId: 'root', type: 'message' };
+  const other = { id: 'other', parentId: 'root', type: 'message' };
+  launcher.configure = mux => { mux.entries = [root, kept, other]; mux.leafId = 'kept'; mux.extraSnapshot.session = { file, id: 'branch', name: 'Runtime title', cwd }; };
+  const args = ['--provider', 'fx', '--thinking', 'high'];
+  const env = { PI_CODING_AGENT_DIR: '/synthetic/agent', HERDR_SOCKET_PATH: '/synthetic/herdr.sock' };
+  const result = await manager.resume({ sessionFile: file, cwd, model: 'fx/one', entries: [{ id: 'stale' }], sessionName: 'Stale title', args, env });
+  assert.deepEqual(result.session.entries, [root, kept]);
+  assert.equal(result.session.sessionName, 'Runtime title');
+  assert.equal(launcher.calls[0].args[launcher.calls[0].args.indexOf('--session') + 1], file);
+  assert.deepEqual(launcher.calls[0].args.slice(-args.length), args);
+  for (const [key, value] of Object.entries(env)) assert.equal(launcher.calls[0].env?.[key], value);
 });
 
-test('resume() coalesces concurrent and repeated resumes for the same file', async (t: TestContext) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  const child = makeFakeChild();
-  let call = 0;
-  _setSpawnPiForTest(() => { call++; return child; });
-  t.after(() => _setSpawnPiForTest(null));
-
-  const mgr = new LiveSessionManager();
-  const client = openClient();
-  mgr.addClient(client);
-
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-resume2-'));
-  const sessionFile = path.join(cwd, 'dup.jsonl');
-
-  const p1 = mgr.resume({ sessionFile, cwd });
-  const p2 = mgr.resume({ sessionFile, cwd });
-  assert.equal(mgr.hasPendingResume(sessionFile), true);
-  t.mock.timers.tick(100);
-  const [s1, s2] = await Promise.all([p1, p2]);
-  assert.equal(s1.id, s2.id);
-  assert.equal(call, 1);
-  assert.equal(mgr.sessions.size, 1);
-  assert.equal(client.sent.length, 1);
-
-  const s3 = await mgr.resume({ sessionFile, cwd });
-  assert.equal(s3.id, s1.id);
-  assert.equal(call, 1);
-  assert.equal(mgr.sessions.size, 1);
+test('resume() joins concurrent startup and later reuses the same view without another managed launch', async t => {
+  const { launcher, manager } = fixture(t);
+  const file = path.join(runtimeEnvironment.sessions, 'concurrent.jsonl');
+  let ready!: () => void;
+  launcher.gate = new Promise(resolve => { ready = resolve; });
+  const first = manager.resume({ sessionFile: file, cwd });
+  const second = manager.resume({ sessionFile: file, cwd });
+  await until(() => launcher.calls.length === 1, 'one launch');
+  assert.equal(manager.hasPendingResume(file), true);
+  ready();
+  const [a, b] = await Promise.all([first, second]);
+  assert.equal(a.session, b.session);
+  assert.equal(a.started, true);
+  assert.equal(b.started, false);
+  assert.equal((await manager.resume({ sessionFile: file, cwd })).session, a.session);
+  assert.equal(launcher.calls.length, 1);
+  assert.equal(manager.hasPendingResume(file), false);
 });
 
-test('resume() waits for a terminating session with the same file before spawning again', async (t: TestContext) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  let call = 0;
-  _setSpawnPiForTest(() => { call++; return makeFakeChild(); });
-  t.after(() => _setSpawnPiForTest(null));
-
-  const mgr = new LiveSessionManager();
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'tau-resume-terminate-'));
-  const sessionFile = path.join(cwd, 'resume.jsonl');
-
-  const firstP = mgr.resume({ sessionFile, cwd });
-  t.mock.timers.tick(100);
-  const first = await firstP;
-  assert.equal(call, 1);
-
-  const deleteP = mgr.delete(first.id);
-  assert.equal(mgr.hasTerminatingResume(sessionFile), true);
-  assert.equal(mgr.sessions.size, 0);
-
-  const secondP = mgr.resume({ sessionFile, cwd });
-  assert.equal(call, 1, 'resume must not spawn while the old child is terminating');
-  assert.equal(mgr.hasPendingResume(sessionFile), true);
-
-  t.mock.timers.tick(1500);
-  for (let i = 0; i < 20 && call < 2; i++) await Promise.resolve();
-  assert.equal(call, 2, 'resume should spawn after termination completes');
-  t.mock.timers.tick(100);
-  const [second] = await Promise.all([secondP, deleteP]);
-
-  assert.notEqual(second.id, first.id);
-  assert.equal(call, 2);
-  assert.equal(mgr.sessions.size, 1);
-  assert.equal(mgr.hasTerminatingResume(sessionFile), false);
+test('resume during a disconnect refuses until the view settles, then reattaches without restarting Pi', async t => {
+  const { launcher, manager } = fixture(t);
+  const file = path.join(runtimeEnvironment.sessions, 'disconnecting.jsonl');
+  const { session } = await manager.resume({ sessionFile: file, cwd });
+  const transport = session.transport;
+  const close = transport.close.bind(transport);
+  let finish!: () => void;
+  const gate = new Promise<void>(resolve => { finish = resolve; });
+  t.mock.method(transport, 'close', () => gate.then(close));
+  const deletion = manager.delete(session.id);
+  await assert.rejects(manager.resume({ sessionFile: file, cwd }), /disconnecting/);
+  assert.equal(launcher.calls.length, 1);
+  finish();
+  await deletion;
+  const successor = await manager.resume({ sessionFile: file, cwd });
+  assert.notEqual(successor.session.id, session.id);
+  assert.equal(successor.started, false);
+  assert.equal(launcher.calls.length, 1);
 });
 
-test('create() rejects when the cwd does not exist', async (t: TestContext) => {
-  _setSpawnPiForTest(() => makeFakeChild());
-  t.after(() => _setSpawnPiForTest(null));
-  const mgr = new LiveSessionManager();
-  await assert.rejects(
-    () => mgr.create({ cwd: '/definitely/not/a/real/path/tau' }),
-    /Directory not found/,
-  );
-  assert.equal(mgr.sessions.size, 0);
+test('failed disconnect retains the unavailable view and never grants permission to launch a second writer', async t => {
+  const { launcher, manager } = fixture(t);
+  const file = path.join(runtimeEnvironment.sessions, 'uncertain-disconnect.jsonl');
+  const { session } = await manager.resume({ sessionFile: file, cwd });
+  const transport = session.transport;
+  const close = transport.close.bind(transport);
+  t.mock.method(transport, 'close', async () => { throw new Error('disconnect unconfirmed'); });
+  await assert.rejects(manager.delete(session.id), /disconnect unconfirmed/);
+  assert.equal(manager.get(session.id), session);
+  await assert.rejects(manager.resume({ sessionFile: file, cwd }), /disconnecting/);
+  assert.equal(launcher.calls.length, 1);
+  t.mock.method(transport, 'close', close);
+  await manager.delete(session.id);
+});
+
+test('ambiguous startup identifies its retained operation and a live common claim blocks another launch', async t => {
+  const { launcher, manager } = fixture(t);
+  const file = path.join(runtimeEnvironment.sessions, 'uncertain-start.jsonl');
+  launcher.failure = new RuntimeOperationError('startup uncertain', 'retained-operation', 'retained-runtime');
+  await assert.rejects(manager.resume({ sessionFile: file, cwd }), /retained-operation/);
+  const identity = readProcessIdentity(process.pid)!;
+  const claim = acquireClaim(file, { id: 'retained-runtime', kind: 'rpc', protocol: 2, socket: path.join(process.env.PIMUX_DIR!, 'retained.sock'), operationId: 'retained-operation', wrapper: identity, pi: identity });
+  t.after(() => releaseClaim(claim));
+  await assert.rejects(manager.resume({ sessionFile: file, cwd }), /unavailable/);
+  assert.equal(launcher.calls.length, 1);
+});
+
+test('create() rejects a missing directory before invoking the managed launcher', async t => {
+  const { launcher, manager } = fixture(t);
+  await assert.rejects(manager.create({ cwd: '/definitely/not/a/real/path/tau' }), /Directory not found/);
+  assert.equal(launcher.calls.length, 0);
+  assert.equal(manager.sessions.size, 0);
 });
 
 // A live session wired to a manager with one open browser, driven by the
@@ -316,57 +309,45 @@ function liveSessionWithClient() {
 
 const RESULT = { summary: 'What happened so far.', firstKeptEntryId: 'k1', tokensBefore: 150000, estimatedTokensAfter: 32000, usage: {}, details: {} };
 
-test('a running compaction is part of the metadata and snapshot until it ends', () => {
+test('a running compaction is part of the tab metadata until it ends', () => {
   const { session, piSays, lastMetadata } = liveSessionWithClient();
   piSays({ type: 'compaction_start', reason: 'threshold' });
   assert.equal(session.compaction.reason, 'threshold');
   assert.equal(typeof session.compaction.startedAt, 'number');
   assert.deepEqual(lastMetadata().compaction, session.compaction);
-  assert.deepEqual(session.snapshot().session.compaction, session.compaction);
-  assert.deepEqual(session.snapshot().compaction, session.compaction);
 
   piSays({ type: 'compaction_end', reason: 'threshold', result: RESULT, aborted: false, willRetry: false });
   assert.equal(session.compaction, null);
   assert.equal(lastMetadata().compaction, null);
-  assert.equal(session.snapshot().compaction, null);
 });
 
 for (const reason of ['threshold', 'overflow']) {
   test(`${reason} compaction keeps the tab busy before agent_start until the reply settles`, () => {
-    const { session, piSays, lastMetadata } = liveSessionWithClient();
+    const { piSays, lastMetadata } = liveSessionWithClient();
     piSays({ type: 'compaction_start', reason });
     assert.equal(lastMetadata().isStreaming, true);
-    assert.equal(session.snapshot().isStreaming, true);
 
     piSays({ type: 'compaction_end', reason, result: RESULT, aborted: false, willRetry: false });
     assert.equal(lastMetadata().compaction, null);
     assert.equal(lastMetadata().isStreaming, true);
-    assert.equal(session.snapshot().session.isStreaming, true);
-    assert.equal(session.snapshot().isStreaming, true);
 
     piSays({ type: 'agent_start' });
     piSays({ type: 'agent_settled' });
     assert.equal(lastMetadata().isStreaming, false);
-    assert.equal(session.snapshot().isStreaming, false);
   });
 }
 
-test('a successful compaction adds a compaction entry so snapshots show the divider', () => {
+test('a manual compaction leaves the tab idle and its divider comes from the appended entry', () => {
   const { session, piSays } = liveSessionWithClient();
   piSays({ type: 'message_start', message: { role: 'user', content: 'hello' } });
   piSays({ type: 'compaction_start', reason: 'manual' });
   assert.equal(session.isStreaming, false);
+  const entry = { type: 'compaction', id: 'c1', summary: RESULT.summary, firstKeptEntryId: 'k1', tokensBefore: 150000 };
+  piSays({ type: 'entry_appended', entry });
   piSays({ type: 'compaction_end', reason: 'manual', result: RESULT, aborted: false, willRetry: false });
   assert.equal(session.isStreaming, false);
-  const entry = session.entries.at(-1);
-  assert.equal(entry.type, 'compaction');
-  assert.equal(entry.summary, RESULT.summary);
-  assert.equal(entry.firstKeptEntryId, 'k1');
-  assert.equal(entry.tokensBefore, 150000);
-  assert.equal(entry.estimatedTokensAfter, 32000);
-  assert.equal(entry.reason, 'manual');
-  assert.equal(typeof entry.timestamp, 'string');
-  assert.deepEqual(session.snapshot().entries.at(-1), entry);
+  assert.deepEqual(session.entries.at(-1), entry);
+  assert.equal(session.entries.length, 2);
 });
 
 test('a failed or cancelled compaction adds no entry and clears the running state', () => {
@@ -386,4 +367,17 @@ test('a Pi process that exits never leaves its tab compacting', () => {
   session.handleExit(1, null);
   assert.equal(session.compaction, null);
   assert.equal(mgr.sessions.size, 0);
+});
+
+test('snapshots link to history images instead of carrying their data', () => {
+  const { session } = liveSessionWithClient();
+  const png = Buffer.from('89504e470d0a1a0a', 'hex').toString('base64');
+  const text = { type: 'message', message: { role: 'assistant', content: [{ type: 'text', text: 'no image' }] } };
+  session.entries = [text, { type: 'message', message: { role: 'user', content: [{ type: 'text', text: 'look' }, { type: 'image', data: png, mimeType: 'image/png' }] } }];
+  const entries = session.currentSnapshot().entries;
+  assert.equal(entries[0], text, 'entries without images are sent as they are');
+  assert.deepEqual(entries[1].message.content[1], { type: 'image', mimeType: 'image/png', url: `/api/live-sessions/${encodeURIComponent(session.id)}/images/0/1/1` });
+  assert.ok(!JSON.stringify(entries).includes(png));
+  assert.equal(session.entries[1].message.content[1].data, png, 'the live session keeps the image data');
+  assert.deepEqual(session.historyImage(0, 1, 1), { data: png, mimeType: 'image/png' });
 });

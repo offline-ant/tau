@@ -1,4 +1,9 @@
-import { test } from 'node:test';
+import { runtimeEnvironment } from './runtime-environment.ts';
+import { test, after } from 'node:test';
+import fs from 'node:fs';
+import path from 'node:path';
+import * as tau from '../bin/tau.js';
+after(() => fs.rmSync(runtimeEnvironment.root, { recursive: true, force: true }));
 import assert from 'node:assert/strict';
 
 // The built server module is a plain JS artifact without declarations; the
@@ -7,11 +12,12 @@ const {
   parseArgs,
   expandHome,
   resolvePiCommand,
+  PI_COMMAND,
   modelLabel,
   makeId,
   isWithinPath,
   isAllowedApiOrigin,
-} = (await import('../bin/tau.js')) as any;
+} = tau as any;
 
 test('parseArgs parses --key value pairs and boolean --open', () => {
   assert.deepEqual(parseArgs([]), {});
@@ -28,18 +34,20 @@ test('parseArgs ignores non-flag tokens', () => {
   assert.deepEqual(parseArgs(['positional', '--port', '9']), { port: '9' });
 });
 
-test('resolvePiCommand prefers --pi-command, then TAU_PI_COMMAND, then pi', () => {
-  assert.equal(resolvePiCommand({}, {}), 'pi');
-  assert.equal(resolvePiCommand({}, { TAU_PI_COMMAND: 'pi-bolt' }), 'pi-bolt');
-  assert.equal(resolvePiCommand({ 'pi-command': 'pig' }, { TAU_PI_COMMAND: 'pi-bolt' }), 'pig');
-  // blank values fall through to the next source
-  assert.equal(resolvePiCommand({ 'pi-command': '  ' }, { TAU_PI_COMMAND: '' }), 'pi');
-  assert.equal(parseArgs(['--pi-command', 'pi-bolt'])['pi-command'], 'pi-bolt');
+test('resolvePiCommand prefers an explicit absolute release, then the installed exact host', () => {
+  assert.equal(resolvePiCommand({}, {}), PI_COMMAND);
+  assert.equal(resolvePiCommand({}, { TAU_PI_COMMAND: PI_COMMAND }), PI_COMMAND);
+  assert.equal(resolvePiCommand({ 'pi-command': PI_COMMAND }, { TAU_PI_COMMAND: 'not-a-release' }), PI_COMMAND);
+  assert.equal(resolvePiCommand({ 'pi-command': '  ' }, { TAU_PI_COMMAND: '' }), PI_COMMAND);
+  assert.throws(() => resolvePiCommand({ 'pi-command': 'pi-bolt' }, {}), /absolute/);
+  assert.equal(parseArgs(['--pi-command', PI_COMMAND])['pi-command'], PI_COMMAND);
 });
 
 test('resolvePiCommand expands a leading tilde', () => {
   const home = process.env.HOME || process.env.USERPROFILE;
-  assert.equal(resolvePiCommand({ 'pi-command': '~/bin/pig' }, {}), `${home}/bin/pig`);
+  fs.mkdirSync(path.join(home!, 'bin'));
+  fs.symlinkSync(PI_COMMAND, path.join(home!, 'bin', 'pi-release'));
+  assert.equal(resolvePiCommand({ 'pi-command': '~/bin/pi-release' }, {}), PI_COMMAND);
 });
 
 test('expandHome expands a leading tilde and passes through others', () => {

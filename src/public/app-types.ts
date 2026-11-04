@@ -1,5 +1,6 @@
 import type { DialogRequest } from './dialogs.js';
 import type { NestedCallsRecord } from './nested-tool-calls.js';
+import type { InputContext, RuntimeInputContext } from './unsent-input.js';
 
 export type PendingDialog = DialogRequest & {
   id: string;
@@ -48,6 +49,19 @@ export type LiveSession = {
   createdAt?: string;
   lastActiveAt?: string;
   contextUsage?: UsageRecord;
+  leafId?: string | null;
+  runtimeContext?: RuntimeInputContext | null;
+  inputReady?: boolean;
+  shared?: boolean;
+  capabilities?: { stop?: boolean; navigateTree?: boolean };
+  /** Runtime identity is independent of the frontend that first started it. Closing only disconnects. */
+  attached?: { muxId: string; host: string | null; placement: string; name: string | null } | null;
+};
+
+export type LiveInstance = {
+  sessionFile?: string | null;
+  cwd?: string;
+  port: string;
 };
 
 export type UsageRecord = {
@@ -74,6 +88,8 @@ export type MessageContentBlock = {
   arguments?: Record<string, unknown>;
 };
 
+export type AssistantStep = { type: 'text' | 'thinking'; text: string };
+
 export type AppMessage = {
   id?: string;
   role?: string;
@@ -93,7 +109,7 @@ export type AppEvent = {
   sessionId?: string;
   session?: LiveSession;
   message?: AppMessage | string;
-  assistantMessageEvent?: { type?: string; delta?: string };
+  assistantMessageEvent?: { type?: string; delta?: string; contentIndex?: number; partial?: AppMessage };
   toolCallId?: string;
   parentToolCallId?: string;
   toolName?: string;
@@ -121,6 +137,6 @@ export type AppEvent = {
 
 export type PendingImage = { data: string; mimeType: string };
 export type PendingFilePath = { path: string; name: string; ext: string; sessionId?: string | null };
-export type QueuedCommand = { type: string; id?: string; message?: string; images?: PendingImage[]; sessionId?: string; error?: string };
+export type QueuedCommand = { type: string; inputContext?: InputContext; id?: string; message?: string; images?: PendingImage[]; sessionId?: string; error?: string; streamingBehavior?: 'followUp' | 'steer' };
 export type ExtensionUIRequest = { sessionId: string; event: AppEvent };
 export type RpcCommand = { type: string; sessionId?: string; filePath?: string; [key: string]: unknown };
