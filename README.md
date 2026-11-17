@@ -1,3 +1,5 @@
+> **Archived.** Tau is no longer maintained. Its successor for running and sharing Pi agents is the Emacs workspace [Phimacs](https://github.com/offline-ant/phimacs).
+
 # Pi Tau Web Server
 
 **Browser workspace for [Pi](https://github.com/earendil-works/pi) — a standalone web server that manages multiple live Pi RPC sessions in parallel.**
